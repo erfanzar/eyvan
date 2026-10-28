@@ -68,6 +68,19 @@ class ApiClient(tp.Protocol):
 
         ...
 
+    def stream_lines(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: tp.Mapping[str, str | int | float | bool | None] | None = None,
+        headers: tp.Mapping[str, str] | None = None,
+        json: JsonObject | None = None,
+    ) -> tp.Iterator[str]:
+        """Send a request and yield response lines as they arrive (SSE or NDJSON)."""
+
+        ...
+
 
 ApiClientFactory: tp.TypeAlias = tp.Callable[[str, tp.Mapping[str, str]], ApiClient]
 """Build an API client for a control-plane URL and identity headers."""

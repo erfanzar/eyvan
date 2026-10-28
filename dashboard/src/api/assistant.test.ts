@@ -179,6 +179,114 @@ describe("assistant provider API", () => {
     await pending.catch(() => undefined);
   });
 
+  it("streams NDJSON events across chunks split mid-line and several lines per chunk", async () => {
+    const lines = [
+      { type: "start", conversation_id: "conv_1", provider_id: "p", model: "m", title: "t" },
+      { type: "step", step: 1, max_steps: 6 },
+      { type: "text", delta: "héllo ✓" },
+      { type: "done", reply: "héllo ✓", steps: 1, tool_calls: [], drafts: [], requests: [], message_id: "x" },
+    ];
+    const bytes = new TextEncoder().encode(lines.map((line) => JSON.stringify(line)).join("\n"));
+    // Odd chunk boundaries: mid-line, mid multi-byte character, and the last line has no newline.
+    const cuts = [5, 6, 60, 61, 95, 96, 97, bytes.length];
+    let at = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const cut of cuts) {
+          controller.enqueue(bytes.slice(at, cut));
+          at = cut;
+        }
+        controller.close();
+      },
+    });
+    const fetch = vi.fn(async () => new Response(body, { headers: { "content-type": "application/x-ndjson" } }));
+    vi.stubGlobal("fetch", fetch);
+    const events: unknown[] = [];
+    const controller = new AbortController();
+    await new EyvanApiClient("https://plane.example/api/v1", false).assistantChatStream(
+      { message: "hi", conversation_id: "conv_1", provider_id: "p", model: "m" },
+      (event) => events.push(event),
+      controller.signal,
+    );
+    expect(events).toEqual(lines);
+    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://plane.example/api/v1/assistant/chat/stream");
+    expect(init.method).toBe("POST");
+    expect(init.signal).toBe(controller.signal);
+    expect(new Headers(init.headers).get("accept")).toBe("application/x-ndjson");
+    const scope = configuredScope();
+    expect(JSON.parse(String(init.body))).toEqual({
+      message: "hi",
+      conversation_id: "conv_1",
+      provider_id: "p",
+      model: "m",
+      org_id: scope.orgId,
+      project_id: scope.projectId,
+    });
+  });
+
+  it("parses several events delivered in one chunk", async () => {
+    const text = '{"type":"step","step":1,"max_steps":2}\n\n{"type":"text","delta":"a"}\n{"type":"text","delta":"b"}\n';
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(text)),
+    );
+    const events: unknown[] = [];
+    await new EyvanApiClient("/api/v1", false).assistantChatStream({ message: "x" }, (event) => events.push(event));
+    expect(events).toEqual([
+      { type: "step", step: 1, max_steps: 2 },
+      { type: "text", delta: "a" },
+      { type: "text", delta: "b" },
+    ]);
+  });
+
+  it("throws the plane's detail when the stream is refused before it starts", async () => {
+    mockResponse({ detail: "unknown provider" }, 404);
+    const onEvent = vi.fn();
+    const pending = new EyvanApiClient("/api/v1", false).assistantChatStream({ message: "x" }, onEvent);
+    await expect(pending).rejects.toMatchObject({ status: 404, message: expect.stringContaining("unknown provider") });
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("reads, renames and deletes conversations and drives Claude Code at literal paths", async () => {
+    const client = new EyvanApiClient("/api/v1", false);
+    let fetch = mockResponse({ conversations: [{ id: "c1" }] });
+    await expect(client.listAssistantConversations()).resolves.toEqual([{ id: "c1" }]);
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/assistant/conversations");
+
+    fetch = mockResponse({ id: "c/1", messages: [] });
+    await client.getAssistantConversation("c/1");
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/assistant/conversations/c%2F1");
+
+    fetch = mockResponse({ id: "c1", title: "New" });
+    await client.renameAssistantConversation("c1", "New");
+    expect(fetch.mock.calls[0][1].method).toBe("PUT");
+    expect(JSON.parse(fetch.mock.calls[0][1].body as string)).toEqual({ title: "New" });
+
+    fetch = mockResponse({ deleted: "c1" });
+    await expect(client.deleteAssistantConversation("c1")).resolves.toEqual({ deleted: "c1" });
+    expect(fetch.mock.calls[0][1].method).toBe("DELETE");
+
+    fetch = mockResponse({ installed: true, logged_in: false });
+    await client.getClaudeCodeStatus();
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/assistant/claude-code/status");
+
+    fetch = mockResponse({ started: true, url: null });
+    await expect(client.startClaudeCodeLogin()).resolves.toEqual({ started: true, url: null });
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/assistant/claude-code/login");
+    expect(fetch.mock.calls[0][1].method).toBe("POST");
+  });
+
+  it("answers conversations and Claude Code with empty values in demo mode", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", true);
+    await expect(client.listAssistantConversations()).resolves.toEqual([]);
+    await expect(client.getClaudeCodeStatus()).resolves.toMatchObject({ installed: false, logged_in: false });
+    await expect(client.startClaudeCodeLogin()).resolves.toEqual({ started: false, url: null });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("sends the selected provider and model with an explicit chat scope", async () => {
     const fetch = mockResponse({ reply: "ok", steps: 1, tool_calls: [], drafts: [], requests: [] });
     const client = new EyvanApiClient("/api/v1", false);

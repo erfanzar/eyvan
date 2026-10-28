@@ -231,6 +231,17 @@ EXEMPT_ROUTES: dict[str, str] = {
         "victim ids only for a fleet admin (test_governance)"
     ),
     "POST /api/v1/assistant/chat": "tools call the service with the caller's own principal (test_assistant)",
+    "POST /api/v1/assistant/chat/stream": (
+        "tools run as the caller; continues only the caller's own conversation, else 404 (test_assistant_stream)"
+    ),
+    "GET /api/v1/assistant/conversations": "the caller's own saved chats only (test_assistant_stream)",
+    "GET /api/v1/assistant/conversations/{conversation_id}": (
+        "owner-only; anyone else, a fleet admin included, gets 404 (test_assistant_stream)"
+    ),
+    "PUT /api/v1/assistant/conversations/{conversation_id}": "rename the caller's own chat only (test_assistant_stream)",
+    "DELETE /api/v1/assistant/conversations/{conversation_id}": (
+        "delete the caller's own chat only (test_assistant_stream)"
+    ),
     "GET /api/v1/assistant/presets": "a fixed built-in list of provider endpoints; no stored data",
     "GET /api/v1/assistant/oauth/openrouter/callback/{state}": (
         "authorized only by a single-use, expiring state minted for one fleet admin (test_assistant_presets)"
@@ -261,6 +272,8 @@ FLEET_ONLY_ROUTES.update(
         "POST /api/v1/assistant/oauth/openrouter/start": "begin connecting a plane-wide OpenRouter provider",
         "PUT /api/v1/assistant/providers/{provider_id}": "change a plane-wide assistant provider or its key",
         "DELETE /api/v1/assistant/providers/{provider_id}": "remove a plane-wide assistant provider",
+        "GET /api/v1/assistant/claude-code/status": "the plane host's Claude Code sign-in state (no email/org)",
+        "POST /api/v1/assistant/claude-code/login": "start a Claude Code sign-in on the plane host",
     }
 )
 

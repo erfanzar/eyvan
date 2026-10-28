@@ -54,14 +54,79 @@ def _submit_draft(session: CliSession, draft: dict[str, tp.Any]) -> tp.Any:
     )
 
 
+def _argument_summary(arguments: object, limit: int = 80) -> str:
+    if not isinstance(arguments, dict) or not arguments:
+        return ""
+    text = ", ".join(f"{key}={json.dumps(value, default=str)}" for key, value in arguments.items())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _stream_turn(session: CliSession, body: dict[str, tp.Any], *, live: bool) -> dict[str, tp.Any]:
+    """Run one streamed turn; print steps and tool calls to stderr and the answer to stdout as it arrives."""
+
+    done: dict[str, tp.Any] | None = None
+    conversation_id: str | None = None
+    text_in_step = False
+    for raw in session.client.stream_lines("POST", "/api/v1/assistant/chat/stream", json=body):
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "start":
+            conversation_id = event.get("conversation_id")
+            if live:
+                click.secho(f"· {event.get('model')} thinking…", dim=True, err=True)
+        elif kind == "step":
+            if text_in_step and live:
+                click.echo()
+            text_in_step = False
+            if live and int(event.get("step") or 1) > 1:
+                click.secho(f"· step {event['step']}/{event.get('max_steps')}", dim=True, err=True)
+        elif kind == "text":
+            text_in_step = True
+            if live:
+                click.echo(str(event.get("delta", "")), nl=False)
+        elif kind == "tool_call":
+            if live:
+                if text_in_step:
+                    click.echo()
+                    text_in_step = False
+                summary = _argument_summary(event.get("arguments"))
+                click.secho(f"→ {event.get('name')}({summary})", fg="cyan", err=True)
+        elif kind == "tool_result":
+            if live:
+                mark, colour = ("✓", "green") if event.get("ok") else ("✗", "red")
+                click.secho(f"  {mark} {event.get('name')}", fg=colour, err=True)
+        elif kind == "error":
+            if text_in_step and live:
+                click.echo()
+            raise click.ClickException(f"the assistant failed: {event.get('detail')}")
+        elif kind == "done":
+            done = {key: value for key, value in event.items() if key != "type"}
+    if done is None:
+        raise click.ClickException("the assistant stream ended without an answer")
+    if live and text_in_step:
+        click.echo()
+    done["conversation_id"] = conversation_id
+    done["_streamed_text"] = live and text_in_step
+    return done
+
+
 @click.command("ask")
 @click.argument("question", nargs=-1, required=True)
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
 @click.option("--provider", "provider", help="Provider name or id (see `eyvan assistant providers list`).")
 @click.option("--model", "model", help="One of the chosen provider's models (default: its default model).")
+@click.option("--chat", "conversation_id", help="Continue a saved chat (see `eyvan assistant chats list`).")
 @click.option("--yes", is_flag=True, help="Submit drafted workloads without asking.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw assistant turn as JSON.")
+@click.option("--quiet", is_flag=True, help="Print only the answer, not the live steps and tool calls.")
 @click.pass_obj
 def ask(
     session: CliSession,
@@ -70,28 +135,41 @@ def ask(
     project_id: str | None,
     provider: str | None,
     model: str | None,
+    conversation_id: str | None,
     yes: bool,
     as_json: bool,
+    quiet: bool,
 ) -> None:
-    """Ask the fleet assistant (sizing, which fleet, quota, why a job waits)."""
+    """Ask the fleet assistant (sizing, which fleet, quota, why a job waits).
+
+    Progress streams as it happens: each step, every tool the assistant runs and
+    whether it worked, then the answer as it is written. The turn is saved as a
+    chat you can continue with ``--chat``.
+    """
 
     text = " ".join(question).strip()
     status = session.client.request("GET", "/api/v1/assistant/status")
     if not (isinstance(status, dict) and status.get("enabled")):
         raise click.ClickException(
             "this plane has no assistant provider configured; a fleet admin adds one in the dashboard "
-            "(Assistant page) or with `eyvan assistant providers add`"
+            "(Settings → Assistant providers) or with `eyvan assistant providers add`"
         )
-    body: dict[str, tp.Any] = {"messages": [{"role": "user", "content": text}], **_scope(session, org_id, project_id)}
+    body: dict[str, tp.Any] = {"message": text, **_scope(session, org_id, project_id)}
     if provider is not None:
         body["provider_id"] = _provider_id(session, provider)
     if model is not None:
         body["model"] = model
-    payload = _object(session.client.request("POST", "/api/v1/assistant/chat", json=body))
+    if conversation_id is not None:
+        body["conversation_id"] = conversation_id
+    payload = _stream_turn(session, body, live=not (quiet or as_json))
+    streamed = bool(payload.pop("_streamed_text", False))
     if as_json:
         JsonRenderer().emit(payload)
         return
-    click.echo(str(payload.get("reply", "")).strip())
+    if quiet or not streamed:
+        click.echo(str(payload.get("reply", "")).strip())
+    if payload.get("conversation_id") and not quiet:
+        click.secho(f"\n(chat {payload['conversation_id']}; continue with --chat)", dim=True, err=True)
     for request in _objects(payload.get("requests")):
         click.echo(f"\nfiled request {request['id']} ({request['kind']}): {request['summary']}")
     for draft in _objects(payload.get("drafts")):
@@ -421,9 +499,88 @@ def providers_remove(session: CliSession, provider: str) -> None:
     click.echo(f"removed {provider_id}")
 
 
+@assistant_group.group("chats")
+def chats_group() -> None:
+    """Your saved assistant chats (only you can see them)."""
+
+
+@chats_group.command("list")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def chats_list(session: CliSession, as_json: bool) -> None:
+    """List your saved chats, newest first."""
+
+    payload = _object(session.client.request("GET", "/api/v1/assistant/conversations"))
+    if as_json:
+        JsonRenderer().emit(payload)
+        return
+    rows = _objects(payload.get("conversations"))
+    for row in rows:
+        click.echo(
+            f"{row['id']}  {str(row.get('updated_at', ''))[:16]}  {row.get('message_count', 0):>3} msgs  {row['title']}"
+        )
+    if not rows:
+        click.echo("no saved chats")
+
+
+@chats_group.command("show")
+@click.argument("conversation_id")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def chats_show(session: CliSession, conversation_id: str, as_json: bool) -> None:
+    """Print one saved chat with the tools each answer used."""
+
+    payload = _object(session.client.request("GET", f"/api/v1/assistant/conversations/{conversation_id}"))
+    if as_json:
+        JsonRenderer().emit(payload)
+        return
+    click.secho(str(payload.get("title", "")), bold=True)
+    for message in _objects(payload.get("messages")):
+        click.echo()
+        if message.get("role") == "user":
+            click.secho(f"you: {message.get('content', '')}", fg="cyan")
+            continue
+        for item in _objects(message.get("trace")):
+            mark = "✓" if item.get("ok") else "✗"
+            click.secho(f"  {mark} {item.get('name')}", dim=True)
+        if message.get("error"):
+            click.secho(f"assistant failed: {message['error']}", fg="red")
+        else:
+            click.echo(str(message.get("content", "")))
+
+
+@chats_group.command("rename")
+@click.argument("conversation_id")
+@click.argument("title", nargs=-1, required=True)
+@click.pass_obj
+def chats_rename(session: CliSession, conversation_id: str, title: tuple[str, ...]) -> None:
+    """Rename one of your chats."""
+
+    renamed = _object(
+        session.client.request(
+            "PUT", f"/api/v1/assistant/conversations/{conversation_id}", json={"title": " ".join(title)}
+        )
+    )
+    click.echo(f"renamed {renamed['id']}: {renamed['title']}")
+
+
+@chats_group.command("delete")
+@click.argument("conversation_id")
+@click.pass_obj
+def chats_delete(session: CliSession, conversation_id: str) -> None:
+    """Delete one of your chats."""
+
+    session.client.request("DELETE", f"/api/v1/assistant/conversations/{conversation_id}")
+    click.echo(f"deleted {conversation_id}")
+
+
 def register_assistant_commands(group: click.Group) -> None:
     """Attach ask/size/requests/assistant to the CLI root."""
 
+    from eyvan.sdk.commands.assistant_claude_code import claude_code_group
+
+    if "claude-code" not in assistant_group.commands:
+        assistant_group.add_command(claude_code_group)
     for command in (ask, size, requests_group, assistant_group):
         group.add_command(command)
 

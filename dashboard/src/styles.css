@@ -4170,7 +4170,7 @@ code,
     flex-direction: row;
     align-items: center;
     gap: 14px;
-    padding: 0 max(16px, calc((100vw - 1440px) / 2));
+    padding: 0 16px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
     background: var(--nav-bg);
@@ -4298,12 +4298,12 @@ code,
     margin-left: 0;
     padding-top: 48px;
   }
+  /* Edge to edge: the breadcrumb hugs the column's left edge and the actions
+     its right edge, at every width and whether or not the dock is open. */
   .topbar {
     top: 48px;
-    max-width: 1440px;
     height: 60px;
-    margin: 0 auto;
-    padding: 0 24px;
+    padding: 0 16px;
     background: var(--nav-bg);
     backdrop-filter: blur(14px);
   }
@@ -5368,6 +5368,285 @@ body.dock-resizing {
 }
 .dock-stop {
   background: var(--text-muted);
+}
+.icon-button-active {
+  background: var(--accent-soft);
+  color: var(--accent-fg);
+}
+
+/* Live trace of one assistant turn: step, tools, thinking, narration. */
+.dock-message-assistant {
+  gap: 6px;
+}
+.dock-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: var(--text-3xs);
+  letter-spacing: 0.04em;
+}
+.dock-trace {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.dock-tool-row {
+  border: 1px solid var(--border);
+  background: var(--wash);
+}
+.dock-tool-row-failed {
+  border-color: var(--red-soft);
+}
+.dock-tool-head,
+.dock-thinking > button,
+.dock-trace-toggle {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border: 0;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: var(--text-2xs);
+  text-align: left;
+}
+.dock-tool-head:hover,
+.dock-thinking > button:hover,
+.dock-trace-toggle:hover {
+  color: var(--text);
+}
+.dock-tool-chevron {
+  flex: none;
+  transition: transform 120ms ease;
+}
+[aria-expanded="true"] > .dock-tool-chevron {
+  transform: rotate(90deg);
+}
+.dock-tool-head > svg {
+  flex: none;
+}
+.dock-tool-name {
+  flex: none;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.dock-tool-args {
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dock-tool-status {
+  display: inline-flex;
+  flex: none;
+  margin-left: auto;
+}
+.dock-tool-row-ok .dock-tool-status {
+  color: var(--ok);
+}
+.dock-tool-row-failed .dock-tool-status {
+  color: var(--red);
+}
+.dock-tool-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 8px 8px 24px;
+  border-top: 1px solid var(--border);
+  font-size: var(--text-2xs);
+}
+.dock-tool-detail-label {
+  color: var(--text-faint);
+  font-size: var(--text-3xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dock-tool-detail pre {
+  max-height: 200px;
+  margin: 0;
+  overflow: auto;
+  font-size: var(--text-2xs);
+}
+.dock-tool-detail p {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.dock-thinking > p {
+  padding: 2px 8px 6px 24px;
+  color: var(--text-faint);
+  font-size: var(--text-2xs);
+  font-style: italic;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.dock-narration .md {
+  color: var(--text-soft);
+  font-size: var(--text-xs);
+}
+.dock-trace-toggle {
+  width: auto;
+  padding: 2px 0;
+}
+.dock-answer-streaming > .md > :last-child::after {
+  display: inline-block;
+  width: 6px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent-fg);
+  animation: blip 1s steps(2) infinite;
+  content: "";
+}
+.dock-answer-note {
+  color: var(--text-faint);
+  font-size: var(--text-3xs);
+  text-transform: uppercase;
+}
+.dock-inline-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--red-soft);
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: var(--text-xs);
+}
+
+/* Saved chats. */
+.dock-history {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  padding: 12px 10px;
+}
+.dock-history .dock-alert {
+  margin: 0;
+}
+.dock-history-heading {
+  display: block;
+  padding: 0 6px 4px;
+  color: var(--text-faint);
+  font-size: var(--text-3xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.dock-history-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.dock-history-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px 0 0;
+}
+.dock-history-item:hover,
+.dock-history-item-active {
+  background: var(--surface-muted);
+}
+.dock-history-open {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-xs);
+  text-align: left;
+}
+.dock-history-title {
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dock-history-time {
+  flex: none;
+  color: var(--text-faint);
+  font-size: var(--text-3xs);
+}
+.dock-history-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  opacity: 0;
+}
+.dock-history-item:hover .dock-history-actions,
+.dock-history-item:focus-within .dock-history-actions {
+  opacity: 1;
+}
+.dock-history-rename,
+.dock-history-confirm {
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  font-size: var(--text-xs);
+}
+.dock-history-rename input {
+  min-width: 0;
+  height: 28px;
+  flex: 1;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  outline: 0;
+  background: var(--surface);
+  font-size: var(--text-xs);
+}
+
+/* Settings: Claude Code sign-in on the plane host. */
+.claude-code-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-sunk);
+}
+.claude-code-card .inline-error {
+  margin: 0;
+}
+.claude-code-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-sm);
+}
+.claude-code-ok {
+  color: var(--ok);
+}
+.claude-code-missing {
+  color: var(--amber);
+}
+.claude-code-login {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 /* Light Markdown in assistant replies. */

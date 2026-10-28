@@ -1066,10 +1066,11 @@ def test_local_store_normalizes_pathological_json_decoder_failures(
         # topologies, then the credential rotation and cell stage ledgers, then
         # the service replica health and decision logs, then the webhook
         # subscriptions and delivery cursors, then team accounts, then team
-        # requests, then assistant providers. The unsupported-version case moves
-        # up each time rather than disappearing: an unknown version must still be
-        # refused by version, not by silently dropping the state it describes.
-        b'{"schema":"eyvan.control-plane","version":10}\n',
+        # requests, then assistant providers, then assistant conversations. The
+        # unsupported-version case moves up each time rather than disappearing:
+        # an unknown version must still be refused by version, not by silently
+        # dropping the state it describes.
+        b'{"schema":"eyvan.control-plane","version":11}\n',
         b'{"version":2}\n',
         b'{"schema":"eyvan.control-plane","version":{},"revision":0}\n',
         b'{"schema":"eyvan.control-plane","version":2,"unexpected":true}\n',

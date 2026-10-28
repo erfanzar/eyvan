@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from eyvan.records import (
     ApiTokenRecord,
     ArtifactReferenceRecord,
+    AssistantConversationRecord,
     AssistantProviderRecord,
     AuditEvent,
     BudgetRecord,
@@ -82,6 +83,8 @@ class ControlPlaneState:
     #: LLM endpoints a fleet admin configured for the assistant (id -> provider).
     #: Keys are held only as ciphertext.
     assistant_providers: dict[str, AssistantProviderRecord] = field(default_factory=dict)
+    #: Users' saved assistant chats (id -> conversation); each is owner-only.
+    assistant_conversations: dict[str, AssistantConversationRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -334,6 +337,19 @@ class StateSession(RepositorySession):
 
     async def delete_assistant_provider(self, provider_id: str) -> bool:
         return self._state.assistant_providers.pop(provider_id, None) is not None
+
+    async def get_assistant_conversation(self, conversation_id: str) -> AssistantConversationRecord | None:
+        return self._state.assistant_conversations.get(conversation_id)
+
+    async def list_assistant_conversations(self, *, subject: str) -> list[AssistantConversationRecord]:
+        items = (item for item in self._state.assistant_conversations.values() if item.subject == subject)
+        return sorted(items, key=lambda item: (item.updated_at, item.id), reverse=True)
+
+    async def put_assistant_conversation(self, conversation: AssistantConversationRecord) -> None:
+        self._state.assistant_conversations[conversation.id] = conversation
+
+    async def delete_assistant_conversation(self, conversation_id: str) -> bool:
+        return self._state.assistant_conversations.pop(conversation_id, None) is not None
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

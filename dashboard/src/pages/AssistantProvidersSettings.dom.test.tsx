@@ -9,8 +9,13 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EyvanApiClient } from "../api/client";
-import type { AssistantPreset, AssistantProvider } from "../types";
-import { AssistantProvidersSettings, type AssistantSettingsClient } from "./AssistantProvidersSettings";
+import type { AssistantPreset, AssistantProvider, ClaudeCodeStatus } from "../types";
+import {
+  AssistantProvidersSettings,
+  claudeCodeStatusText,
+  presetBadge,
+  type AssistantSettingsClient,
+} from "./AssistantProvidersSettings";
 import { SettingsPage, assistantHashNotice } from "./SettingsPage";
 import type { TeamClient } from "./UsersPage";
 
@@ -86,8 +91,38 @@ function mockClient(providers: AssistantProvider[] = []) {
       authorize_url: "https://openrouter.ai/auth?callback=x",
       expires_at: "2026-10-28T12:00:00Z",
     })),
+    getClaudeCodeStatus: vi.fn<AssistantSettingsClient["getClaudeCodeStatus"]>(async () => SIGNED_OUT),
+    startClaudeCodeLogin: vi.fn<AssistantSettingsClient["startClaudeCodeLogin"]>(async () => ({
+      started: true,
+      url: "https://claude.ai/oauth/authorize?code=x",
+    })),
   } satisfies AssistantSettingsClient;
 }
+
+const CLAUDE_CODE: AssistantPreset = {
+  id: "claude-code",
+  label: "Claude Code",
+  base_url: "",
+  editable_url: false,
+  key_required: false,
+  key_url: null,
+  sign_in: "claude-code",
+  suggested_models: ["sonnet", "opus", "haiku"],
+};
+const SIGNED_OUT: ClaudeCodeStatus = {
+  installed: true,
+  version: "2.1.0",
+  logged_in: false,
+  auth_method: null,
+  subscription_type: null,
+  detail: null,
+};
+const SIGNED_IN: ClaudeCodeStatus = {
+  ...SIGNED_OUT,
+  logged_in: true,
+  auth_method: "claude.ai",
+  subscription_type: "max",
+};
 
 async function choosePreset(label: string) {
   fireEvent.click(await screen.findByRole("button", { name: "Add provider" }));
@@ -287,6 +322,101 @@ describe("Assistant providers settings", () => {
 
     fireEvent.click(within(form).getByRole("button", { name: "or paste an API key" }));
     expect(within(form).getByLabelText("API key")).toBeTruthy();
+  });
+
+  it("words the Claude Code status and badges the preset Sign in", () => {
+    expect(claudeCodeStatusText(SIGNED_IN)).toBe("Signed in · Claude Max via claude.ai");
+    expect(claudeCodeStatusText(SIGNED_OUT)).toBe("Not signed in");
+    expect(claudeCodeStatusText({ ...SIGNED_OUT, installed: false })).toBe(
+      "Claude Code isn't installed on the plane host",
+    );
+    expect(presetBadge(CLAUDE_CODE).text).toBe("Sign in");
+  });
+
+  it("says when Claude Code is not installed and offers no sign-in", async () => {
+    const client = mockClient();
+    client.listAssistantPresets.mockResolvedValue([...PRESETS, CLAUDE_CODE]);
+    client.getClaudeCodeStatus.mockResolvedValue({
+      ...SIGNED_OUT,
+      installed: false,
+      version: null,
+      detail: "claude: command not found",
+    });
+    render(<AssistantProvidersSettings client={client} />);
+    await choosePreset("Claude Code");
+    const card = await screen.findByRole("group", { name: "Claude Code" });
+    expect((await within(card).findByRole("status")).textContent).toBe("Claude Code isn't installed on the plane host");
+    expect(within(card).getByText("claude: command not found")).toBeTruthy();
+    expect(within(card).queryByRole("button", { name: "Sign in with Claude" })).toBeNull();
+    expect(screen.queryByLabelText("API key")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save provider" })).toBeNull();
+    expect(client.discoverAssistantModels).not.toHaveBeenCalled();
+  });
+
+  it("signs Claude Code in on the plane host, polls until signed in, then saves without a key", async () => {
+    const client = mockClient();
+    client.listAssistantPresets.mockResolvedValue([...PRESETS, CLAUDE_CODE]);
+    client.getClaudeCodeStatus
+      .mockResolvedValueOnce(SIGNED_OUT)
+      .mockResolvedValueOnce(SIGNED_OUT)
+      .mockResolvedValue(SIGNED_IN);
+    client.discoverAssistantModels.mockResolvedValue({
+      models: ["sonnet", "opus", "haiku", "claude-sonnet-4-5"],
+      source: "live",
+      detail: null,
+    });
+    render(<AssistantProvidersSettings client={client} claudeCodePollMs={20} />);
+    await choosePreset("Claude Code");
+    const form = screen.getByRole("form", { name: "Add Claude Code" });
+    expect(within(form).getByText("Sign in")).toBeTruthy();
+    const card = within(form).getByRole("group", { name: "Claude Code" });
+    expect((await within(card).findByRole("status")).textContent).toBe("Not signed in");
+    expect(within(form).queryByLabelText("API key")).toBeNull();
+    expect(within(form).queryByLabelText("Base URL")).toBeNull();
+    expect(within(form).queryByRole("group", { name: "Models" })).toBeNull();
+    expect(within(card).getByRole("button", { name: "Check again" })).toBeTruthy();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Sign in with Claude" }));
+    const link = await within(card).findByRole("link", { name: /Open sign-in page/ });
+    expect(link.getAttribute("href")).toBe("https://claude.ai/oauth/authorize?code=x");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(within(card).getByText(/completes on the plane host/)).toBeTruthy();
+    expect(client.startClaudeCodeLogin).toHaveBeenCalledTimes(1);
+
+    await within(card).findByText("Signed in · Claude Max via claude.ai", undefined, { timeout: 2000 });
+    expect(client.getClaudeCodeStatus.mock.calls.length).toBeGreaterThanOrEqual(3);
+    await waitFor(() =>
+      expect(client.discoverAssistantModels).toHaveBeenCalledWith({ preset: "claude-code" }, expect.any(AbortSignal)),
+    );
+    await within(form).findByText("4 models from the provider");
+    expect(checkedModels()).toEqual(["sonnet", "opus", "haiku"]);
+    expect(within(form).queryByLabelText("API key")).toBeNull();
+    fireEvent.click(within(form).getByRole("button", { name: "Save provider" }));
+    await waitFor(() =>
+      expect(client.createAssistantProvider).toHaveBeenCalledWith({
+        preset: "claude-code",
+        models: ["sonnet", "opus", "haiku"],
+        default_model: "sonnet",
+      }),
+    );
+  });
+
+  it("keeps waiting when a Claude Code sign-in is already running", async () => {
+    const client = mockClient();
+    client.listAssistantPresets.mockResolvedValue([...PRESETS, CLAUDE_CODE]);
+    client.startClaudeCodeLogin.mockRejectedValueOnce(
+      Object.assign(new Error("Eyvan API request failed with 409"), { status: 409 }),
+    );
+    render(<AssistantProvidersSettings client={client} claudeCodePollMs={20} />);
+    await choosePreset("Claude Code");
+    const card = await screen.findByRole("group", { name: "Claude Code" });
+    fireEvent.click(await within(card).findByRole("button", { name: "Sign in with Claude" }));
+    await within(card).findByText(/already running on the plane host/);
+    expect(within(card).queryByRole("alert")).toBeNull();
+    client.getClaudeCodeStatus.mockResolvedValue(SIGNED_IN);
+    fireEvent.click(within(card).getByRole("button", { name: "Check again" }));
+    await within(card).findByText("Signed in · Claude Max via claude.ai");
   });
 
   it("works through the real API client class without detaching its methods", async () => {

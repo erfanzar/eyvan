@@ -6202,6 +6202,22 @@
         "title": "RegionCarbon",
         "type": "object"
       },
+      "RenameConversationBody": {
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "RenameConversationBody",
+        "type": "object"
+      },
       "RequestBody": {
         "additionalProperties": false,
         "properties": {
@@ -7296,6 +7312,72 @@
           }
         },
         "title": "SizeBody",
+        "type": "object"
+      },
+      "StreamChatBody": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id"
+          },
+          "message": {
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "org_id": {
+            "default": "default",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Org Id",
+            "type": "string"
+          },
+          "project_id": {
+            "default": "default",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Project Id",
+            "type": "string"
+          },
+          "provider_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Id"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "StreamChatBody",
         "type": "object"
       },
       "SubjectUsageRecord": {
@@ -10279,6 +10361,259 @@
           }
         },
         "summary": "Assistant Chat",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/chat/stream": {
+      "post": {
+        "description": "Run one turn and stream every step, tool call and text delta as NDJSON; save it to the conversation.\n\nRefusals (unknown provider or conversation, unlisted model) are ordinary\nHTTP errors raised before the stream starts; a provider failure after it\nstarted arrives as a final ``error`` event and is saved on the turn.",
+        "operationId": "assistant_chat_stream_api_v1_assistant_chat_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamChatBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Assistant Chat Stream",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/claude-code/login": {
+      "post": {
+        "description": "Start ``claude auth login --claudeai`` on the plane host (fleet admins).\n\nThe sign-in runs and completes **on the plane host**: Claude Code opens\nthe host's browser and receives the sign-in there. ``url`` is the\nsign-in link it printed, if any; it completes the sign-in only from a\nbrowser whose redirect reaches the plane host. At most one sign-in runs\nat a time (409 otherwise); check progress with the status route.",
+        "operationId": "start_claude_code_login_api_v1_assistant_claude_code_login_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Claude Code Login Api V1 Assistant Claude Code Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start Claude Code Login",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/claude-code/status": {
+      "get": {
+        "description": "Whether the plane host's Claude Code is installed and signed in (never the account itself).",
+        "operationId": "claude_code_host_status_api_v1_assistant_claude_code_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Claude Code Host Status Api V1 Assistant Claude Code Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Claude Code Host Status",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/conversations": {
+      "get": {
+        "description": "The caller's own saved chats, newest first (never anyone else's).",
+        "operationId": "list_assistant_conversations_api_v1_assistant_conversations_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Assistant Conversations Api V1 Assistant Conversations Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Assistant Conversations",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/conversations/{conversation_id}": {
+      "delete": {
+        "description": "Delete one of the caller's chats.",
+        "operationId": "delete_assistant_conversation_api_v1_assistant_conversations__conversation_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Assistant Conversation Api V1 Assistant Conversations  Conversation Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Assistant Conversation",
+        "tags": [
+          "assistant"
+        ]
+      },
+      "get": {
+        "description": "One of the caller's chats with every message, its trace, drafts and requests.",
+        "operationId": "get_assistant_conversation_api_v1_assistant_conversations__conversation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Assistant Conversation Api V1 Assistant Conversations  Conversation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Assistant Conversation",
+        "tags": [
+          "assistant"
+        ]
+      },
+      "put": {
+        "description": "Rename one of the caller's chats.",
+        "operationId": "rename_assistant_conversation_api_v1_assistant_conversations__conversation_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameConversationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Rename Assistant Conversation Api V1 Assistant Conversations  Conversation Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Assistant Conversation",
         "tags": [
           "assistant"
         ]

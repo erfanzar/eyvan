@@ -49,8 +49,14 @@ import type {
   AttachmentPlan,
   AuditEvent,
   DiscoveredTpus,
+  AssistantChatStreamInput,
+  AssistantConversation,
+  AssistantConversationSummary,
   AssistantDraft,
   AssistantMessage,
+  AssistantStreamEvent,
+  ClaudeCodeLoginStart,
+  ClaudeCodeStatus,
   AssistantModelDiscovery,
   AssistantModelDiscoveryInput,
   AssistantPreset,
@@ -345,6 +351,58 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/**
+ * Read a newline-delimited body as it arrives, one complete line at a time.
+ * A chunk can end mid-line, or mid-character, so the decoder streams and the
+ * unfinished tail waits for the next chunk; a final line without a newline is
+ * still delivered when the body ends.
+ */
+export async function readNdjsonLines(response: Response, onLine: (line: string) => void): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const emit = (final: boolean) => {
+    const lines = buffer.split("\n");
+    buffer = final ? "" : (lines.pop() ?? "");
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (line) onLine(line);
+    }
+  };
+  const reader = response.body?.getReader();
+  if (!reader) {
+    buffer = await response.text();
+    emit(true);
+    return;
+  }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      emit(false);
+    }
+    buffer += decoder.decode();
+    emit(true);
+  } catch (error) {
+    void reader.cancel().catch(() => undefined);
+    throw error;
+  }
+}
+
+/** One NDJSON line of the assistant stream; a line that is not an event object is refused. */
+export function parseAssistantStreamEvent(line: string): AssistantStreamEvent {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    throw new ApiError("The assistant sent an unreadable update");
+  }
+  if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") {
+    throw new ApiError("The assistant sent an unreadable update");
+  }
+  return parsed as AssistantStreamEvent;
 }
 
 export function workloadStatus(value: string): WorkloadStatus {
@@ -890,6 +948,110 @@ export class EyvanApiClient {
     );
   }
 
+  /**
+   * One chat turn, streamed. Only the new message is sent; the plane keeps the
+   * conversation and answers with NDJSON events, each handed to `onEvent` as
+   * its line completes. A refusal before streaming starts throws its detail.
+   */
+  async assistantChatStream(
+    body: AssistantChatStreamInput,
+    onEvent: (event: AssistantStreamEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no assistant", 400);
+    const path = "/api/v1/assistant/chat/stream".replace(/^\/api\/v1/, "");
+    const payload: AssistantChatStreamInput = {
+      ...body,
+      org_id: body.org_id ?? this.activeScope.orgId,
+      project_id: body.project_id ?? this.activeScope.projectId,
+    };
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: this.requestHeaders({ Accept: "application/x-ndjson" }),
+        body: JSON.stringify(payload),
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      throw new ApiError(
+        error instanceof Error ? `Unable to reach Eyvan API: ${error.message}` : "Unable to reach Eyvan API",
+      );
+    }
+    if (!response.ok) throw await this.refusal(path, response);
+    try {
+      await readNdjsonLines(response, (line) => onEvent(parseAssistantStreamEvent(line)));
+    } catch (error) {
+      if (signal?.aborted || error instanceof ApiError) throw error;
+      throw new ApiError(
+        error instanceof Error
+          ? `The assistant's answer was interrupted: ${error.message}`
+          : "The assistant's answer was interrupted",
+      );
+    }
+  }
+
+  /** The caller's saved conversations, newest first. */
+  async listAssistantConversations(signal?: AbortSignal): Promise<AssistantConversationSummary[]> {
+    if (this.forceDemo) return [];
+    return (
+      await this.attachmentRequest<{ conversations: AssistantConversationSummary[] }>(
+        "/api/v1/assistant/conversations",
+        { signal },
+      )
+    ).conversations;
+  }
+
+  async getAssistantConversation(id: string, signal?: AbortSignal): Promise<AssistantConversation> {
+    if (this.forceDemo) throw new ApiError("Conversation not found", 404);
+    return this.attachmentRequest<AssistantConversation>(`/api/v1/assistant/conversations/${encodeURIComponent(id)}`, {
+      signal,
+    });
+  }
+
+  async renameAssistantConversation(id: string, title: string): Promise<AssistantConversationSummary> {
+    return this.attachmentRequest<AssistantConversationSummary>(
+      `/api/v1/assistant/conversations/${encodeURIComponent(id)}`,
+      { method: "PUT", body: JSON.stringify({ title }) },
+    );
+  }
+
+  async deleteAssistantConversation(id: string): Promise<{ deleted: string }> {
+    return this.attachmentRequest<{ deleted: string }>(`/api/v1/assistant/conversations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+
+  /** What the plane host's Claude Code CLI says about itself (fleet admins). */
+  async getClaudeCodeStatus(signal?: AbortSignal): Promise<ClaudeCodeStatus> {
+    if (this.forceDemo) {
+      return {
+        installed: false,
+        version: null,
+        logged_in: false,
+        auth_method: null,
+        subscription_type: null,
+        detail: null,
+      };
+    }
+    return this.attachmentRequest<ClaudeCodeStatus>(
+      "/api/v1/assistant/claude-code/status",
+      { signal },
+      PROVIDER_READ_TIMEOUT_MS,
+    );
+  }
+
+  /** Start the CLI's sign-in on the plane host; 409 while one is already running. */
+  async startClaudeCodeLogin(): Promise<ClaudeCodeLoginStart> {
+    if (this.forceDemo) return { started: false, url: null };
+    return this.attachmentRequest<ClaudeCodeLoginStart>(
+      "/api/v1/assistant/claude-code/login",
+      { method: "POST" },
+      PROVIDER_READ_TIMEOUT_MS,
+    );
+  }
+
   /** Submit a draft the user confirmed: an ordinary submission under their own identity. */
   async submitAssistantDraft(draft: AssistantDraft): Promise<{ id: string }> {
     return this.attachmentRequest<{ id: string }>("/api/v1/workloads", {
@@ -932,6 +1094,43 @@ export class EyvanApiClient {
     );
   }
 
+  /** The headers every JSON request carries: content negotiation plus this session's credential. */
+  private requestHeaders(extra?: HeadersInit): HeadersInit {
+    return {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...apiAuthHeaders(),
+      ...(extra as Record<string, string> | undefined),
+    };
+  }
+
+  /** Turn a non-2xx answer into an ApiError carrying the plane's `detail`, retiring a refused session. */
+  private async refusal(path: string, response: Response): Promise<ApiError> {
+    let detail = "";
+    try {
+      detail = formatErrorDetail(((await response.json()) as { detail?: unknown }).detail);
+    } catch {
+      // The HTTP status remains actionable when an upstream returns a non-JSON error body.
+    }
+    // Tracking has a separate upstream credential. Its refusals belong to
+    // the tracking panel, never the browser's control-plane session.
+    // Compared by first path segment rather than a quoted path prefix: the
+    // route guard in tests/test_dashboard_calls_routes_that_exist.py treats
+    // every quoted absolute path in this file as a request it must serve.
+    const isTrackingRead = path.split("/")[1] === "tracking";
+    if (response.status === 401 && !isTrackingRead) {
+      rejectSession();
+      // A refused loopback credential retires itself here: the gate let
+      // this page through on the value it held, and the plane has just
+      // said that value will never be accepted. Without this, a rotated
+      // or reset credential turns every panel into the same 401 wall the
+      // gate exists to prevent -- the working command one terminal line
+      // away and never named.
+      invalidateRefusedLocalCredential(detail);
+    }
+    return new ApiError(`Eyvan API request failed with ${response.status}${detail}`, response.status);
+  }
+
   /** JSON and binary reads share authentication, cancellation and refusal handling. */
   private async requestBody<T>(
     path: string,
@@ -948,39 +1147,10 @@ export class EyvanApiClient {
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          ...apiAuthHeaders(),
-          ...init.headers,
-        },
+        headers: this.requestHeaders(init.headers),
         signal: controller.signal,
       });
-      if (!response.ok) {
-        let detail = "";
-        try {
-          detail = formatErrorDetail(((await response.json()) as { detail?: unknown }).detail);
-        } catch {
-          // The HTTP status remains actionable when an upstream returns a non-JSON error body.
-        }
-        // Tracking has a separate upstream credential. Its refusals belong to
-        // the tracking panel, never the browser's control-plane session.
-        // Compared by first path segment rather than a quoted path prefix: the
-        // route guard in tests/test_dashboard_calls_routes_that_exist.py treats
-        // every quoted absolute path in this file as a request it must serve.
-        const isTrackingRead = path.split("/")[1] === "tracking";
-        if (response.status === 401 && !isTrackingRead) {
-          rejectSession();
-          // A refused loopback credential retires itself here: the gate let
-          // this page through on the value it held, and the plane has just
-          // said that value will never be accepted. Without this, a rotated
-          // or reset credential turns every panel into the same 401 wall the
-          // gate exists to prevent -- the working command one terminal line
-          // away and never named.
-          invalidateRefusedLocalCredential(detail);
-        }
-        throw new ApiError(`Eyvan API request failed with ${response.status}${detail}`, response.status);
-      }
+      if (!response.ok) throw await this.refusal(path, response);
       return await read(response);
     } catch (error) {
       if (error instanceof ApiError) throw error;

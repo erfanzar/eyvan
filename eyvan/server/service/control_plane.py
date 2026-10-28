@@ -13,6 +13,7 @@ from eyvan.server.service._control_plane.artifact_collection import ArtifactColl
 from eyvan.server.service._control_plane.artifact_inventory import ArtifactInventoryMixin
 from eyvan.server.service._control_plane.artifact_io import ArtifactIoMixin
 from eyvan.server.service._control_plane.artifact_recovery import ArtifactRecoveryMixin
+from eyvan.server.service._control_plane.assistant_conversations import AssistantConversationsMixin
 from eyvan.server.service._control_plane.assistant_providers import AssistantProvidersMixin
 from eyvan.server.service._control_plane.audit import AuditMixin
 from eyvan.server.service._control_plane.callable_submission import CallableSubmissionMixin
@@ -751,6 +752,7 @@ from eyvan.server.service._control_plane.workload_storage import WorkloadStorage
 class ControlPlaneService(
     AccountsMixin,
     AssistantProvidersMixin,
+    AssistantConversationsMixin,
     TeamRequestsMixin,
     GovernanceMixin,
     SchedulingMixin,

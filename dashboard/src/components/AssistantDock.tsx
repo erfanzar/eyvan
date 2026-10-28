@@ -9,11 +9,11 @@ import {
   Check,
   ChevronDown,
   CircleStop,
+  History,
   Inbox,
   MessageSquarePlus,
   Search,
   Sparkles,
-  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -27,27 +27,35 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
-import type { AuthScope } from "../auth/oidc";
 import type {
+  AssistantChatStreamInput,
+  AssistantConversation,
   AssistantDraft,
-  AssistantMessage,
   AssistantProvider,
   AssistantProviderList,
-  AssistantTurn,
+  AssistantStreamEvent,
   TeamRequest,
 } from "../types";
-import { AssistantMarkdown } from "./AssistantMarkdown";
+import { AssistantHistory, type AssistantHistoryClient } from "./AssistantHistory";
+import { AnswerView } from "./AssistantTrace";
+import {
+  answerFromSaved,
+  applyStreamEvent,
+  finishAnswer,
+  streamingAnswer,
+  type AssistantAnswer,
+} from "./assistantStream";
 import { DOCK_MAX_WIDTH, DOCK_MIN_WIDTH } from "./assistantDockState";
 
 /** Methods the dock calls -- always as `client.method(...)`: the real class needs its `this`. */
-export interface AssistantDockClient {
+export interface AssistantDockClient extends AssistantHistoryClient {
   listAssistantProviders(signal?: AbortSignal): Promise<AssistantProviderList>;
-  assistantChat(
-    messages: AssistantMessage[],
-    selection?: { provider_id: string; model: string } | null,
-    scope?: AuthScope,
+  assistantChatStream(
+    body: AssistantChatStreamInput,
+    onEvent: (event: AssistantStreamEvent) => void,
     signal?: AbortSignal,
-  ): Promise<AssistantTurn>;
+  ): Promise<void>;
+  getAssistantConversation(id: string, signal?: AbortSignal): Promise<AssistantConversation>;
   submitAssistantDraft(draft: AssistantDraft): Promise<{ id: string }>;
   listTeamRequests(signal?: AbortSignal): Promise<TeamRequest[]>;
   resolveTeamRequest(
@@ -74,8 +82,13 @@ export interface AssistantDockProps {
   providersRevision?: number;
 }
 
-/** The conversation survives page navigation and reloads, but not the browser tab. */
-export const CONVERSATION_KEY = "eyvan.assistant.conversation";
+/**
+ * The plane keeps every conversation; the browser remembers only which one was
+ * open, so reopening the dock -- or the page -- resumes it.
+ */
+export const ACTIVE_CONVERSATION_KEY = "eyvan.assistant.active-conversation";
+/** Where earlier releases cached the whole conversation; cleared on sight. */
+const LEGACY_CONVERSATION_KEY = "eyvan.assistant.conversation";
 /** The last provider/model choice survives across tabs. */
 export const SELECTION_KEY = "eyvan.assistant.selection";
 
@@ -90,13 +103,7 @@ type DraftStatus = "pending" | "confirming" | "submitting" | "submitted" | "dism
 
 export type ChatItem =
   | { kind: "user"; id: string; content: string }
-  | {
-      kind: "assistant";
-      id: string;
-      content: string;
-      tools: Array<{ tool: string; ok: boolean }>;
-      model?: string;
-    }
+  | AssistantAnswer
   | { kind: "draft"; id: string; draft: AssistantDraft; status: DraftStatus; workloadId?: string; error?: string }
   | { kind: "request"; id: string; request: TeamRequest };
 
@@ -105,39 +112,26 @@ type Selection = { provider_id: string; model: string };
 let sequence = 0;
 const nextId = () => `${Date.now().toString(36)}-${(sequence += 1)}`;
 const message = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
+const statusOf = (error: unknown): unknown =>
+  error && typeof error === "object" && "status" in error ? (error as { status?: unknown }).status : undefined;
 const defaultModel = (provider: AssistantProvider) =>
   provider.models.includes(provider.default_model) ? provider.default_model : (provider.models[0] ?? "");
 
-function loadConversation(): ChatItem[] {
+function readActiveConversation(): string | null {
   try {
-    const parsed: unknown = JSON.parse(globalThis.sessionStorage?.getItem(CONVERSATION_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(
-        (item): item is ChatItem =>
-          typeof item === "object" &&
-          item !== null &&
-          typeof (item as ChatItem).id === "string" &&
-          ["user", "assistant", "draft", "request"].includes((item as ChatItem).kind),
-      )
-      .map((item) =>
-        // A submission that was mid-flight when the page went away is shown
-        // as undecided again; the user sees its state rather than a spinner.
-        item.kind === "draft" && (item.status === "submitting" || item.status === "confirming")
-          ? { ...item, status: "pending" }
-          : item,
-      );
+    globalThis.sessionStorage?.removeItem(LEGACY_CONVERSATION_KEY);
+    return globalThis.localStorage?.getItem(ACTIVE_CONVERSATION_KEY) || null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-function saveConversation(items: ChatItem[]): void {
+function writeActiveConversation(id: string | null): void {
   try {
-    if (items.length) globalThis.sessionStorage?.setItem(CONVERSATION_KEY, JSON.stringify(items));
-    else globalThis.sessionStorage?.removeItem(CONVERSATION_KEY);
+    if (id) globalThis.localStorage?.setItem(ACTIVE_CONVERSATION_KEY, id);
+    else globalThis.localStorage?.removeItem(ACTIVE_CONVERSATION_KEY);
   } catch {
-    // A conversation that cannot be remembered still works in this page.
+    // Resuming the last chat is a convenience; the plane still has it.
   }
 }
 
@@ -158,10 +152,21 @@ function saveSelection(selection: Selection): void {
   }
 }
 
-const toMessages = (items: ChatItem[]): AssistantMessage[] =>
-  items.flatMap((item) =>
-    item.kind === "user" || item.kind === "assistant" ? [{ role: item.kind, content: item.content }] : [],
-  );
+/** A saved conversation as dock items: finished answers with their trace, drafts as undecided cards. */
+export function itemsFromConversation(conversation: AssistantConversation): ChatItem[] {
+  return conversation.messages.flatMap((saved): ChatItem[] => {
+    if (saved.role === "user") return [{ kind: "user", id: saved.id, content: saved.content }];
+    return [
+      answerFromSaved(saved),
+      ...(saved.drafts ?? []).map(
+        (draft, index): ChatItem => ({ kind: "draft", id: `${saved.id}-draft-${index}`, draft, status: "pending" }),
+      ),
+      ...(saved.requests ?? []).map(
+        (request, index): ChatItem => ({ kind: "request", id: `${saved.id}-request-${index}`, request }),
+      ),
+    ];
+  });
+}
 
 interface PickerOption {
   provider: AssistantProvider;
@@ -521,7 +526,11 @@ export function AssistantDock({
   onOpenWorkload,
   providersRevision = 0,
 }: AssistantDockProps) {
-  const [items, setItems] = useState<ChatItem[]>(loadConversation);
+  const [items, setItems] = useState<ChatItem[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(readActiveConversation);
+  const [view, setView] = useState<"chat" | "history">("chat");
+  const [historyRevision, setHistoryRevision] = useState(0);
+  const [restoring, setRestoring] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -531,11 +540,19 @@ export function AssistantDock({
   const [tab, setTab] = useState<"chat" | "requests">("chat");
   const [requestsRevision, setRequestsRevision] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
+  const answerRef = useRef<string | null>(null);
+  const loadRef = useRef<AbortController | null>(null);
+  const conversationRef = useRef<string | null>(conversationId);
+  const restoredRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dockRef = useRef<HTMLElement>(null);
 
-  useEffect(() => saveConversation(items), [items]);
+  const chooseConversation = useCallback((id: string | null) => {
+    conversationRef.current = id;
+    setConversationId(id);
+    writeActiveConversation(id);
+  }, []);
 
   // Read when the dock opens rather than on every page load: a closed dock
   // costs the plane nothing.
@@ -559,6 +576,45 @@ export function AssistantDock({
 
   // An answer that is no longer wanted is not paid for.
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  const openConversation = useCallback(
+    async (id: string) => {
+      loadRef.current?.abort();
+      const controller = new AbortController();
+      loadRef.current = controller;
+      setRestoring(true);
+      setError(null);
+      try {
+        const conversation = await client.getAssistantConversation(id, controller.signal);
+        if (controller.signal.aborted) return;
+        setItems(itemsFromConversation(conversation));
+        chooseConversation(conversation.id);
+      } catch (failure) {
+        if (controller.signal.aborted) return;
+        // A chat deleted elsewhere is simply gone: start a fresh one.
+        if (statusOf(failure) === 404) {
+          setItems([]);
+          chooseConversation(null);
+        } else {
+          setError(message(failure, "Could not open the chat"));
+        }
+      } finally {
+        if (loadRef.current === controller) {
+          loadRef.current = null;
+          setRestoring(false);
+        }
+      }
+    },
+    [client, chooseConversation],
+  );
+
+  // Resume the remembered chat the first time the dock is shown.
+  useEffect(() => {
+    if (!open || restoredRef.current) return;
+    restoredRef.current = true;
+    const id = conversationRef.current;
+    if (id) void openConversation(id);
+  }, [open, openConversation]);
 
   const available = useMemo(
     () => (providers ?? []).filter((provider) => provider.enabled !== false && provider.models.length > 0),
@@ -600,7 +656,7 @@ export function AssistantDock({
   useEffect(() => {
     const log = logRef.current;
     if (log) log.scrollTop = log.scrollHeight;
-  }, [items, busy]);
+  }, [items, busy, view]);
 
   useEffect(() => {
     const area = textareaRef.current;
@@ -611,58 +667,139 @@ export function AssistantDock({
 
   const send = async (raw: string) => {
     const text = raw.trim();
-    if (!text || busy || !current) return;
-    const next: ChatItem[] = [...items, { kind: "user", id: nextId(), content: text }];
-    setItems(next);
+    if (!text || busy || restoring || !current) return;
+    const answerId = nextId();
+    setItems((existing) => [
+      ...existing,
+      { kind: "user", id: nextId(), content: text },
+      streamingAnswer(answerId, current.model),
+    ]);
     setInput("");
     setBusy(true);
     setError(null);
     const controller = new AbortController();
     abortRef.current = controller;
+    answerRef.current = answerId;
+    const updateAnswer = (change: (answer: AssistantAnswer) => AssistantAnswer) =>
+      setItems((existing) =>
+        existing.map((item) => (item.kind === "assistant" && item.id === answerId ? change(item) : item)),
+      );
+    const append = (added: ChatItem[]) => setItems((existing) => [...existing, ...added]);
+    let draftsSeen = 0;
+    let requestsSeen = 0;
+    const onEvent = (event: AssistantStreamEvent) => {
+      if (controller.signal.aborted) return;
+      switch (event.type) {
+        case "start":
+          if (event.conversation_id) chooseConversation(event.conversation_id);
+          updateAnswer((answer) => applyStreamEvent(answer, event));
+          return;
+        case "draft":
+          draftsSeen += 1;
+          append([{ kind: "draft", id: nextId(), draft: event.draft, status: "pending" }]);
+          return;
+        case "request":
+          requestsSeen += 1;
+          append([{ kind: "request", id: nextId(), request: event.request }]);
+          setRequestsRevision((value) => value + 1);
+          return;
+        case "done": {
+          updateAnswer((answer) => applyStreamEvent(answer, event));
+          // A plane that reports drafts only in the summary still shows them once.
+          const late: ChatItem[] = [
+            ...(draftsSeen ? [] : (event.drafts ?? [])).map(
+              (draft): ChatItem => ({ kind: "draft", id: nextId(), draft, status: "pending" }),
+            ),
+            ...(requestsSeen ? [] : (event.requests ?? [])).map(
+              (request): ChatItem => ({ kind: "request", id: nextId(), request }),
+            ),
+          ];
+          if (late.length) append(late);
+          if (!requestsSeen && event.requests?.length) setRequestsRevision((value) => value + 1);
+          return;
+        }
+        default:
+          updateAnswer((answer) => applyStreamEvent(answer, event));
+      }
+    };
     try {
-      const turn = await client.assistantChat(
-        toMessages(next),
-        { provider_id: current.provider.id, model: current.model },
-        undefined,
+      const conversation = conversationRef.current;
+      await client.assistantChatStream(
+        {
+          message: text,
+          ...(conversation ? { conversation_id: conversation } : {}),
+          provider_id: current.provider.id,
+          model: current.model,
+        },
+        onEvent,
         controller.signal,
       );
-      if (controller.signal.aborted) return;
-      const added: ChatItem[] = [
-        {
-          kind: "assistant",
-          id: nextId(),
-          content: turn.reply || "(no answer)",
-          tools: turn.tool_calls ?? [],
-          model: turn.model ?? current.model,
-        },
-        ...(turn.drafts ?? []).map((draft): ChatItem => ({ kind: "draft", id: nextId(), draft, status: "pending" })),
-        ...(turn.requests ?? []).map((request): ChatItem => ({ kind: "request", id: nextId(), request })),
-      ];
-      setItems((existing) => [...existing, ...added]);
-      if (turn.requests?.length) setRequestsRevision((value) => value + 1);
+      if (!controller.signal.aborted) {
+        updateAnswer((answer) =>
+          answer.status === "streaming"
+            ? finishAnswer(answer, "error", "The answer ended before the assistant finished.")
+            : answer,
+        );
+      }
     } catch (failure) {
-      if (!controller.signal.aborted) setError(message(failure, "The assistant could not answer"));
+      if (!controller.signal.aborted) {
+        updateAnswer((answer) =>
+          answer.status === "streaming"
+            ? finishAnswer(answer, "error", message(failure, "The assistant could not answer"))
+            : answer,
+        );
+      }
     } finally {
       if (abortRef.current === controller) {
         abortRef.current = null;
+        answerRef.current = null;
         setBusy(false);
       }
+      setHistoryRevision((value) => value + 1);
     }
   };
 
   const stop = () => {
-    abortRef.current?.abort();
+    const controller = abortRef.current;
+    const answerId = answerRef.current;
     abortRef.current = null;
+    answerRef.current = null;
+    controller?.abort();
+    if (answerId) {
+      setItems((existing) =>
+        existing.map((item) =>
+          item.kind === "assistant" && item.id === answerId && item.status === "streaming"
+            ? finishAnswer(item, "stopped")
+            : item,
+        ),
+      );
+    }
     setBusy(false);
   };
 
-  const newChat = () => {
+  const resetConversation = () => {
     stop();
+    loadRef.current?.abort();
+    loadRef.current = null;
+    setRestoring(false);
     setItems([]);
+    chooseConversation(null);
     setError(null);
+  };
+
+  const newChat = () => {
+    resetConversation();
     setInput("");
     setTab("chat");
+    setView("chat");
     textareaRef.current?.focus();
+  };
+
+  const openFromHistory = (id: string) => {
+    stop();
+    setItems([]);
+    setView("chat");
+    void openConversation(id);
   };
 
   const updateDraft = (id: string, patch: Partial<Extract<ChatItem, { kind: "draft" }>>) =>
@@ -702,6 +839,7 @@ export function AssistantDock({
 
   const loading = providers === null;
   const unconfigured = !loading && available.length === 0;
+  const showingHistory = view === "history" && tab === "chat";
 
   return (
     <aside
@@ -734,6 +872,19 @@ export function AssistantDock({
         </span>
         {current && <ModelPicker providers={available} current={current} onChoose={chooseModel} />}
         <span className="dock-header-actions">
+          <button
+            className={`icon-button ${showingHistory ? "icon-button-active" : ""}`}
+            type="button"
+            aria-label="Chat history"
+            aria-pressed={showingHistory}
+            title="Chat history"
+            onClick={() => {
+              setTab("chat");
+              setView(showingHistory ? "chat" : "history");
+            }}
+          >
+            <History size={15} aria-hidden="true" />
+          </button>
           <button className="icon-button" type="button" aria-label="New chat" title="New chat" onClick={newChat}>
             <MessageSquarePlus size={15} aria-hidden="true" />
           </button>
@@ -773,6 +924,16 @@ export function AssistantDock({
 
       {tab === "requests" && teamMode ? (
         <RequestsPanel client={client} canAdminister={canAdminister} revision={requestsRevision} />
+      ) : showingHistory ? (
+        <AssistantHistory
+          client={client}
+          activeId={conversationId}
+          revision={historyRevision}
+          onOpen={openFromHistory}
+          onDeleted={(id) => {
+            if (id === conversationRef.current) resetConversation();
+          }}
+        />
       ) : (
         <>
           <div className="dock-log" role="log" aria-label="Conversation" ref={logRef}>
@@ -793,7 +954,8 @@ export function AssistantDock({
                 )}
               </div>
             )}
-            {current && items.length === 0 && (
+            {restoring && <p className="dock-hint">Opening chat…</p>}
+            {current && items.length === 0 && !restoring && (
               <div className="dock-welcome">
                 <Sparkles size={20} aria-hidden="true" />
                 <strong>Ask about this plane</strong>
@@ -819,25 +981,7 @@ export function AssistantDock({
                     </div>
                   );
                 case "assistant":
-                  return (
-                    <div key={item.id} className="dock-message dock-message-assistant">
-                      <AssistantMarkdown text={item.content} />
-                      {item.tools.length > 0 && (
-                        <div className="dock-tools" aria-label="Tools used">
-                          {item.tools.map((call, index) => (
-                            <span
-                              key={`${call.tool}-${index}`}
-                              className={`dock-tool ${call.ok ? "" : "dock-tool-failed"}`}
-                              title={call.ok ? `${call.tool} answered` : `${call.tool} failed`}
-                            >
-                              <Wrench size={10} aria-hidden="true" />
-                              used {call.tool} {call.ok ? "✓" : "✗"}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
+                  return <AnswerView key={item.id} answer={item} />;
                 case "draft":
                   return (
                     <DraftCard
@@ -861,13 +1005,6 @@ export function AssistantDock({
                   );
               }
             })}
-            {busy && (
-              <div className="dock-typing" role="status" aria-label="Assistant is thinking">
-                <span />
-                <span />
-                <span />
-              </div>
-            )}
           </div>
           {error && (
             <div className="dock-alert" role="alert">

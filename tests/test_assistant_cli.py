@@ -80,6 +80,15 @@ def plane(tmp_path, monkeypatch):
                 raise EyvanApiError(response.status_code, response.text)
             return response.json()
 
+        def stream_lines(self, method, path, *, params=None, headers=None, json=None):
+            with self.http.stream(
+                method, path, params=params, json=json, headers={**self.headers, **(headers or {})}
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise EyvanApiError(response.status_code, response.text)
+                yield from response.iter_lines()
+
     monkeypatch.setattr(cli, "EyvanClient", ForwardingClient)
     return SimpleNamespace(app=app, script=script)
 
@@ -108,6 +117,50 @@ def test_ask_submits_the_draft_only_with_yes(plane) -> None:
     [workload] = _workloads(plane)
     assert f"submitted {workload['id']}" in result.output
     assert workload["created_by"] == "alice" and workload["spec"]["name"] == "llama-sft"
+
+
+def test_ask_streams_tool_progress_and_saves_a_chat_you_can_continue(plane) -> None:
+    plane.script.extend(_draft_script())
+    runner = CliRunner()
+    first = runner.invoke(cli.main, [*ALICE, "ask", "draft", "my", "job"])
+    assert first.exit_code == 0, first.output
+    assert "→ draft_workload(" in first.output and "✓ draft_workload" in first.output
+    assert "Here is a draft." in first.output
+    listed = runner.invoke(cli.main, [*ALICE, "assistant", "chats", "list", "--json"])
+    assert listed.exit_code == 0, listed.output
+    [chat] = json.loads(listed.output)["conversations"]
+    assert chat["title"] == "draft my job" and chat["message_count"] == 2
+
+    plane.script.append({"role": "assistant", "content": "second answer"})
+    second = runner.invoke(cli.main, [*ALICE, "ask", "--chat", chat["id"], "--quiet", "and", "then?"])
+    assert second.exit_code == 0, second.output
+    assert second.output.strip().endswith("second answer") and "→" not in second.output
+    shown = runner.invoke(cli.main, [*ALICE, "assistant", "chats", "show", chat["id"]])
+    assert "you: and then?" in shown.output and "✓ draft_workload" in shown.output
+
+    renamed = runner.invoke(cli.main, [*ALICE, "assistant", "chats", "rename", chat["id"], "Sizing", "chat"])
+    assert renamed.exit_code == 0 and "Sizing chat" in renamed.output
+    other = runner.invoke(
+        cli.main,
+        [
+            "--user",
+            "bob",
+            "--role",
+            "project_submitter",
+            "--org",
+            "acme",
+            "--project",
+            "r",
+            "assistant",
+            "chats",
+            "show",
+            chat["id"],
+        ],
+    )
+    assert other.exit_code != 0
+    deleted = runner.invoke(cli.main, [*ALICE, "assistant", "chats", "delete", chat["id"]])
+    assert deleted.exit_code == 0
+    assert "no saved chats" in runner.invoke(cli.main, [*ALICE, "assistant", "chats", "list"]).output
 
 
 def test_size_and_requests_commands(plane, tmp_path) -> None:

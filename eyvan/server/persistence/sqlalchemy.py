@@ -48,6 +48,7 @@ from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import (
     ApiTokenRecord,
     ArtifactReferenceRecord,
+    AssistantConversationRecord,
     AssistantProviderRecord,
     AuditEvent,
     BudgetRecord,
@@ -89,7 +90,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0022_assistant_providers"
+SCHEMA_REVISION = "0023_assistant_conversations"
 
 
 @tp.runtime_checkable
@@ -252,6 +253,15 @@ class AssistantProviderRow(Base):
 
     __tablename__ = "assistant_providers"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class AssistantConversationRow(Base):
+    """A user's saved assistant chat; ``subject`` is filtered on so a list never scans other users'."""
+
+    __tablename__ = "assistant_conversations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(256), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -996,6 +1006,31 @@ class SqlAlchemySession:
 
     async def delete_assistant_provider(self, provider_id: str) -> bool:
         row = await self._get_locked(AssistantProviderRow, provider_id)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        return True
+
+    async def get_assistant_conversation(self, conversation_id: str) -> AssistantConversationRecord | None:
+        row = await self._get_locked(AssistantConversationRow, conversation_id)
+        return None if row is None else AssistantConversationRecord.model_validate(row.data)
+
+    async def list_assistant_conversations(self, *, subject: str) -> list[AssistantConversationRecord]:
+        statement = select(AssistantConversationRow).where(AssistantConversationRow.subject == subject)
+        rows = (await self.session.scalars(statement)).all()
+        return sorted(
+            _decode_rows(AssistantConversationRecord, rows, table="assistant_conversations"),
+            key=lambda item: (item.updated_at, item.id),
+            reverse=True,
+        )
+
+    async def put_assistant_conversation(self, conversation: AssistantConversationRecord) -> None:
+        await self.session.merge(
+            AssistantConversationRow(id=conversation.id, subject=conversation.subject, data=_dump(conversation))
+        )
+
+    async def delete_assistant_conversation(self, conversation_id: str) -> bool:
+        row = await self._get_locked(AssistantConversationRow, conversation_id)
         if row is None:
             return False
         await self.session.delete(row)

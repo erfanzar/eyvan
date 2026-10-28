@@ -155,8 +155,25 @@ export interface AssistantPreset {
   key_required: boolean;
   /** Where an admin gets a key, when the provider has a page for it. */
   key_url: string | null;
-  sign_in: "openrouter" | null;
+  /** `claude-code` signs the plane host's Claude Code CLI in; no key is stored. */
+  sign_in: "openrouter" | "claude-code" | null;
   suggested_models: string[];
+}
+
+/** What the plane host's Claude Code CLI reports about itself. */
+export interface ClaudeCodeStatus {
+  installed: boolean;
+  version: string | null;
+  logged_in: boolean;
+  auth_method: string | null;
+  subscription_type: string | null;
+  detail: string | null;
+}
+
+/** The sign-in runs in a browser on the plane host; `url` is set when it can be opened from here. */
+export interface ClaudeCodeLoginStart {
+  started: boolean;
+  url: string | null;
 }
 
 /** With a preset the server fills name, base URL and models it can infer. */
@@ -234,6 +251,78 @@ export interface AssistantTurn {
   requests: TeamRequest[];
   provider_id?: string;
   model?: string;
+}
+
+/** One streamed chat turn; the plane fills org/project from the client's scope when omitted. */
+export interface AssistantChatStreamInput {
+  message: string;
+  conversation_id?: string;
+  org_id?: string;
+  project_id?: string;
+  provider_id?: string;
+  model?: string;
+}
+
+/** One NDJSON line of `POST /api/v1/assistant/chat/stream`. */
+export type AssistantStreamEvent =
+  | { type: "start"; conversation_id: string; provider_id?: string; model?: string; title?: string }
+  | { type: "step"; step: number; max_steps: number }
+  | { type: "thinking"; delta: string }
+  | { type: "text"; delta: string }
+  | { type: "tool_call"; id: string; name: string; arguments: Record<string, unknown> | null }
+  | { type: "tool_result"; id: string; name: string; ok: boolean; summary: string }
+  | { type: "draft"; draft: AssistantDraft }
+  | { type: "request"; request: TeamRequest }
+  | {
+      type: "done";
+      reply: string;
+      steps: number;
+      tool_calls: Array<{ tool: string; ok: boolean }>;
+      drafts: AssistantDraft[];
+      requests: TeamRequest[];
+      message_id?: string;
+    }
+  | { type: "error"; detail: string };
+
+export interface AssistantConversationSummary {
+  id: string;
+  title: string;
+  provider_id: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+/** A tool call saved with an assistant message. */
+export interface AssistantTraceEntry {
+  type: "tool";
+  name: string;
+  ok: boolean;
+  summary: string;
+  arguments: Record<string, unknown> | null;
+}
+
+export interface AssistantConversationMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+  trace?: AssistantTraceEntry[];
+  drafts?: AssistantDraft[];
+  requests?: TeamRequest[];
+  provider_id?: string | null;
+  model?: string | null;
+}
+
+export interface AssistantConversation {
+  id: string;
+  title: string;
+  provider_id: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+  messages: AssistantConversationMessage[];
 }
 
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";

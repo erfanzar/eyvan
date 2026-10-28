@@ -38,7 +38,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan.config import EyvanSettings
-from eyvan.records import ASSISTANT_MODEL_PATTERN, Principal, utcnow
+from eyvan.records import ASSISTANT_MODEL_PATTERN, CLAUDE_CODE_BASE_URL, Principal, utcnow
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.service.errors import EyvanServiceError
 
@@ -62,6 +62,8 @@ OPENROUTER_KEY_EXCHANGE_URL = "https://openrouter.ai/api/v1/auth/keys"
 SIGN_IN_TTL_S = 600
 MAX_PENDING_SIGN_INS = 64
 SETTINGS_REDIRECT = "/#/settings"
+#: The preset answered by the plane host's own ``claude`` CLI rather than over HTTP.
+CLAUDE_CODE_PRESET = "claude-code"
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +103,17 @@ PRESETS: tuple[AssistantPreset, ...] = (
         key_url="https://openrouter.ai/keys",
         sign_in="openrouter",
         suggested_models=("anthropic/claude-sonnet-4", "openai/gpt-4.1", "z-ai/glm-4.6", "moonshotai/kimi-k2"),
+    ),
+    # The plane host's own signed-in `claude` CLI: no URL, no key (see assistant_claude_code).
+    AssistantPreset(
+        "claude-code",
+        "Claude Code",
+        "",
+        key_required=False,
+        editable_url=False,
+        key_url="https://claude.com/product/claude-code",
+        sign_in="claude-code",
+        suggested_models=("sonnet", "opus", "haiku"),
     ),
     AssistantPreset(
         "openai",
@@ -202,6 +215,13 @@ def resolve_base_url(preset: AssistantPreset | None, base_url: str | None) -> st
     """The URL a provider uses: fixed by its preset, or given when the preset allows it."""
 
     given = (base_url or "").strip().rstrip("/")
+    if preset is not None and preset.id == CLAUDE_CODE_PRESET:
+        if given and given != CLAUDE_CODE_BASE_URL:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Claude Code runs as the plane host's own CLI and takes no base URL",
+            )
+        return CLAUDE_CODE_BASE_URL
     if preset is not None and not preset.editable_url:
         if given and given != preset.base_url:
             raise HTTPException(
@@ -255,6 +275,22 @@ async def discover_models(
     return sorted(found)[:MAX_DISCOVERED_MODELS]
 
 
+async def _claude_code_model_list(executable: str | None) -> tuple[list[str], str, str | None]:
+    """(models, source, detail) from the plane host's Claude Code CLI, never over HTTP.
+
+    Falls back to the preset's suggestions when the CLI's list cannot be read.
+    """
+
+    # Imported here: assistant_claude_code imports ModelDiscoveryError from this module.
+    from eyvan.server.api.assistant_claude_code import claude_code_models, find_claude_executable
+
+    try:
+        models = await claude_code_models(executable or find_claude_executable())
+    except ModelDiscoveryError as exc:
+        return list(PRESETS_BY_ID[CLAUDE_CODE_PRESET].suggested_models), "suggested", str(exc)
+    return models[:MAX_DISCOVERED_MODELS], "live", None
+
+
 def _unique_name(base: str, taken: set[str]) -> str:
     base = base[:60]
     if base.lower() not in taken:
@@ -276,8 +312,14 @@ async def provider_creation_fields(
     models: tp.Sequence[str] | None,
     api_key: str | None,
     transport: httpx.AsyncBaseTransport | None,
+    claude_code_executable: str | None = None,
 ) -> dict[str, tp.Any]:
-    """Fill a new provider's name, URL and models from its preset where the admin left them out."""
+    """Fill a new provider's name, URL and models from its preset where the admin left them out.
+
+    A ``claude-code`` provider takes no key; without chosen models it offers the
+    plane host's live Claude Code model list (``claude_code_executable``, else the
+    discovered ``claude``), or the preset's suggestions when that cannot be read.
+    """
 
     preset = get_preset(preset_id) if preset_id else None
     if preset is None and not (name and base_url and models):
@@ -288,6 +330,14 @@ async def provider_creation_fields(
     if preset is not None and preset.key_required and not (api_key or "").strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{preset.label} needs an API key")
     chosen = [model.strip() for model in models or () if model.strip()]
+    if preset is not None and preset.id == CLAUDE_CODE_PRESET:
+        if (api_key or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Claude Code uses the plane host's own sign-in and takes no API key",
+            )
+        if not chosen:
+            chosen = (await _claude_code_model_list(claude_code_executable))[0][:MAX_PROVIDER_MODELS]
     if not chosen and preset is not None:
         chosen = list(preset.suggested_models)
         if not chosen:
@@ -418,7 +468,7 @@ def _settings_redirect(query: str) -> RedirectResponse:
 
 
 def register_assistant_preset_routes(app: FastAPI, *, settings: EyvanSettings, service: ControlPlaneService) -> None:
-    """Register preset listing, model discovery and OpenRouter sign-in routes."""
+    """Register preset listing, model discovery, OpenRouter sign-in and Claude Code host routes."""
 
     sign_ins = OpenRouterSignIns()
     app.state.openrouter_sign_ins = sign_ins
@@ -432,6 +482,16 @@ def register_assistant_preset_routes(app: FastAPI, *, settings: EyvanSettings, s
     def transport(request: Request) -> httpx.AsyncBaseTransport | None:
         # A test/embedding seam, not configuration: a fake provider transport.
         return getattr(request.app.state, "assistant_transport", None)
+
+    def claude_code_executable(request: Request) -> str | None:
+        # A test/embedding seam, not configuration: the `claude` executable to use.
+        override = getattr(request.app.state, "claude_code_executable", None)
+        return str(override) if override else None
+
+    # Imported here: assistant_claude_code imports ModelDiscoveryError from this module.
+    from eyvan.server.api.assistant_claude_code import register_claude_code_routes
+
+    register_claude_code_routes(app, service=service)
 
     @app.get("/api/v1/assistant/presets", tags=["assistant"])
     async def list_assistant_presets(principal: _Principal) -> dict[str, tp.Any]:
@@ -455,6 +515,10 @@ def register_assistant_preset_routes(app: FastAPI, *, settings: EyvanSettings, s
         else:
             preset = get_preset(body.preset) if body.preset else None
             url, key = resolve_base_url(preset, body.base_url), body.api_key
+        if (preset is not None and preset.id == CLAUDE_CODE_PRESET) or url == CLAUDE_CODE_BASE_URL:
+            # The plane host's own CLI lists its models; nothing goes over HTTP and no key is used.
+            models, source, detail = await _claude_code_model_list(claude_code_executable(request))
+            return {"models": models, "source": source, "detail": detail}
         suggestions = list(preset.suggested_models) if preset is not None else []
         try:
             models = await discover_models(url, key, transport=transport(request))
@@ -517,6 +581,7 @@ def register_assistant_preset_routes(app: FastAPI, *, settings: EyvanSettings, s
 
 
 __all__ = (
+    "CLAUDE_CODE_PRESET",
     "PRESETS",
     "PRESETS_BY_ID",
     "AssistantPreset",

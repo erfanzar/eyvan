@@ -921,7 +921,9 @@ class TeamRequestRecord(EyvanModel):
 
 
 #: One model name as an OpenAI-compatible endpoint spells it.
-ASSISTANT_MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
+ASSISTANT_MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,127}$"
+#: The base URL a Claude Code provider records: it is a local CLI, never an HTTP endpoint.
+CLAUDE_CODE_BASE_URL = "claude-code://local"
 
 
 class AssistantProviderRecord(EyvanModel):
@@ -951,8 +953,16 @@ class AssistantProviderRecord(EyvanModel):
         _validate_string(self.name, field_name="assistant provider name")
         from urllib.parse import urlsplit
 
-        parsed = urlsplit(self.base_url)
-        if (
+        if self.preset == "claude-code" or self.base_url == CLAUDE_CODE_BASE_URL:
+            # Claude Code runs as the plane host's own `claude` CLI, not over HTTP.
+            if self.preset != "claude-code" or self.base_url != CLAUDE_CODE_BASE_URL:
+                raise ValueError(f"the claude-code preset and base_url {CLAUDE_CODE_BASE_URL!r} go together")
+            if self.api_key_ciphertext is not None:
+                raise ValueError("a Claude Code provider uses the host's own sign-in and stores no key")
+            parsed = None
+        else:
+            parsed = urlsplit(self.base_url)
+        if parsed is not None and (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.username is not None
@@ -968,6 +978,55 @@ class AssistantProviderRecord(EyvanModel):
                 raise ValueError(f"invalid model name {model!r}")
         if self.default_model not in self.models:
             raise ValueError("default_model must be one of the provider's models")
+        return self
+
+
+#: Bounds on one saved assistant conversation, so a chat cannot grow a record without limit.
+MAX_CONVERSATION_MESSAGES = 200
+MAX_CONVERSATION_MESSAGE_CHARS = 32000
+MAX_CONVERSATION_TRACE_ITEMS = 64
+
+
+class AssistantMessageRecord(EyvanModel):
+    """One visible turn of a saved assistant conversation.
+
+    ``trace`` holds what the assistant did to answer (tool names, outcomes and
+    short result summaries); ``drafts`` and ``requests`` are what it produced.
+    None of it carries a provider key.
+    """
+
+    id: str = Field(pattern=r"^msg_[0-9a-f]{16}$")
+    role: tp.Literal["user", "assistant"]
+    content: str = Field(max_length=MAX_CONVERSATION_MESSAGE_CHARS)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    provider_id: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=128)
+    trace: tuple[dict[str, tp.Any], ...] = Field(default=(), max_length=MAX_CONVERSATION_TRACE_ITEMS)
+    drafts: tuple[dict[str, tp.Any], ...] = Field(default=(), max_length=32)
+    requests: tuple[dict[str, tp.Any], ...] = Field(default=(), max_length=32)
+    #: Set when the turn ended in an error or was stopped, so history shows it honestly.
+    error: str | None = Field(default=None, max_length=2000)
+
+
+class AssistantConversationRecord(EyvanModel):
+    """A user's saved chat with the fleet assistant; only its owner may read or change it."""
+
+    id: str = Field(pattern=r"^conv_[0-9a-f]{16}$")
+    subject: str = Field(min_length=1, max_length=256)
+    title: str = Field(min_length=1, max_length=200)
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    provider_id: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=128)
+    messages: tuple[AssistantMessageRecord, ...] = Field(default=(), max_length=MAX_CONVERSATION_MESSAGES)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    updated_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_conversation(self) -> AssistantConversationRecord:
+        _validate_string(self.title, field_name="assistant conversation title")
+        if len({message.id for message in self.messages}) != len(self.messages):
+            raise ValueError("assistant conversation messages must have unique IDs")
         return self
 
 

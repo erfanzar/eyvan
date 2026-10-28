@@ -27,6 +27,7 @@ from eyvan._internal.workspace import create_private_directory
 from eyvan.records import (
     ApiTokenRecord,
     ArtifactReferenceRecord,
+    AssistantConversationRecord,
     AssistantProviderRecord,
     AuditEvent,
     BudgetRecord,
@@ -108,7 +109,10 @@ LOCAL_CONTROL_PLANE_REQUESTS_SCHEMA_VERSION = 8
 #: Emitted once a fleet admin configures an assistant provider: an older build
 #: must refuse the file rather than silently forget the configured endpoints.
 LOCAL_CONTROL_PLANE_ASSISTANT_SCHEMA_VERSION = 9
-LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+#: Emitted once a user has a saved assistant conversation: an older build must
+#: refuse the file rather than silently drop people's chat history.
+LOCAL_CONTROL_PLANE_CONVERSATIONS_SCHEMA_VERSION = 10
+LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 LOCAL_CONTROL_PLANE_V1_BACKUP_SUFFIX = ".v1.bak"
 LOCAL_CONTROL_PLANE_MAX_BYTES = 64 * 1024 * 1024
 _LOCAL_CONTROL_PLANE_MAX_INTEGER_DIGITS = 128
@@ -319,6 +323,8 @@ class LocalControlPlaneDocument(_LocalControlPlaneDocumentBase):
             raise ValueError("team requests require the v8 local control-plane document")
         if state.assistant_providers:
             raise ValueError("assistant providers require the v9 local control-plane document")
+        if state.assistant_conversations:
+            raise ValueError("assistant conversations require the v10 local control-plane document")
         progress_reports = sorted(
             (
                 LocalProgressReportDocument(workload_id=workload_id, report=report)
@@ -707,6 +713,36 @@ class LocalControlPlaneV9Document(LocalControlPlaneV8Document):
         return state
 
 
+class LocalControlPlaneV10Document(LocalControlPlaneV9Document):
+    """Schema-v10 document: v9 plus users' saved assistant conversations."""
+
+    version: Literal[10] = LOCAL_CONTROL_PLANE_CONVERSATIONS_SCHEMA_VERSION  # type: ignore[assignment]
+    assistant_conversations: tuple[AssistantConversationRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_v10_document(self) -> LocalControlPlaneV10Document:
+        """Reject duplicate conversation identities before restoration merges them."""
+
+        if len({record.id for record in self.assistant_conversations}) != len(self.assistant_conversations):
+            raise ValueError("local control-plane assistant conversations must have unique IDs")
+        return self
+
+    @classmethod
+    def from_state(cls, state: ControlPlaneState) -> LocalControlPlaneV10Document:
+        """Encode one snapshot including every saved conversation."""
+
+        conversations = tuple(state.assistant_conversations[key] for key in sorted(state.assistant_conversations))
+        base = LocalControlPlaneV9Document.from_state(replace(state, assistant_conversations={}))
+        return cls(**base.model_dump(exclude={"version"}), assistant_conversations=conversations)
+
+    def to_state(self) -> ControlPlaneState:
+        """Restore v9 aggregates plus every saved conversation."""
+
+        state = super().to_state()
+        state.assistant_conversations = {record.id: record for record in self.assistant_conversations}
+        return state
+
+
 def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneDocument:
     """Return the lowest document version that can carry one whole state.
 
@@ -719,6 +755,8 @@ def local_control_plane_document(state: ControlPlaneState) -> LocalControlPlaneD
     discarding durable state it does not understand.
     """
 
+    if state.assistant_conversations:
+        return LocalControlPlaneV10Document.from_state(state)
     if state.assistant_providers:
         return LocalControlPlaneV9Document.from_state(state)
     if state.team_requests:
@@ -746,6 +784,7 @@ _LocalControlPlaneReadableDocument: tp.TypeAlias = (
     | LocalControlPlaneV7Document
     | LocalControlPlaneV8Document
     | LocalControlPlaneV9Document
+    | LocalControlPlaneV10Document
 )
 _LocalFileIdentity: tp.TypeAlias = tuple[int, int, int, int, int]
 
@@ -900,6 +939,7 @@ class LocalControlPlaneStore:
                 LOCAL_CONTROL_PLANE_TEAM_SCHEMA_VERSION: LocalControlPlaneV7Document,
                 LOCAL_CONTROL_PLANE_REQUESTS_SCHEMA_VERSION: LocalControlPlaneV8Document,
                 LOCAL_CONTROL_PLANE_ASSISTANT_SCHEMA_VERSION: LocalControlPlaneV9Document,
+                LOCAL_CONTROL_PLANE_CONVERSATIONS_SCHEMA_VERSION: LocalControlPlaneV10Document,
             }
             document = models[version].model_validate(raw)
         except LocalControlPlaneSchemaError:
@@ -1444,6 +1484,7 @@ class LocalJsonRepository(StateRepository):
 
 __all__ = (
     "LOCAL_CONTROL_PLANE_ASSISTANT_SCHEMA_VERSION",
+    "LOCAL_CONTROL_PLANE_CONVERSATIONS_SCHEMA_VERSION",
     "LOCAL_CONTROL_PLANE_MAX_BYTES",
     "LOCAL_CONTROL_PLANE_READABLE_SCHEMA_VERSIONS",
     "LOCAL_CONTROL_PLANE_REQUESTS_SCHEMA_VERSION",
@@ -1469,6 +1510,7 @@ __all__ = (
     "LocalControlPlaneV7Document",
     "LocalControlPlaneV8Document",
     "LocalControlPlaneV9Document",
+    "LocalControlPlaneV10Document",
     "LocalJsonRepository",
     "LocalJsonSession",
     "LocalProgressReportDocument",

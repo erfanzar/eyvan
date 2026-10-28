@@ -28,8 +28,8 @@ import json
 import logging
 import typing as tp
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from eyvan.config import EyvanSettings
@@ -41,6 +41,8 @@ from eyvan.domain.sizing import (
     size_job,
 )
 from eyvan.records import (
+    AssistantConversationRecord,
+    AssistantMessageRecord,
     AssistantProviderRecord,
     CapacityClass,
     CommandExecution,
@@ -53,8 +55,17 @@ from eyvan.records import (
     WorkloadState,
 )
 from eyvan.server.api.assistant_presets import provider_creation_fields, register_assistant_preset_routes
+from eyvan.server.api.assistant_stream import (
+    AssistantProviderError,
+    ChatModel,
+    OpenAICompatibleChat,
+    StreamEvent,
+    collect_turn,
+    run_turn_stream,
+)
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.api.team_routes import require_team_mode
+from eyvan.server.service._control_plane.assistant_conversations import clip_message, clip_trace, new_message_id
 from eyvan.server.service.errors import EyvanServiceError
 
 if tp.TYPE_CHECKING:
@@ -383,106 +394,39 @@ def size_request(
 # ------------------------------------------------------------------- loop
 
 
-class AssistantProviderError(RuntimeError):
-    """The configured provider could not answer; the message never carries the key."""
+#: Kept for callers that imported the one-shot provider; it now streams over SSE.
+AssistantProvider = OpenAICompatibleChat
 
 
-class AssistantProvider:
-    """One OpenAI-compatible chat-completions endpoint."""
-
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        model: str,
-        api_key: str | None,
-        transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
-        self.url = base_url.rstrip("/") + "/chat/completions"
-        self.model = model
-        self._key = api_key
-        self._transport = transport
-
-    def __repr__(self) -> str:
-        return f"AssistantProvider(url={self.url!r}, model={self.model!r})"
-
-    async def complete(self, messages: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
-        headers = {"Content-Type": "application/json"}
-        if self._key:
-            headers["Authorization"] = f"Bearer {self._key}"
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "tools": [{"type": "function", "function": spec} for spec in TOOL_SPECS],
-            "tool_choice": "auto",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_S, transport=self._transport) as client:
-                response = await client.post(self.url, json=body, headers=headers)
-        except httpx.HTTPError as exc:
-            logger.warning("assistant provider unreachable: %s", type(exc).__name__)
-            raise AssistantProviderError(f"the assistant provider is unreachable ({type(exc).__name__})") from None
-        if response.status_code != 200:
-            logger.warning("assistant provider answered HTTP %s", response.status_code)
-            detail = _scrub(response.text[:300], self._key)
-            raise AssistantProviderError(f"the assistant provider answered HTTP {response.status_code}: {detail}")
-        try:
-            message = response.json()["choices"][0]["message"]
-        except (ValueError, KeyError, IndexError, TypeError):
-            raise AssistantProviderError("the assistant provider returned an unreadable answer") from None
-        if not isinstance(message, dict):
-            raise AssistantProviderError("the assistant provider returned an unreadable answer")
-        return message
+def system_prompt(tools: AssistantTools) -> str:
+    return f"{SYSTEM_PROMPT}\nUser: {tools.principal.subject}. Scope: {tools.org_id}/{tools.project_id}."
 
 
 async def run_chat(
-    provider: AssistantProvider, tools: AssistantTools, history: list[dict[str, str]], *, max_steps: int
+    provider: ChatModel, tools: AssistantTools, history: list[dict[str, str]], *, max_steps: int
 ) -> dict[str, tp.Any]:
-    """Run at most ``max_steps`` provider round trips and return the reply plus what tools did."""
+    """Run one whole turn and return the reply plus what tools did (the non-streaming answer)."""
 
-    messages: list[dict[str, tp.Any]] = [
-        {
-            "role": "system",
-            "content": f"{SYSTEM_PROMPT}\nUser: {tools.principal.subject}. Scope: {tools.org_id}/{tools.project_id}.",
-        },
-        *history,
-    ]
-    trace: list[dict[str, tp.Any]] = []
-    for step in range(1, max_steps + 1):
-        message = await provider.complete(messages)
-        calls = message.get("tool_calls") or []
-        if not calls:
-            return _turn(str(message.get("content") or ""), step, trace, tools)
-        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
-        for call in calls:
-            function = call.get("function") or {}
-            name = str(function.get("name", ""))
-            try:
-                arguments = json.loads(function.get("arguments") or "{}")
-                if not isinstance(arguments, dict):
-                    raise ValueError("arguments must be an object")
-            except ValueError:
-                outcome = ToolOutcome(name, False, {"error": "arguments were not a JSON object"})
-            else:
-                outcome = await tools.call(name, arguments)
-            content = json.dumps(outcome.result, default=str)
-            if len(content) > MAX_TOOL_RESULT_CHARS:
-                content = content[:MAX_TOOL_RESULT_CHARS] + '..."(truncated)"'
-            trace.append({"tool": name, "ok": outcome.ok})
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": content})
-    return _turn(
-        f"I stopped after {max_steps} steps without a final answer; ask a narrower question.", max_steps, trace, tools
+    events = run_turn_stream(
+        provider, tools, list(history), system=system_prompt(tools), tool_specs=list(TOOL_SPECS), max_steps=max_steps
     )
+    return await collect_turn(events)
 
 
-def _turn(reply: str, steps: int, trace: list[dict[str, tp.Any]], tools: AssistantTools) -> dict[str, tp.Any]:
-    return {
-        "reply": reply,
-        "steps": steps,
-        "tool_calls": trace,
-        "drafts": tools.drafts,
-        "requests": [request.model_dump(mode="json") for request in tools.requests],
-    }
+def chat_model_for(record: AssistantProviderRecord, model: str, key: str | None, request: Request) -> ChatModel:
+    """The streaming chat model for one resolved provider: Claude Code, or an OpenAI-compatible endpoint."""
+
+    if record.preset == "claude-code":
+        from eyvan.server.api.assistant_claude_code import claude_code_chat
+
+        return tp.cast(ChatModel, claude_code_chat(model, request))
+    return OpenAICompatibleChat(
+        base_url=record.base_url,
+        model=model,
+        api_key=key,
+        # A test/embedding seam, not configuration: a fake provider transport.
+        transport=getattr(request.app.state, "assistant_transport", None),
+    )
 
 
 # ----------------------------------------------------------------- routes
@@ -507,6 +451,34 @@ class ChatBody(_Body):
     #: enabled provider by name and its default model.
     provider_id: str | None = Field(default=None, max_length=32)
     model: str | None = Field(default=None, max_length=128)
+
+
+class StreamChatBody(_Body):
+    #: Only the new message travels; earlier turns come from the saved conversation.
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    conversation_id: str | None = Field(default=None, max_length=32)
+    org_id: str = Field(default="default", min_length=1, max_length=128)
+    project_id: str = Field(default="default", min_length=1, max_length=128)
+    provider_id: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=128)
+
+
+class RenameConversationBody(_Body):
+    title: str = Field(min_length=1, max_length=200)
+
+
+def conversation_summary(record: AssistantConversationRecord) -> dict[str, tp.Any]:
+    return {
+        "id": record.id,
+        "title": record.title,
+        "provider_id": record.provider_id,
+        "model": record.model,
+        "org_id": record.org_id,
+        "project_id": record.project_id,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+        "message_count": len(record.messages),
+    }
 
 
 class ProviderCreateBody(_Body):
@@ -639,6 +611,7 @@ def register_assistant_routes(
             models=body.models,
             api_key=body.api_key,
             transport=getattr(request.app.state, "assistant_transport", None),
+            claude_code_executable=getattr(request.app.state, "claude_code_executable", None),
         )
         created = await service.create_assistant_provider(
             principal,
@@ -684,13 +657,7 @@ def register_assistant_routes(
         record, model, key = await service.resolve_assistant_provider(
             principal, provider_id=body.provider_id, model=body.model
         )
-        chosen = AssistantProvider(
-            base_url=record.base_url,
-            model=model,
-            api_key=key,
-            # A test/embedding seam, not configuration: a fake provider transport.
-            transport=getattr(request.app.state, "assistant_transport", None),
-        )
+        chosen = chat_model_for(record, model, key, request)
         tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
         tools.team_mode = settings.team_mode
         history = [message.model_dump() for message in body.messages]
@@ -699,6 +666,153 @@ def register_assistant_routes(
         except AssistantProviderError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from None
         return {**turn, "provider_id": record.id, "model": model}
+
+    @app.post("/api/v1/assistant/chat/stream", tags=["assistant"])
+    async def assistant_chat_stream(body: StreamChatBody, request: Request, principal: _Principal) -> StreamingResponse:
+        """Run one turn and stream every step, tool call and text delta as NDJSON; save it to the conversation.
+
+        Refusals (unknown provider or conversation, unlisted model) are ordinary
+        HTTP errors raised before the stream starts; a provider failure after it
+        started arrives as a final ``error`` event and is saved on the turn.
+        """
+
+        record, model, key = await service.resolve_assistant_provider(
+            principal, provider_id=body.provider_id, model=body.model
+        )
+        if body.conversation_id is not None:
+            conversation = await service.get_assistant_conversation(principal, body.conversation_id)
+        else:
+            conversation = await service.start_assistant_conversation(
+                principal,
+                first_message=body.message,
+                org_id=body.org_id,
+                project_id=body.project_id,
+                provider_id=record.id,
+                model=model,
+            )
+        history = [
+            {"role": item.role, "content": item.content}
+            for item in conversation.messages
+            if item.content.strip() and item.error is None
+        ][-(MAX_CLIENT_MESSAGES - 1) :]
+        history.append({"role": "user", "content": body.message})
+        user_message = AssistantMessageRecord(id=new_message_id(), role="user", content=clip_message(body.message))
+        await service.append_assistant_messages(principal, conversation.id, [user_message])
+        chosen = chat_model_for(record, model, key, request)
+        tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
+        tools.team_mode = settings.team_mode
+
+        async def events() -> tp.AsyncIterator[bytes]:
+            def line(event: StreamEvent) -> bytes:
+                return (json.dumps(event, default=str) + "\n").encode("utf-8")
+
+            yield line(
+                {
+                    "type": "start",
+                    "conversation_id": conversation.id,
+                    "provider_id": record.id,
+                    "model": model,
+                    "title": conversation.title,
+                    "user_message_id": user_message.id,
+                }
+            )
+            trace: list[dict[str, tp.Any]] = []
+            by_id: dict[str, dict[str, tp.Any]] = {}
+            message_id = new_message_id()
+            try:
+                async for event in run_turn_stream(
+                    chosen,
+                    tools,
+                    history,
+                    system=system_prompt(tools),
+                    tool_specs=list(TOOL_SPECS),
+                    max_steps=record.max_steps,
+                ):
+                    kind = event.get("type")
+                    if kind == "tool_call":
+                        item = {"type": "tool", "name": event["name"], "arguments": event.get("arguments"), "ok": None}
+                        by_id[str(event.get("id"))] = item
+                        trace.append(item)
+                    elif kind == "tool_result":
+                        item = by_id.get(str(event.get("id"))) or {"type": "tool", "name": event["name"]}
+                        item.update(ok=event.get("ok"), summary=event.get("summary"))
+                    elif kind == "done":
+                        await service.append_assistant_messages(
+                            principal,
+                            conversation.id,
+                            [
+                                AssistantMessageRecord(
+                                    id=message_id,
+                                    role="assistant",
+                                    content=clip_message(str(event.get("reply") or "")),
+                                    provider_id=record.id,
+                                    model=model,
+                                    trace=clip_trace(trace),
+                                    drafts=tuple(event.get("drafts") or ())[:32],
+                                    requests=tuple(event.get("requests") or ())[:32],
+                                )
+                            ],
+                            provider_id=record.id,
+                            model=model,
+                        )
+                        event = {**event, "message_id": message_id}
+                    yield line(event)
+            except AssistantProviderError as exc:
+                await service.append_assistant_messages(
+                    principal,
+                    conversation.id,
+                    [
+                        AssistantMessageRecord(
+                            id=message_id,
+                            role="assistant",
+                            content="",
+                            provider_id=record.id,
+                            model=model,
+                            trace=clip_trace(trace),
+                            error=str(exc)[:2000],
+                        )
+                    ],
+                )
+                yield line({"type": "error", "detail": str(exc), "message_id": message_id})
+
+        # A client that stops reading (the dock's Stop button) cancels this
+        # generator; the user turn is already saved and no answer is recorded.
+        return StreamingResponse(
+            events(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+        )
+
+    @app.get("/api/v1/assistant/conversations", tags=["assistant"])
+    async def list_assistant_conversations(principal: _Principal) -> dict[str, tp.Any]:
+        """The caller's own saved chats, newest first (never anyone else's)."""
+
+        records = await service.list_assistant_conversations(principal)
+        return {"conversations": [conversation_summary(item) for item in records]}
+
+    @app.get("/api/v1/assistant/conversations/{conversation_id}", tags=["assistant"])
+    async def get_assistant_conversation(conversation_id: str, principal: _Principal) -> dict[str, tp.Any]:
+        """One of the caller's chats with every message, its trace, drafts and requests."""
+
+        record = await service.get_assistant_conversation(principal, conversation_id)
+        return {
+            **conversation_summary(record),
+            "messages": [item.model_dump(mode="json", exclude_none=True) for item in record.messages],
+        }
+
+    @app.put("/api/v1/assistant/conversations/{conversation_id}", tags=["assistant"])
+    async def rename_assistant_conversation(
+        conversation_id: str, body: RenameConversationBody, principal: _Principal
+    ) -> dict[str, tp.Any]:
+        """Rename one of the caller's chats."""
+
+        record = await service.rename_assistant_conversation(principal, conversation_id, title=body.title)
+        return conversation_summary(record)
+
+    @app.delete("/api/v1/assistant/conversations/{conversation_id}", tags=["assistant"])
+    async def delete_assistant_conversation(conversation_id: str, principal: _Principal) -> dict[str, tp.Any]:
+        """Delete one of the caller's chats."""
+
+        await service.delete_assistant_conversation(principal, conversation_id)
+        return {"deleted": conversation_id}
 
     @app.post("/api/v1/assistant/size", tags=["assistant"])
     async def assistant_size(body: SizeBody, principal: _Principal) -> dict[str, tp.Any]:
@@ -747,7 +861,9 @@ __all__ = (
     "AssistantProvider",
     "AssistantProviderError",
     "AssistantTools",
+    "chat_model_for",
     "register_assistant_routes",
     "run_chat",
     "size_request",
+    "system_prompt",
 )

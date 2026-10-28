@@ -230,8 +230,9 @@ class EyvanClient:
         *,
         params: QueryParams | None = None,
         headers: HeaderMap | None = None,
+        json: JsonObject | None = None,
     ) -> tp.Iterator[str]:
-        """Yield response lines as they arrive, for server-sent event streams.
+        """Yield response lines as they arrive, for server-sent event and NDJSON streams.
 
         A generator rather than a callback: the caller decides when to stop, and
         the ``with`` block closes the connection on the way out however the
@@ -247,6 +248,7 @@ class EyvanClient:
                 path,
                 params=dict(params or {}),
                 headers=request_headers,
+                json=json,
                 timeout=None,
             ) as response:
                 if response.status_code >= 400:

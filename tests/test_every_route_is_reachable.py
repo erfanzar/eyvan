@@ -80,6 +80,10 @@ DYNAMIC_ROUTES: dict[str, str] = {
 #: Routes with no client and a stated reason. Each entry is a decision, and the
 #: bar for adding one is that a client would be *wrong*, not merely absent.
 DEFERRED_ROUTES: dict[str, str] = {
+    "POST /api/v1/assistant/chat": (
+        "the one-shot JSON turn kept for compatibility; `eyvan ask` uses the streaming route so the "
+        "user sees each step, and a second CLI path for the same turn would only drift"
+    ),
     "GET /api/v1/assistant/oauth/openrouter/callback/{}": (
         "OpenRouter's OAuth redirect target; only OpenRouter sends the admin's browser here with the "
         "single-use state, so any first-party client calling it would be wrong"
