@@ -30,6 +30,13 @@ describe("dashboard routing", () => {
   });
 });
 
+describe("hash queries", () => {
+  it("ignores a notice query after the route", () => {
+    expect(parseRoute("#/settings?assistant=openrouter-connected")).toEqual({ section: "settings" });
+    expect(parseRoute("#/settings?assistant_error=denied")).toEqual({ section: "settings" });
+  });
+});
+
 describe("every section the rail offers", () => {
   it("parses back to itself, so pressing it and reloading land in the same place", () => {
     for (const section of ["workloads", "fleet", "capacity", "billing", "budgets", "audit"] as const) {

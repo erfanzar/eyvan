@@ -3274,6 +3274,61 @@
         "title": "DagSubmitResponse",
         "type": "object"
       },
+      "DiscoverBody": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset"
+          },
+          "provider_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Id"
+          }
+        },
+        "title": "DiscoverBody",
+        "type": "object"
+      },
       "EffectiveProjectScope": {
         "additionalProperties": false,
         "description": "One project the authenticated principal can act in.\n\n``permissions`` is evaluated by the same :class:`Authorizer` used at every\nservice boundary after claim and durable grants have been unioned. It is not\na client-side interpretation of an access-token payload.",
@@ -5511,10 +5566,17 @@
             "title": "Api Key"
           },
           "base_url": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Base Url",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
           },
           "default_model": {
             "anyOf": [
@@ -5541,26 +5603,47 @@
             "type": "integer"
           },
           "models": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 32,
-            "minItems": 1,
-            "title": "Models",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
           },
           "name": {
-            "maxLength": 64,
-            "minLength": 1,
-            "title": "Name",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset"
           }
         },
-        "required": [
-          "name",
-          "base_url",
-          "models"
-        ],
         "title": "ProviderCreateBody",
         "type": "object"
       },
@@ -7017,6 +7100,53 @@
           "subject"
         ],
         "title": "SessionResponse",
+        "type": "object"
+      },
+      "SignInBody": {
+        "additionalProperties": false,
+        "properties": {
+          "default_model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Model"
+          },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "SignInBody",
         "type": "object"
       },
       "SizeBody": {
@@ -10154,6 +10284,118 @@
         ]
       }
     },
+    "/api/v1/assistant/models/discover": {
+      "post": {
+        "description": "Ask the provider which models it serves; fall back to the preset's suggestions.",
+        "operationId": "discover_assistant_models_api_v1_assistant_models_discover_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoverBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Discover Assistant Models Api V1 Assistant Models Discover Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Discover Assistant Models",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/oauth/openrouter/start": {
+      "post": {
+        "description": "Begin OpenRouter OAuth PKCE; the browser goes to ``authorize_url``.",
+        "operationId": "start_openrouter_sign_in_api_v1_assistant_oauth_openrouter_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignInBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Openrouter Sign In Api V1 Assistant Oauth Openrouter Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Openrouter Sign In",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/presets": {
+      "get": {
+        "description": "Known providers an admin can add by pasting a key (or signing in).",
+        "operationId": "list_assistant_presets_api_v1_assistant_presets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Assistant Presets Api V1 Assistant Presets Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Assistant Presets",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
     "/api/v1/assistant/providers": {
       "get": {
         "description": "Configured providers: every field but the key for fleet admins, names and models for others.",
@@ -10178,7 +10420,7 @@
         ]
       },
       "post": {
-        "description": "Add a provider (fleet admins). The key is sealed and never returned.",
+        "description": "Add a provider (fleet admins); a preset needs only a key. The key is sealed and never returned.",
         "operationId": "create_assistant_provider_api_v1_assistant_providers_post",
         "requestBody": {
           "content": {

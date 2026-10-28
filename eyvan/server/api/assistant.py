@@ -52,6 +52,7 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadState,
 )
+from eyvan.server.api.assistant_presets import provider_creation_fields, register_assistant_preset_routes
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.api.team_routes import require_team_mode
 from eyvan.server.service.errors import EyvanServiceError
@@ -509,11 +510,13 @@ class ChatBody(_Body):
 
 
 class ProviderCreateBody(_Body):
-    name: str = Field(min_length=1, max_length=64)
-    base_url: str = Field(min_length=1, max_length=512)
+    #: A built-in preset (``GET /api/v1/assistant/presets``) fills name, URL and models.
+    preset: str | None = Field(default=None, max_length=64)
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    base_url: str | None = Field(default=None, min_length=1, max_length=512)
     #: Write-only; never returned.
     api_key: str | None = Field(default=None, max_length=4096)
-    models: list[str] = Field(min_length=1, max_length=32)
+    models: list[str] | None = Field(default=None, min_length=1, max_length=32)
     default_model: str | None = Field(default=None, max_length=128)
     max_steps: int = Field(default=6, ge=1, le=20)
     enabled: bool = True
@@ -536,6 +539,7 @@ def provider_document(provider: AssistantProviderRecord, *, admin: bool) -> dict
     document: dict[str, tp.Any] = {
         "id": provider.id,
         "name": provider.name,
+        "preset": provider.preset,
         "models": list(provider.models),
         "default_model": provider.default_model,
     }
@@ -589,9 +593,12 @@ def register_assistant_routes(
     """Register assistant, provider, sizing and team-request routes.
 
     Providers live in the plane's own store and are managed by fleet admins
-    over this API (the dashboard's Assistant page). With none enabled, chat
-    answers 404 and status reports disabled.
+    over this API (the dashboard's Settings page), usually from a built-in
+    preset plus a key. With none enabled, chat answers 404 and status reports
+    disabled.
     """
+
+    register_assistant_preset_routes(app, settings=settings, service=service)
 
     @app.get("/api/v1/assistant/status", tags=["assistant"])
     async def assistant_status(principal: _Principal) -> dict[str, tp.Any]:
@@ -614,14 +621,28 @@ def register_assistant_routes(
         return {"providers": [provider_document(item, admin=admin) for item in providers], "can_manage": admin}
 
     @app.post("/api/v1/assistant/providers", status_code=201, tags=["assistant"])
-    async def create_assistant_provider(body: ProviderCreateBody, principal: _Principal) -> dict[str, tp.Any]:
-        """Add a provider (fleet admins). The key is sealed and never returned."""
+    async def create_assistant_provider(
+        body: ProviderCreateBody, request: Request, principal: _Principal
+    ) -> dict[str, tp.Any]:
+        """Add a provider (fleet admins); a preset needs only a key. The key is sealed and never returned."""
 
-        created = await service.create_assistant_provider(
+        if not service.can_manage_assistant_providers(principal):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="only fleet admins configure assistant providers"
+            )
+        fields = await provider_creation_fields(
+            service,
             principal,
+            preset_id=body.preset,
             name=body.name,
             base_url=body.base_url,
             models=body.models,
+            api_key=body.api_key,
+            transport=getattr(request.app.state, "assistant_transport", None),
+        )
+        created = await service.create_assistant_provider(
+            principal,
+            **fields,
             api_key=body.api_key,
             default_model=body.default_model,
             max_steps=body.max_steps,

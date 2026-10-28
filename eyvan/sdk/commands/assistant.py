@@ -273,10 +273,57 @@ def providers_list(session: CliSession, as_json: bool) -> None:
     click.echo("\n".join(lines) or "no assistant providers configured")
 
 
+@providers_group.command("presets")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def providers_presets(session: CliSession, as_json: bool) -> None:
+    """List built-in providers you can add with just a key (`providers add --preset ID`)."""
+
+    payload = _object(session.client.request("GET", "/api/v1/assistant/presets"))
+    if as_json:
+        JsonRenderer().emit(payload)
+        return
+    for preset in _objects(payload.get("presets")):
+        needs = "sign-in or key" if preset.get("sign_in") else ("key" if preset.get("key_required") else "no key")
+        url = preset.get("base_url") or "(you give the URL)"
+        click.echo(f"{preset['id']:<16} {preset['label']:<34} {needs:<15} {url}")
+
+
+@providers_group.command("models")
+@click.option("--preset", "preset_id", help="Preset id (see `providers presets`).")
+@click.option("--url", "base_url", help="Base URL, for custom/local presets.")
+@click.option("--provider", "provider", help="An existing provider: use its stored URL and key.")
+@click.option("--key-stdin", is_flag=True, help="Read the API key from stdin instead of a hidden prompt.")
+@click.pass_obj
+def providers_models(
+    session: CliSession, preset_id: str | None, base_url: str | None, provider: str | None, key_stdin: bool
+) -> None:
+    """Ask a provider which models it serves (fleet admins)."""
+
+    body: dict[str, tp.Any] = {}
+    if provider is not None:
+        body["provider_id"] = _provider_id(session, provider)
+    else:
+        if preset_id is None and base_url is None:
+            raise click.UsageError("give --preset, --url or --provider")
+        if preset_id is not None:
+            body["preset"] = preset_id
+        if base_url is not None:
+            body["base_url"] = base_url
+        key = _read_key(key_stdin)
+        if key:
+            body["api_key"] = key
+    payload = _object(session.client.request("POST", "/api/v1/assistant/models/discover", json=body))
+    if payload.get("detail"):
+        click.echo(f"note: {payload['detail']} ({payload.get('source')} list)", err=True)
+    click.echo("\n".join(str(item) for item in payload.get("models") or []) or "no models")
+
+
 @providers_group.command("add")
-@click.argument("name")
-@click.option("--url", "base_url", required=True, help="OpenAI-compatible base URL, e.g. https://api.example.com/v1")
-@click.option("--models", required=True, help="Comma-separated model names.")
+@click.argument("name", required=False)
+@click.option("--preset", "preset_id", help="Built-in provider (see `providers presets`); then only a key is needed.")
+@click.option("--url", "base_url", help="OpenAI-compatible base URL (custom/local presets only).")
+@click.option("--models", help="Comma-separated model names (default: the preset's suggestions).")
 @click.option("--default-model")
 @click.option("--max-steps", type=click.IntRange(1, 20), default=6, show_default=True)
 @click.option("--key-stdin", is_flag=True, help="Read the API key from stdin instead of a hidden prompt.")
@@ -284,9 +331,10 @@ def providers_list(session: CliSession, as_json: bool) -> None:
 @click.pass_obj
 def providers_add(
     session: CliSession,
-    name: str,
-    base_url: str,
-    models: str,
+    name: str | None,
+    preset_id: str | None,
+    base_url: str | None,
+    models: str | None,
     default_model: str | None,
     max_steps: int,
     key_stdin: bool,
@@ -294,13 +342,14 @@ def providers_add(
 ) -> None:
     """Add a provider (fleet admins). The key is never shown again."""
 
-    body: dict[str, tp.Any] = {
-        "name": name,
-        "base_url": base_url,
-        "models": _models(models),
-        "max_steps": max_steps,
-        "enabled": not disabled,
-    }
+    if preset_id is None and not (name and base_url and models):
+        raise click.UsageError("give --preset ID, or NAME with --url and --models")
+    body: dict[str, tp.Any] = {"max_steps": max_steps, "enabled": not disabled}
+    for field_name, value in (("preset", preset_id), ("name", name), ("base_url", base_url)):
+        if value:
+            body[field_name] = value
+    if models:
+        body["models"] = _models(models)
     if default_model:
         body["default_model"] = default_model
     key = _read_key(key_stdin)

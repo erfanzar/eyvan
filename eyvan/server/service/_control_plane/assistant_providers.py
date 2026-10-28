@@ -105,6 +105,7 @@ class AssistantProvidersMixin:
         default_model: str | None = None,
         max_steps: int = 6,
         enabled: bool = True,
+        preset: str | None = None,
     ) -> AssistantProviderRecord:
         """Add one provider (fleet admins). ``api_key`` is sealed before anything is stored."""
 
@@ -116,6 +117,7 @@ class AssistantProvidersMixin:
             provider = AssistantProviderRecord(
                 id=provider_id,
                 name=name.strip(),
+                preset=preset,
                 base_url=base_url.strip().rstrip("/"),
                 models=cleaned,
                 default_model=(default_model or "").strip() or (cleaned[0] if cleaned else ""),
@@ -193,6 +195,27 @@ class AssistantProvidersMixin:
                 raise NotFoundError(f"assistant provider {provider_id!r} not found")
             await tx.delete_assistant_provider(provider_id)
             await tx.append_event(_event(principal.subject, current, "assistant_provider.deleted"))
+
+    async def assistant_provider_key(
+        self, principal: Principal, provider_id: str
+    ) -> tuple[AssistantProviderRecord, str | None]:
+        """Return one provider and its plaintext key for a fleet admin's model discovery.
+
+        The key never leaves the plane: callers use it only as the provider's
+        ``Authorization`` header.
+        """
+
+        self._require_provider_admin(principal)
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            current = await tx.get_assistant_provider(provider_id)
+        if current is None:
+            raise NotFoundError(f"assistant provider {provider_id!r} not found")
+        if current.api_key_ciphertext is None:
+            return current, None
+        try:
+            return current, self._sealer().open(current.id, current.api_key_ciphertext)
+        except AssistantKeyError as exc:
+            raise UnavailableError(str(exc)) from None
 
     async def resolve_assistant_provider(
         self, principal: Principal, *, provider_id: str | None, model: str | None

@@ -30,7 +30,9 @@ export function accessibleRoute(route: Route, availability: SectionAvailability)
 }
 
 export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
-  const path = hash.replace(/^#\/?/, "");
+  // A query after the route (`#/settings?assistant=...`) is a notice for the
+  // page, never part of the route itself.
+  const path = hash.replace(/^#\/?/, "").split("?")[0];
   const [section, id, tab] = path.split("/");
   if ((section === "workloads" || section === "runs") && id) {
     try {

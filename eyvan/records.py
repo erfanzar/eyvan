@@ -934,6 +934,8 @@ class AssistantProviderRecord(EyvanModel):
 
     id: str = Field(pattern=r"^aprv_[0-9a-f]{16}$")
     name: str = Field(min_length=1, max_length=64)
+    #: Built-in preset this provider was created from (``None`` for a hand-entered endpoint).
+    preset: str | None = Field(default=None, max_length=64)
     base_url: str = Field(min_length=1, max_length=512)
     models: tuple[str, ...] = Field(min_length=1, max_length=32)
     default_model: str

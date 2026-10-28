@@ -51,12 +51,17 @@ import type {
   DiscoveredTpus,
   AssistantDraft,
   AssistantMessage,
+  AssistantModelDiscovery,
+  AssistantModelDiscoveryInput,
+  AssistantPreset,
   AssistantProvider,
   AssistantProviderInput,
   AssistantProviderList,
   AssistantProviderUpdate,
   AssistantStatus,
   AssistantTurn,
+  OpenRouterSignInInput,
+  OpenRouterSignInStart,
   TeamRequest,
   TeamInvite,
   TeamInviteCreated,
@@ -836,10 +841,38 @@ export class EyvanApiClient {
     });
   }
 
+  async listAssistantPresets(signal?: AbortSignal): Promise<AssistantPreset[]> {
+    if (this.forceDemo) return [];
+    return (await this.attachmentRequest<{ presets: AssistantPreset[] }>("/api/v1/assistant/presets", { signal }))
+      .presets;
+  }
+
+  /** Ask the provider for its models; a provider failure answers with suggestions, not an error. */
+  async discoverAssistantModels(
+    body: AssistantModelDiscoveryInput,
+    signal?: AbortSignal,
+  ): Promise<AssistantModelDiscovery> {
+    if (this.forceDemo) return { models: [], source: "suggested", detail: null };
+    return this.attachmentRequest<AssistantModelDiscovery>(
+      "/api/v1/assistant/models/discover",
+      { method: "POST", body: JSON.stringify(body), signal },
+      PROVIDER_READ_TIMEOUT_MS,
+    );
+  }
+
+  /** Begin OpenRouter's OAuth flow; the caller sends the browser to `authorize_url`. */
+  async startOpenRouterSignIn(body: OpenRouterSignInInput): Promise<OpenRouterSignInStart> {
+    return this.attachmentRequest<OpenRouterSignInStart>("/api/v1/assistant/oauth/openrouter/start", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
   async assistantChat(
     messages: AssistantMessage[],
     selection?: { provider_id: string; model: string } | null,
     scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
   ): Promise<AssistantTurn> {
     return this.attachmentRequest<AssistantTurn>(
       "/api/v1/assistant/chat",
@@ -851,6 +884,7 @@ export class EyvanApiClient {
           project_id: scope.projectId,
           ...(selection ? { provider_id: selection.provider_id, model: selection.model } : {}),
         }),
+        signal,
       },
       150_000,
     );

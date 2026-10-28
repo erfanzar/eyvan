@@ -88,7 +88,13 @@ def test_only_fleet_admins_manage_providers_and_the_key_is_never_returned(caplog
     user_view = http.get("/api/v1/assistant/providers", headers=ALICE)
     assert user_view.json() == {
         "providers": [
-            {"id": created["id"], "name": "alpha", "models": ["a-small", "a-large"], "default_model": "a-small"}
+            {
+                "id": created["id"],
+                "name": "alpha",
+                "preset": None,
+                "models": ["a-small", "a-large"],
+                "default_model": "a-small",
+            }
         ],
         "can_manage": False,
     }

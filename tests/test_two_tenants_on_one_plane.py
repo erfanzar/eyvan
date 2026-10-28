@@ -231,6 +231,10 @@ EXEMPT_ROUTES: dict[str, str] = {
         "victim ids only for a fleet admin (test_governance)"
     ),
     "POST /api/v1/assistant/chat": "tools call the service with the caller's own principal (test_assistant)",
+    "GET /api/v1/assistant/presets": "a fixed built-in list of provider endpoints; no stored data",
+    "GET /api/v1/assistant/oauth/openrouter/callback/{state}": (
+        "authorized only by a single-use, expiring state minted for one fleet admin (test_assistant_presets)"
+    ),
     "GET /api/v1/assistant/providers": (
         "plane-wide provider names and models, never a key; URLs and state only for a fleet admin "
         "(test_assistant_providers)"
@@ -253,6 +257,8 @@ FLEET_ONLY_ROUTES.update(
         "PUT /api/v1/team/users/{subject}/rules": "set any account's fleet rules, approval threshold and guarantee",
         "POST /api/v1/team/workloads/{workload_id}/reclaim": "checkpoint, stop and requeue any tenant's workload",
         "POST /api/v1/assistant/providers": "add a plane-wide assistant provider",
+        "POST /api/v1/assistant/models/discover": "read a provider's model list with a typed or stored key",
+        "POST /api/v1/assistant/oauth/openrouter/start": "begin connecting a plane-wide OpenRouter provider",
         "PUT /api/v1/assistant/providers/{provider_id}": "change a plane-wide assistant provider or its key",
         "DELETE /api/v1/assistant/providers/{provider_id}": "remove a plane-wide assistant provider",
     }

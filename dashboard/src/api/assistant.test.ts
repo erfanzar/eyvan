@@ -125,6 +125,60 @@ describe("assistant provider API", () => {
     });
   });
 
+  it("returns empty preset and discovery answers in demo mode without a request", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const client = new EyvanApiClient("/api/v1", true);
+    await expect(client.listAssistantPresets()).resolves.toEqual([]);
+    await expect(client.discoverAssistantModels({ preset: "openai" })).resolves.toEqual({
+      models: [],
+      source: "suggested",
+      detail: null,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("reads presets, discovers models and starts the OpenRouter sign-in at their literal paths", async () => {
+    const fetch = mockResponse({ presets: [{ id: "openai" }] });
+    const client = new EyvanApiClient("/api/v1", false);
+    await expect(client.listAssistantPresets()).resolves.toEqual([{ id: "openai" }]);
+    expect(fetch.mock.calls[0][0]).toBe("/api/v1/assistant/presets");
+
+    mockResponse({ models: ["a"], source: "live", detail: null });
+    await client.discoverAssistantModels({ provider_id: PROVIDER.id });
+    const discover = vi.mocked(globalThis.fetch).mock.calls[0];
+    expect(discover[0]).toBe("/api/v1/assistant/models/discover");
+    expect(discover[1]?.method).toBe("POST");
+    expect(JSON.parse(String(discover[1]?.body))).toEqual({ provider_id: PROVIDER.id });
+
+    mockResponse({ authorize_url: "https://openrouter.ai/auth", expires_at: "2026-10-28T12:00:00Z" });
+    await client.startOpenRouterSignIn({ models: ["a"], default_model: "a" });
+    const start = vi.mocked(globalThis.fetch).mock.calls[0];
+    expect(start[0]).toBe("/api/v1/assistant/oauth/openrouter/start");
+    expect(JSON.parse(String(start[1]?.body))).toEqual({ models: ["a"], default_model: "a" });
+  });
+
+  it("creates a provider from a preset with only its key", async () => {
+    const fetch = mockResponse(PROVIDER, 201);
+    await new EyvanApiClient("/api/v1", false).createAssistantProvider({ preset: "openai", api_key: "k" });
+    expect(JSON.parse(fetch.mock.calls[0][1].body as string)).toEqual({ preset: "openai", api_key: "k" });
+  });
+
+  it("forwards a chat abort signal", async () => {
+    const fetch = mockResponse({ reply: "ok", steps: 1, tool_calls: [], drafts: [], requests: [] });
+    const controller = new AbortController();
+    const pending = new EyvanApiClient("/api/v1", false).assistantChat(
+      [{ role: "user", content: "hi" }],
+      null,
+      undefined,
+      controller.signal,
+    );
+    const signal = fetch.mock.calls[0][1].signal as AbortSignal;
+    controller.abort();
+    expect(signal.aborted).toBe(true);
+    await pending.catch(() => undefined);
+  });
+
   it("sends the selected provider and model with an explicit chat scope", async () => {
     const fetch = mockResponse({ reply: "ok", steps: 1, tool_calls: [], drafts: [], requests: [] });
     const client = new EyvanApiClient("/api/v1", false);

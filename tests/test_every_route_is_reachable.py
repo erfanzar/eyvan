@@ -65,6 +65,9 @@ BROWSER_ROUTES: dict[str, str] = {
     "POST /api/v1/team/invites/preview": "dashboard accept-invite screen shows who an invite is for",
     "POST /api/v1/team/invites/accept": "dashboard accept-invite screen sets the password and signs in",
     "POST /api/v1/team/logout": "dashboard sign-out drops the HttpOnly team session cookie",
+    "POST /api/v1/assistant/oauth/openrouter/start": (
+        "dashboard Settings 'Sign in with OpenRouter' sends the browser to OpenRouter's consent page"
+    ),
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.
@@ -77,6 +80,10 @@ DYNAMIC_ROUTES: dict[str, str] = {
 #: Routes with no client and a stated reason. Each entry is a decision, and the
 #: bar for adding one is that a client would be *wrong*, not merely absent.
 DEFERRED_ROUTES: dict[str, str] = {
+    "GET /api/v1/assistant/oauth/openrouter/callback/{}": (
+        "OpenRouter's OAuth redirect target; only OpenRouter sends the admin's browser here with the "
+        "single-use state, so any first-party client calling it would be wrong"
+    ),
     "GET /api/v1/workloads/{}/logs/stream": (
         "server-sent events; a CLI follower needs streaming request support the shared "
         "JSON client does not have, and half-implementing it would buffer the stream and "

@@ -198,3 +198,39 @@ def test_admin_manages_providers_from_the_cli_and_the_key_is_never_printed(plane
     removed = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "remove", "beta"])
     assert removed.exit_code == 0, removed.output
     assert "beta" not in runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "list"]).output
+
+
+def test_admin_adds_a_preset_with_only_a_key_from_the_cli(plane) -> None:
+    sent: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "deepseek-chat"}, {"id": "deepseek-reasoner"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    plane.app.state.assistant_transport = httpx.MockTransport(record)
+    runner = CliRunner()
+    presets = runner.invoke(cli.main, [*ALICE, "assistant", "providers", "presets"])
+    assert presets.exit_code == 0, presets.output
+    assert "zai-coding" in presets.output and "https://api.z.ai/api/coding/paas/v4" in presets.output
+
+    models = runner.invoke(
+        cli.main,
+        [*ADMIN, "assistant", "providers", "models", "--preset", "deepseek", "--key-stdin"],
+        input=CLI_KEY + "\n",
+    )
+    assert models.exit_code == 0, models.output
+    assert "deepseek-chat" in models.output and CLI_KEY not in models.output
+    assert sent[-1].headers["authorization"] == f"Bearer {CLI_KEY}"
+
+    added = runner.invoke(
+        cli.main, [*ADMIN, "assistant", "providers", "add", "--preset", "deepseek", "--key-stdin"], input=CLI_KEY
+    )
+    assert added.exit_code == 0, added.output
+    assert "(DeepSeek); key set" in added.output and CLI_KEY not in added.output
+    stored = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "models", "--provider", "deepseek"])
+    assert stored.exit_code == 0 and "deepseek-reasoner" in stored.output
+    assert str(sent[-1].url) == "https://api.deepseek.com/v1/models"
+    missing = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "add"])
+    assert missing.exit_code != 0 and "--preset" in missing.output

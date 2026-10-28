@@ -133,6 +133,8 @@ export interface AssistantProvider {
   max_steps?: number;
   enabled?: boolean;
   has_api_key?: boolean;
+  /** The preset the provider was created from; null for hand-configured providers. */
+  preset?: string | null;
   created_by?: string;
   created_at?: string;
   updated_at?: string;
@@ -143,14 +145,56 @@ export interface AssistantProviderList {
   can_manage: boolean;
 }
 
-export interface AssistantProviderInput {
-  name: string;
+/** A provider the plane knows how to talk to; admins pick one and paste a key. */
+export interface AssistantPreset {
+  id: string;
+  label: string;
+  /** Empty for `custom`, whose URL the admin types. */
   base_url: string;
+  editable_url: boolean;
+  key_required: boolean;
+  /** Where an admin gets a key, when the provider has a page for it. */
+  key_url: string | null;
+  sign_in: "openrouter" | null;
+  suggested_models: string[];
+}
+
+/** With a preset the server fills name, base URL and models it can infer. */
+export interface AssistantProviderInput {
+  preset?: string;
+  name?: string;
+  base_url?: string;
   api_key?: string;
-  models: string[];
+  models?: string[];
   default_model?: string;
   max_steps?: number;
   enabled?: boolean;
+}
+
+export interface AssistantModelDiscoveryInput {
+  preset?: string;
+  base_url?: string;
+  api_key?: string;
+  /** Use this stored provider's key, so an edit never needs the key again. */
+  provider_id?: string;
+}
+
+export interface AssistantModelDiscovery {
+  models: string[];
+  /** `suggested` when the live listing failed; `detail` then says why. */
+  source: "live" | "suggested";
+  detail: string | null;
+}
+
+export interface OpenRouterSignInInput {
+  models?: string[];
+  default_model?: string;
+  name?: string;
+}
+
+export interface OpenRouterSignInStart {
+  authorize_url: string;
+  expires_at: string;
 }
 
 export type AssistantProviderUpdate = Partial<AssistantProviderInput> & { clear_api_key?: true };
@@ -188,6 +232,8 @@ export interface AssistantTurn {
   tool_calls: Array<{ tool: string; ok: boolean }>;
   drafts: AssistantDraft[];
   requests: TeamRequest[];
+  provider_id?: string;
+  model?: string;
 }
 
 export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";

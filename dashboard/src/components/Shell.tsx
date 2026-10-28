@@ -3,10 +3,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   Activity,
-  Bot,
   ChartNoAxesCombined,
   Boxes,
   ChevronRight,
@@ -24,6 +23,7 @@ import {
   RefreshCw,
   ServerCog,
   Settings,
+  Sparkles,
   X,
 } from "lucide-react";
 
@@ -53,6 +53,12 @@ interface ShellProps {
   selectedScope?: EffectiveProjectScope;
   onScopeChange: (scope: EffectiveProjectScope) => void;
   onLogout?: () => void;
+  /** The assistant dock, docked right of the main column on every page. */
+  assistantDock?: ReactNode;
+  assistantOpen?: boolean;
+  assistantWidth?: number;
+  /** Present when the dock exists; renders the topbar toggle. */
+  onToggleAssistant?: () => void;
   children: ReactNode;
 }
 
@@ -69,7 +75,6 @@ const navigation: Array<{
   { section: "billing", label: "Billing", icon: Receipt },
   { section: "budgets", label: "Budgets & policies", icon: CircleDollarSign },
   { section: "audit", label: "Audit events", icon: Activity },
-  { section: "assistant", label: "Assistant", icon: Bot },
   { section: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -89,7 +94,10 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
     title: "Assistant",
     description: "Sizing, fleets and quota answered from this plane's data; requests to the fleet admins",
   },
-  settings: { title: "Settings", description: "Users & tokens: team accounts, invites and personal API tokens" },
+  settings: {
+    title: "Settings",
+    description: "Assistant providers, team accounts, invites and personal API tokens",
+  },
 };
 
 /** The rail's own memory. A rail that forgets is a rail somebody re-collapses every morning. */
@@ -119,6 +127,10 @@ export function Shell({
   selectedScope,
   onScopeChange,
   onLogout,
+  assistantDock,
+  assistantOpen = false,
+  assistantWidth,
+  onToggleAssistant,
   children,
 }: ShellProps) {
   const drawerRef = useRef<HTMLElement>(null);
@@ -162,8 +174,10 @@ export function Shell({
     onMobileNavigationChange(false);
   };
 
+  const shellStyle = assistantWidth ? ({ "--dock-width": `${assistantWidth}px` } as CSSProperties) : undefined;
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${assistantOpen && assistantDock ? "app-shell-docked" : ""}`} style={shellStyle}>
       {mobileNavigationOpen && (
         <button
           className="drawer-scrim"
@@ -364,6 +378,22 @@ export function Shell({
             >
               {theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}
             </button>
+            {onToggleAssistant && (
+              <button
+                id="assistant-dock-toggle"
+                className={`button button-secondary dock-toggle ${assistantOpen ? "dock-toggle-active" : ""}`}
+                type="button"
+                aria-label="Assistant"
+                aria-pressed={assistantOpen}
+                aria-controls="assistant-dock"
+                aria-keyshortcuts="Control+J Meta+J"
+                title="Assistant (Ctrl/⌘+J)"
+                onClick={onToggleAssistant}
+              >
+                <Sparkles size={14} aria-hidden="true" />
+                <span className="button-label">Assistant</span>
+              </button>
+            )}
             {onRefresh && (
               <button className="button button-secondary" type="button" aria-label="Refresh" onClick={onRefresh}>
                 <RefreshCw size={14} aria-hidden="true" />
@@ -380,6 +410,7 @@ export function Shell({
         </header>
         <main className="page-content">{children}</main>
       </div>
+      {assistantDock}
     </div>
   );
 }

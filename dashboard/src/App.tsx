@@ -33,8 +33,9 @@ import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
-import { AssistantPage } from "./pages/AssistantPage";
-import { UsersPage } from "./pages/UsersPage";
+import { AssistantDock } from "./components/AssistantDock";
+import { useAssistantDockState } from "./components/assistantDockState";
+import { SettingsPage } from "./pages/SettingsPage";
 import { WorkloadDetailPage, type LogFollowHandlers } from "./pages/WorkloadDetailPage";
 import { WorkloadsPage } from "./pages/WorkloadsPage";
 import { accessibleRoute, navigate, parseRoute, type Route, type Section, type SectionAvailability } from "./routing";
@@ -265,6 +266,17 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null);
   const [refreshWarning, setRefreshWarning] = useState<string | null>(null);
+  const dock = useAssistantDockState();
+  const [assistantProvidersRevision, setAssistantProvidersRevision] = useState(0);
+  const bumpAssistantProviders = useCallback(() => setAssistantProvidersRevision((value) => value + 1), []);
+  const openDock = dock.setOpen;
+
+  // `#/assistant` was a page; old links now open the dock over the overview.
+  useEffect(() => {
+    if (route.section !== "assistant") return;
+    openDock(true);
+    navigate({ section: "overview" });
+  }, [openDock, route.section]);
 
   const mountedRef = useRef(false);
   const snapshotRef = useRef(snapshot);
@@ -641,10 +653,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
     // Billing reads fleet-wide costs, not just the selected project's usage.
     billing: capabilities.manageFleet,
     audit: canReadSelectedScope,
-    // Only a team-mode plane has accounts; everywhere else the section is absent.
-    settings: isTeamMode(),
-    // The page itself says when the plane has no assistant configured.
-    assistant: true,
+    // Accounts exist only on a team-mode plane; assistant providers are a fleet
+    // admin's setting on every plane.
+    settings: isTeamMode() || capabilities.manageFleet,
+    // The assistant is a dock on every page, not a section of its own.
+    assistant: false,
   };
   const routed = accessibleRoute(route, sectionAvailability);
   // SUBMIT does not imply READ. A submit-only deep link must not mount the
@@ -1251,16 +1264,15 @@ export default function App({ client = apiClient, identityProvider = currentIden
       case "audit":
         content = <AuditPage events={data.auditEvents} onAction={(message) => setToast({ message })} />;
         break;
-      case "assistant":
-        content = <AssistantPage client={client} canAdminister={capabilities.manageFleet} teamMode={isTeamMode()} />;
-        break;
       case "settings":
         content = (
-          <UsersPage
+          <SettingsPage
             client={client}
-            canAdminister={capabilities.manageFleet}
+            teamMode={isTeamMode()}
+            canManageFleet={capabilities.manageFleet}
             defaultOrg={selectedScope?.orgId ?? configuredScope().orgId}
             defaultProject={selectedScope?.projectId ?? configuredScope().projectId}
+            onProvidersChanged={bumpAssistantProviders}
           />
         );
         break;
@@ -1309,6 +1321,23 @@ export default function App({ client = apiClient, identityProvider = currentIden
         selectedScope={selectedScope ?? undefined}
         onScopeChange={selectScope}
         onLogout={identity?.mode === "development" && !isTeamSession() ? undefined : () => void logout()}
+        assistantOpen={dock.open}
+        assistantWidth={dock.width}
+        onToggleAssistant={dock.toggle}
+        assistantDock={
+          <AssistantDock
+            client={client}
+            open={dock.open}
+            width={dock.width}
+            onWidthChange={dock.setWidth}
+            onClose={() => dock.setOpen(false)}
+            canAdminister={capabilities.manageFleet}
+            teamMode={isTeamMode()}
+            onOpenSettings={sectionAvailability.settings ? () => goToSection("settings") : undefined}
+            onOpenWorkload={openWorkload}
+            providersRevision={assistantProvidersRevision}
+          />
+        }
       >
         {/* A scope commit remounts page-local filters, pending controls, and panels. */}
         <Fragment key={selectedScopeIdentity}>
