@@ -6,7 +6,8 @@
 """The fleet assistant: a bounded tool-calling loop the plane runs for one user.
 
 The plane, not the browser or CLI, talks to an OpenAI-compatible
-chat-completions endpoint configured by the operator (``EYVAN_ASSISTANT_*``).
+chat-completions endpoint configured by the operator in the platform file
+(``assistant:`` in ``/etc/eyvan/platform.yaml``; the key is read from ``api_key_file``).
 The provider key never leaves this process: it is sent only as the provider's
 ``Authorization`` header and is scrubbed from anything echoed back.
 
@@ -30,6 +31,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from eyvan._internal.platform import AssistantConfig
 from eyvan.config import EyvanSettings
 from eyvan.domain.sizing import (
     DEFAULT_CANDIDATE_TYPES,
@@ -386,11 +388,10 @@ class AssistantProviderError(RuntimeError):
 class AssistantProvider:
     """One OpenAI-compatible chat-completions endpoint."""
 
-    def __init__(self, settings: EyvanSettings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        assert settings.assistant_url is not None and settings.assistant_model is not None
-        self.url = settings.assistant_url.rstrip("/") + "/chat/completions"
-        self.model = settings.assistant_model
-        self._key = settings.assistant_api_key
+    def __init__(self, config: AssistantConfig, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self.url = config.url.rstrip("/") + "/chat/completions"
+        self.model = config.model
+        self._key = config.api_key
         self._transport = transport
 
     async def complete(self, messages: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
@@ -520,26 +521,31 @@ class ResolveBody(_Body):
     note: str = Field(default="", max_length=2000)
 
 
-def assistant_enabled(settings: EyvanSettings) -> bool:
-    return bool(settings.assistant_url and settings.assistant_model)
+def register_assistant_routes(
+    app: FastAPI,
+    *,
+    settings: EyvanSettings,
+    service: ControlPlaneService,
+    assistant: AssistantConfig | None,
+) -> None:
+    """Register assistant, sizing and team-request routes.
 
-
-def register_assistant_routes(app: FastAPI, *, settings: EyvanSettings, service: ControlPlaneService) -> None:
-    """Register assistant, sizing and team-request routes."""
+    ``assistant`` comes from the operator's platform configuration file; when
+    it is ``None`` the chat route answers 404 and status reports disabled.
+    """
 
     def provider(request: Request) -> AssistantProvider:
-        if not assistant_enabled(settings):
+        if assistant is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="the assistant is not configured")
         # A test/embedding seam, not configuration: a fake provider transport.
-        return AssistantProvider(settings, transport=getattr(request.app.state, "assistant_transport", None))
+        return AssistantProvider(assistant, transport=getattr(request.app.state, "assistant_transport", None))
 
     @app.get("/api/v1/assistant/status", tags=["assistant"])
     async def assistant_status(principal: _Principal) -> dict[str, tp.Any]:
         """Whether this plane runs the assistant, and with which model (never the key)."""
 
         del principal
-        enabled = assistant_enabled(settings)
-        return {"enabled": enabled, "model": settings.assistant_model if enabled else None}
+        return {"enabled": assistant is not None, "model": assistant.model if assistant is not None else None}
 
     @app.post("/api/v1/assistant/chat", tags=["assistant"])
     async def assistant_chat(body: ChatBody, request: Request, principal: _Principal) -> dict[str, tp.Any]:
@@ -550,7 +556,8 @@ def register_assistant_routes(app: FastAPI, *, settings: EyvanSettings, service:
         tools.team_mode = settings.team_mode
         history = [message.model_dump() for message in body.messages]
         try:
-            return await run_chat(chosen, tools, history, max_steps=settings.assistant_max_steps)
+            assert assistant is not None  # provider() already refused an unconfigured plane
+            return await run_chat(chosen, tools, history, max_steps=assistant.max_steps)
         except AssistantProviderError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from None
 
@@ -601,7 +608,6 @@ __all__ = (
     "AssistantProvider",
     "AssistantProviderError",
     "AssistantTools",
-    "assistant_enabled",
     "register_assistant_routes",
     "run_chat",
     "size_request",

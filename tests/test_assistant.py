@@ -20,6 +20,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
+from eyvan._internal.platform import AssistantConfig, EyvanPlatformConfig
 from eyvan.config import EyvanSettings
 from eyvan.server.api.app import create_app
 
@@ -54,16 +55,13 @@ class FakeProvider:
 
 
 def _client(provider: FakeProvider | None, *, configured: bool = True, team_mode: bool = True, steps: int = 6):
-    settings = EyvanSettings(
-        dev_auth_enabled=True,
-        team_mode=team_mode,
-        artifact_token_key="k" * 32,
-        assistant_url="http://provider.test/v1" if configured else None,
-        assistant_model="test-model" if configured else None,
-        assistant_api_key=KEY,
-        assistant_max_steps=steps,
+    settings = EyvanSettings(dev_auth_enabled=True, team_mode=team_mode, artifact_token_key="k" * 32)
+    assistant = (
+        AssistantConfig(url="http://provider.test/v1", model="test-model", api_key=KEY, max_steps=steps)
+        if configured
+        else None
     )
-    app = create_app(settings=settings)
+    app = create_app(settings=settings, platform_config=EyvanPlatformConfig(assistant=assistant))
     if provider is not None:
         app.state.assistant_transport = httpx.MockTransport(provider)
     return TestClient(app, base_url="http://127.0.0.1:8080")

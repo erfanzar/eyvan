@@ -603,7 +603,8 @@ def create_app(
     platform = platform_config or load_platform_config(settings.platform_config_path)
     loopback_development = settings.dev_auth_enabled and server_bind.is_loopback
     if platform.default_agent_endpoint is None and loopback_development:
-        platform = EyvanPlatformConfig(default_agent_endpoint=DEFAULT_LOCAL_CELL_AGENT_URL)
+        # Keep every other operator setting (the assistant) when filling in the local agent.
+        platform = replace(platform, default_agent_endpoint=DEFAULT_LOCAL_CELL_AGENT_URL)
     engine: AsyncEngine | None = None
     if repository is None:
         if settings.repository_backend is RepositoryBackend.MEMORY:
@@ -783,7 +784,7 @@ def create_app(
     register_tracking_routes(app, settings=settings, service=service)
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     register_team_routes(app, settings=settings, service=service)
-    register_assistant_routes(app, settings=settings, service=service)
+    register_assistant_routes(app, settings=settings, service=service, assistant=platform.assistant)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for

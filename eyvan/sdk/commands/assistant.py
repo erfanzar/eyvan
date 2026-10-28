@@ -75,8 +75,8 @@ def ask(
     status = session.client.request("GET", "/api/v1/assistant/status")
     if not (isinstance(status, dict) and status.get("enabled")):
         raise click.ClickException(
-            "this plane has no assistant configured; its operator sets EYVAN_ASSISTANT_URL and "
-            "EYVAN_ASSISTANT_MODEL (and EYVAN_ASSISTANT_API_KEY) on the server"
+            "this plane has no assistant configured; its operator adds an `assistant:` section "
+            "(url, model, api_key_file) to the server's platform file (/etc/eyvan/platform.yaml)"
         )
     payload = _object(
         session.client.request(

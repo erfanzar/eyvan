@@ -19,6 +19,7 @@ import pytest
 from click.testing import CliRunner
 from starlette.testclient import TestClient
 
+from eyvan._internal.platform import AssistantConfig, EyvanPlatformConfig
 from eyvan.config import EyvanSettings
 from eyvan.sdk import cli
 from eyvan.sdk.commands.http import EyvanApiError
@@ -51,11 +52,9 @@ def plane(tmp_path, monkeypatch):
         team_mode=True,
         controller_enabled=False,
         artifact_token_key="k" * 32,
-        assistant_url="http://provider.test/v1",
-        assistant_model="test-model",
-        assistant_api_key="sk-secret",
     )
-    app = create_app(settings=settings)
+    assistant = AssistantConfig(url="http://provider.test/v1", model="test-model", api_key="sk-secret")
+    app = create_app(settings=settings, platform_config=EyvanPlatformConfig(assistant=assistant))
     script: list[dict] = []
     app.state.assistant_transport = httpx.MockTransport(
         lambda request: httpx.Response(

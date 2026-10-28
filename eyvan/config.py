@@ -98,15 +98,6 @@ class EyvanSettings:
     #: Opt-in team accounts (users, invites, password sign-in, personal API
     #: tokens). False keeps every existing route, auth path and wire shape.
     team_mode: bool = False
-    #: Opt-in fleet assistant: the plane itself calls an OpenAI-compatible
-    #: chat-completions endpoint (``{assistant_url}/chat/completions``). The key
-    #: stays on this server and is never returned, logged or sent to browsers.
-    #: Unset URL or model keeps every assistant chat route answering 404.
-    assistant_url: str | None = None
-    assistant_api_key: str | None = field(default=None, repr=False)
-    assistant_model: str | None = None
-    #: Upper bound on provider round trips (tool-calling steps) per chat turn.
-    assistant_max_steps: int = 6
     #: Opt-in durable security audit; false preserves the existing event stream.
     auth_audit_enabled: bool = False
     #: Opt-in correlation envelopes/headers; disabled preserves legacy wire shapes.
@@ -517,22 +508,6 @@ class EyvanSettings:
                 _ = parsed_tracker.port
             except ValueError as exc:
                 raise ValueError("tracker_url must have a valid port") from exc
-        if self.assistant_url is not None:
-            parsed_assistant = urlsplit(self.assistant_url)
-            if (
-                parsed_assistant.scheme not in {"http", "https"}
-                or not parsed_assistant.hostname
-                or parsed_assistant.username is not None
-                or parsed_assistant.password is not None
-                or parsed_assistant.query
-                or parsed_assistant.fragment
-            ):
-                raise ValueError(
-                    "assistant_url must be an http(s) URL without credentials, query or fragment; "
-                    "put the key in EYVAN_ASSISTANT_API_KEY"
-                )
-        if not 1 <= self.assistant_max_steps <= 20:
-            raise ValueError("assistant_max_steps must be between 1 and 20")
         if self.outbox_dispatch_concurrency <= 0:
             raise ValueError("outbox_dispatch_concurrency must be positive")
         if self.outbox_claim_ttl_s <= 0:
@@ -764,10 +739,6 @@ class EyvanSettings:
             oidc_jwks_url=os.getenv("EYVAN_OIDC_JWKS_URL"),
             dev_auth_enabled=truthy("EYVAN_DEV_AUTH_ENABLED"),
             team_mode=truthy("EYVAN_TEAM_MODE", defaults.team_mode),
-            assistant_url=os.getenv("EYVAN_ASSISTANT_URL") or None,
-            assistant_api_key=os.getenv("EYVAN_ASSISTANT_API_KEY") or None,
-            assistant_model=os.getenv("EYVAN_ASSISTANT_MODEL") or None,
-            assistant_max_steps=int(os.getenv("EYVAN_ASSISTANT_MAX_STEPS", defaults.assistant_max_steps)),
             auth_audit_enabled=truthy("EYVAN_AUTH_AUDIT_ENABLED", defaults.auth_audit_enabled),
             correlation_enabled=truthy("EYVAN_CORRELATION_ENABLED", defaults.correlation_enabled),
             min_client_version=os.getenv("EYVAN_MIN_CLIENT_VERSION") or None,

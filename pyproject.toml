@@ -120,6 +120,13 @@ files = [
     "eyvan/server/api/dashboard_sessions.py",
     "eyvan/server/api/server_bind.py",
     "eyvan/server/api/server_startup.py",
+    "eyvan/sdk/commands/team.py",
+    "eyvan/sdk/commands/assistant.py",
+    "eyvan/server/api/assistant.py",
+    "eyvan/server/api/team_routes.py",
+    "eyvan/server/api/bootstrap_admin.py",
+    "eyvan/server/service/_control_plane/accounts.py",
+    "eyvan/server/service/_control_plane/team_requests.py",
 ]
 # Analyze imported modules for types, but report errors only in the declared
 # ratchet. Editable installs implicitly suppressed these imported-module errors;

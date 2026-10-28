@@ -42,6 +42,20 @@ from eyvan.sdk.team_credentials import (
 )
 
 
+def _object(payload: object) -> dict[str, tp.Any]:
+    """Narrow one decoded API answer to a JSON object, or fail with a readable error."""
+
+    if not isinstance(payload, dict):
+        raise click.ClickException("the plane returned an unexpected answer")
+    return payload
+
+
+def _objects(value: object) -> list[dict[str, tp.Any]]:
+    """Return the objects in a decoded JSON array."""
+
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
 def _http(url: str, trust: PlaneTrust | None = None) -> httpx.Client:
     """HTTP client for one plane: explicit trust, else trust stored by `eyvan login`, else the head CA."""
 
@@ -353,9 +367,8 @@ def users() -> None:
 def users_me(session: CliSession, as_json: bool) -> None:
     """Show who this CLI is signed in as."""
 
-    payload = session.client.request("GET", "/api/v1/team/me")
-    assert is_json_object(payload)
-    roles = ", ".join(str(grant.get("role")) for grant in payload.get("grants", []) if is_json_object(grant))
+    payload = _object(session.client.request("GET", "/api/v1/team/me"))
+    roles = ", ".join(str(grant.get("role")) for grant in _objects(payload.get("grants", [])))
     _emit(as_json, payload, f"{payload.get('subject')}  roles: {roles or 'none'}")
 
 
@@ -366,11 +379,9 @@ def users_list(session: CliSession, as_json: bool) -> None:
     """List every account (fleet admins)."""
 
     payload = session.client.request("GET", "/api/v1/team/users")
-    rows = payload.get("users", []) if is_json_object(payload) else []
+    rows = _objects(payload.get("users", [])) if isinstance(payload, dict) else []
     text = "\n".join(
-        f"{row['subject']:<20} {row['email']:<32} {'disabled' if row['disabled'] else 'active'}"
-        for row in rows
-        if is_json_object(row)
+        f"{row['subject']:<20} {row['email']:<32} {'disabled' if row['disabled'] else 'active'}" for row in rows
     )
     _emit(as_json, payload, text or "no accounts yet; invite someone with `eyvan users invite`")
 
@@ -409,8 +420,7 @@ def users_invite(
             body["org_id"] = scope.org_id
         if role.startswith("project_"):
             body["project_id"] = scope.project_id
-    payload = session.client.request("POST", "/api/v1/team/invites", json=body)
-    assert is_json_object(payload)
+    payload = _object(session.client.request("POST", "/api/v1/team/invites", json=body))
     _emit(
         as_json,
         payload,
@@ -445,12 +455,11 @@ def users_invites(session: CliSession, as_json: bool) -> None:
     """List invites (fleet admins)."""
 
     payload = session.client.request("GET", "/api/v1/team/invites")
-    rows = payload.get("invites", []) if is_json_object(payload) else []
+    rows = _objects(payload.get("invites", [])) if isinstance(payload, dict) else []
     text = "\n".join(
         f"{row['id']}  {row['email']:<32} "
         f"{'accepted' if row['accepted_at'] else 'revoked' if row['revoked'] else 'open until ' + row['expires_at']}"
         for row in rows
-        if is_json_object(row)
     )
     _emit(as_json, payload, text or "no invites")
 
@@ -478,12 +487,11 @@ def tokens() -> None:
 @click.pass_obj
 def tokens_list(session: CliSession, as_json: bool) -> None:
     payload = session.client.request("GET", "/api/v1/team/tokens")
-    rows = payload.get("tokens", []) if is_json_object(payload) else []
+    rows = _objects(payload.get("tokens", [])) if isinstance(payload, dict) else []
     text = "\n".join(
         f"{row['id']}  {row['name']:<24} {row['prefix']}…  "
         f"{'revoked' if row['revoked_at'] else 'last used ' + (row['last_used_at'] or 'never')}"
         for row in rows
-        if is_json_object(row)
     )
     _emit(as_json, payload, text or "no personal tokens")
 
@@ -498,8 +506,7 @@ def tokens_create(session: CliSession, name: str, expires_in_days: int | None) -
     body: dict[str, tp.Any] = {"name": name}
     if expires_in_days is not None:
         body["expires_in_days"] = expires_in_days
-    payload = session.client.request("POST", "/api/v1/team/tokens", json=body)
-    assert is_json_object(payload)
+    payload = _object(session.client.request("POST", "/api/v1/team/tokens", json=body))
     click.echo(f"{payload['token']}\n(shown once; use it as EYVAN_TOKEN)", err=False)
 
 

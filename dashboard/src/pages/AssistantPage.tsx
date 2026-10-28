@@ -139,7 +139,7 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
                 ? "Checking whether this plane runs an assistant…"
                 : status.enabled
                   ? `Answers from this plane's real data with your own permissions (model ${status.model}). It drafts jobs; nothing runs until you confirm.`
-                  : "This plane has no assistant configured. Its operator sets EYVAN_ASSISTANT_URL and EYVAN_ASSISTANT_MODEL on the server."}
+                  : "This plane has no assistant configured. Its operator adds an assistant section (url, model, api_key_file) to the server's platform file."}
             </p>
           </div>
         </div>
