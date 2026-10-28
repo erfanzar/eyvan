@@ -2983,6 +2983,18 @@
             "title": "Messages",
             "type": "array"
           },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "org_id": {
             "default": "default",
             "maxLength": 128,
@@ -2996,6 +3008,18 @@
             "minLength": 1,
             "title": "Project Id",
             "type": "string"
+          },
+          "provider_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Id"
           }
         },
         "required": [
@@ -5469,6 +5493,177 @@
           "observed_at"
         ],
         "title": "ProjectUsageReport",
+        "type": "object"
+      },
+      "ProviderCreateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "base_url": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Base Url",
+            "type": "string"
+          },
+          "default_model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Model"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "max_steps": {
+            "default": 6,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Models",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "base_url",
+          "models"
+        ],
+        "title": "ProviderCreateBody",
+        "type": "object"
+      },
+      "ProviderUpdateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "clear_api_key": {
+            "default": false,
+            "title": "Clear Api Key",
+            "type": "boolean"
+          },
+          "default_model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Model"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "maximum": 20.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ProviderUpdateBody",
         "type": "object"
       },
       "QueueTrend": {
@@ -9917,7 +10112,7 @@
     },
     "/api/v1/assistant/chat": {
       "post": {
-        "description": "Run one assistant turn as the caller; drafts are returned, never submitted.",
+        "description": "Run one assistant turn as the caller with the chosen provider; drafts are never submitted.",
         "operationId": "assistant_chat_api_v1_assistant_chat_post",
         "requestBody": {
           "content": {
@@ -9954,6 +10149,170 @@
           }
         },
         "summary": "Assistant Chat",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/providers": {
+      "get": {
+        "description": "Configured providers: every field but the key for fleet admins, names and models for others.",
+        "operationId": "list_assistant_providers_api_v1_assistant_providers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Assistant Providers Api V1 Assistant Providers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Assistant Providers",
+        "tags": [
+          "assistant"
+        ]
+      },
+      "post": {
+        "description": "Add a provider (fleet admins). The key is sealed and never returned.",
+        "operationId": "create_assistant_provider_api_v1_assistant_providers_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Assistant Provider Api V1 Assistant Providers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Assistant Provider",
+        "tags": [
+          "assistant"
+        ]
+      }
+    },
+    "/api/v1/assistant/providers/{provider_id}": {
+      "delete": {
+        "description": "Remove a provider (fleet admins).",
+        "operationId": "delete_assistant_provider_api_v1_assistant_providers__provider_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Assistant Provider Api V1 Assistant Providers  Provider Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Assistant Provider",
+        "tags": [
+          "assistant"
+        ]
+      },
+      "put": {
+        "description": "Change a provider (fleet admins); an omitted ``api_key`` keeps the stored one.",
+        "operationId": "update_assistant_provider_api_v1_assistant_providers__provider_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "title": "Provider Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderUpdateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Assistant Provider Api V1 Assistant Providers  Provider Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Assistant Provider",
         "tags": [
           "assistant"
         ]
@@ -10005,7 +10364,7 @@
     },
     "/api/v1/assistant/status": {
       "get": {
-        "description": "Whether this plane runs the assistant, and with which model (never the key).",
+        "description": "Whether any provider is available to the caller, and its default model (never a key).",
         "operationId": "assistant_status_api_v1_assistant_status_get",
         "responses": {
           "200": {

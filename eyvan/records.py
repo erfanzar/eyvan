@@ -920,6 +920,55 @@ class TeamRequestRecord(EyvanModel):
     resolution_note: str = Field(default="", max_length=2000)
 
 
+#: One model name as an OpenAI-compatible endpoint spells it.
+ASSISTANT_MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
+
+
+class AssistantProviderRecord(EyvanModel):
+    """An LLM endpoint a fleet admin configured for the fleet assistant.
+
+    ``api_key_ciphertext`` is the provider key sealed with a key derived from
+    the plane's own server secret; the plaintext is never stored, returned,
+    logged or audited. ``None`` means the endpoint takes no key.
+    """
+
+    id: str = Field(pattern=r"^aprv_[0-9a-f]{16}$")
+    name: str = Field(min_length=1, max_length=64)
+    base_url: str = Field(min_length=1, max_length=512)
+    models: tuple[str, ...] = Field(min_length=1, max_length=32)
+    default_model: str
+    max_steps: int = Field(default=6, ge=1, le=20)
+    enabled: bool = True
+    api_key_ciphertext: str | None = Field(default=None, max_length=8192, repr=False)
+    created_by: str = Field(min_length=1, max_length=256)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    updated_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_provider(self) -> AssistantProviderRecord:
+        _validate_string(self.name, field_name="assistant provider name")
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self.base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("base_url must be an http(s) URL without credentials, query or fragment")
+        if len(set(self.models)) != len(self.models):
+            raise ValueError("assistant provider models must be unique")
+        for model in self.models:
+            if not re.fullmatch(ASSISTANT_MODEL_PATTERN, model):
+                raise ValueError(f"invalid model name {model!r}")
+        if self.default_model not in self.models:
+            raise ValueError("default_model must be one of the provider's models")
+        return self
+
+
 class ResourceVector(EyvanModel):
     """Scalar resources requested by one workload replica or offered by a cell."""
 

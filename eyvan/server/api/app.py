@@ -63,6 +63,7 @@ from eyvan.capacity.providers.gcp.quota_discovery import (
 )
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.config import EyvanSettings, RepositoryBackend
+from eyvan.identity.assistant_keys import AssistantKeySealer
 from eyvan.identity.rotation import (
     CredentialRotationBlocked,
     RotatingCredential,
@@ -603,7 +604,7 @@ def create_app(
     platform = platform_config or load_platform_config(settings.platform_config_path)
     loopback_development = settings.dev_auth_enabled and server_bind.is_loopback
     if platform.default_agent_endpoint is None and loopback_development:
-        # Keep every other operator setting (the assistant) when filling in the local agent.
+        # Keep every other operator setting when filling in the local agent.
         platform = replace(platform, default_agent_endpoint=DEFAULT_LOCAL_CELL_AGENT_URL)
     engine: AsyncEngine | None = None
     if repository is None:
@@ -653,6 +654,10 @@ def create_app(
     if settings.secret_token_ttl_s <= 0:
         raise ValueError("EYVAN_SECRET_TOKEN_TTL_S must be positive")
     token_key = _artifact_token_key(settings)
+    if getattr(service, "assistant_sealer", None) is None:
+        # Assistant provider keys are sealed under a key derived from this same
+        # server secret, so they need no second secret and no new setting.
+        service.assistant_sealer = AssistantKeySealer(token_key)
     # Secret and child capabilities are control-plane delivery mechanisms, not
     # properties of the injected artifact-store adapter.  Constructing them only
     # while constructing that adapter made an otherwise valid injection silently
@@ -786,7 +791,7 @@ def create_app(
     register_tracking_routes(app, settings=settings, service=service)
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     register_team_routes(app, settings=settings, service=service)
-    register_assistant_routes(app, settings=settings, service=service, assistant=platform.assistant)
+    register_assistant_routes(app, settings=settings, service=service)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for

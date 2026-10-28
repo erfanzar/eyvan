@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from eyvan.records import (
     ApiTokenRecord,
     ArtifactReferenceRecord,
+    AssistantProviderRecord,
     AuditEvent,
     BudgetRecord,
     CapacityPoolRecord,
@@ -78,6 +79,9 @@ class ControlPlaneState:
     api_tokens: dict[str, ApiTokenRecord] = field(default_factory=dict)
     #: Capacity/approval requests users filed for the fleet admins (id -> request).
     team_requests: dict[str, TeamRequestRecord] = field(default_factory=dict)
+    #: LLM endpoints a fleet admin configured for the assistant (id -> provider).
+    #: Keys are held only as ciphertext.
+    assistant_providers: dict[str, AssistantProviderRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -318,6 +322,18 @@ class StateSession(RepositorySession):
 
     async def put_team_request(self, request: TeamRequestRecord) -> None:
         self._state.team_requests[request.id] = request
+
+    async def get_assistant_provider(self, provider_id: str) -> AssistantProviderRecord | None:
+        return self._state.assistant_providers.get(provider_id)
+
+    async def list_assistant_providers(self) -> list[AssistantProviderRecord]:
+        return sorted(self._state.assistant_providers.values(), key=lambda item: (item.name.lower(), item.id))
+
+    async def put_assistant_provider(self, provider: AssistantProviderRecord) -> None:
+        self._state.assistant_providers[provider.id] = provider
+
+    async def delete_assistant_provider(self, provider_id: str) -> bool:
+        return self._state.assistant_providers.pop(provider_id, None) is not None
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

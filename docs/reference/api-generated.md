@@ -24,6 +24,10 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/artifacts/usage` | Artifact Usage | 200, 422 |
 | PUT | `/api/v1/artifacts/workspaces/{digest}` | Upload Workspace Artifact | 200, 422 |
 | POST | `/api/v1/assistant/chat` | Assistant Chat | 200, 422 |
+| GET | `/api/v1/assistant/providers` | List Assistant Providers | 200 |
+| POST | `/api/v1/assistant/providers` | Create Assistant Provider | 201, 422 |
+| DELETE | `/api/v1/assistant/providers/{provider_id}` | Delete Assistant Provider | 200, 422 |
+| PUT | `/api/v1/assistant/providers/{provider_id}` | Update Assistant Provider | 200, 422 |
 | POST | `/api/v1/assistant/size` | Assistant Size | 200, 422 |
 | GET | `/api/v1/assistant/status` | Assistant Status | 200 |
 | GET | `/api/v1/attachments` | Recent Attachments | 200 |

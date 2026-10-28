@@ -6,11 +6,28 @@
 import { AlertTriangle, Check, LoaderCircle, Send, X } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
-import type { AssistantDraft, AssistantMessage, AssistantStatus, AssistantTurn, TeamRequest } from "../types";
+import type {
+  AssistantDraft,
+  AssistantMessage,
+  AssistantProvider,
+  AssistantProviderInput,
+  AssistantProviderList,
+  AssistantProviderUpdate,
+  AssistantStatus,
+  AssistantTurn,
+  TeamRequest,
+} from "../types";
 
 export interface AssistantClient {
   getAssistantStatus: (signal?: AbortSignal) => Promise<AssistantStatus>;
-  assistantChat: (messages: AssistantMessage[]) => Promise<AssistantTurn>;
+  listAssistantProviders: (signal?: AbortSignal) => Promise<AssistantProviderList>;
+  createAssistantProvider?: (input: AssistantProviderInput) => Promise<AssistantProvider>;
+  updateAssistantProvider?: (id: string, changes: AssistantProviderUpdate) => Promise<AssistantProvider>;
+  deleteAssistantProvider?: (id: string) => Promise<{ deleted: string }>;
+  assistantChat: (
+    messages: AssistantMessage[],
+    selection?: { provider_id: string; model: string } | null,
+  ) => Promise<AssistantTurn>;
   submitAssistantDraft: (draft: AssistantDraft) => Promise<{ id: string }>;
   listTeamRequests: (signal?: AbortSignal) => Promise<TeamRequest[]>;
   resolveTeamRequest: (
@@ -30,7 +47,39 @@ interface AssistantPageProps {
 
 type DraftState = { draft: AssistantDraft; status: "pending" | "submitting" | "submitted" | "dismissed"; id?: string };
 
+type ProviderForm = {
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  models: string;
+  defaultModel: string;
+  maxSteps: string;
+  enabled: boolean;
+  clearApiKey: boolean;
+};
+
+const emptyProviderForm = (): ProviderForm => ({
+  name: "",
+  baseUrl: "",
+  apiKey: "",
+  models: "",
+  defaultModel: "",
+  maxSteps: "8",
+  enabled: true,
+  clearApiKey: false,
+});
+
 const message = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
+const splitModels = (models: string) => [
+  ...new Set(
+    models
+      .split(",")
+      .map((model) => model.trim())
+      .filter(Boolean),
+  ),
+];
+const defaultModel = (provider: AssistantProvider) =>
+  provider.models.includes(provider.default_model) ? provider.default_model : (provider.models[0] ?? "");
 
 export function AssistantPage({ client, canAdminister, teamMode }: AssistantPageProps) {
   const [status, setStatus] = useState<AssistantStatus | null>(null);
@@ -41,6 +90,27 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
   const [drafts, setDrafts] = useState<DraftState[]>([]);
   const [requests, setRequests] = useState<TeamRequest[]>([]);
   const [revision, setRevision] = useState(0);
+  const [providerList, setProviderList] = useState<AssistantProviderList | null>(null);
+  const [providerId, setProviderId] = useState("");
+  const [model, setModel] = useState("");
+  const [providerRevision, setProviderRevision] = useState(0);
+  const [editingProvider, setEditingProvider] = useState<AssistantProvider | null>(null);
+  const [providerForm, setProviderForm] = useState<ProviderForm>(emptyProviderForm);
+  const [providerBusy, setProviderBusy] = useState(false);
+
+  const providers = providerList?.providers ?? [];
+  const availableProviders = providers.filter((provider) => provider.enabled !== false);
+  const selectedProvider = availableProviders.find((provider) => provider.id === providerId) ?? availableProviders[0];
+  const selectedModel = selectedProvider
+    ? selectedProvider.models.includes(model)
+      ? model
+      : defaultModel(selectedProvider)
+    : "";
+  const formModels = splitModels(providerForm.models);
+  const formDefaultModel = formModels.includes(providerForm.defaultModel)
+    ? providerForm.defaultModel
+    : (formModels[0] ?? "");
+  const canManageProviders = canAdminister && providerList?.can_manage === true;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -52,8 +122,16 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
       .catch((failure: unknown) => {
         if (!controller.signal.aborted) setError(message(failure, "Could not read the assistant status"));
       });
+    client
+      .listAssistantProviders(controller.signal)
+      .then((value) => {
+        if (!controller.signal.aborted) setProviderList(value);
+      })
+      .catch((failure: unknown) => {
+        if (!controller.signal.aborted) setError(message(failure, "Could not read assistant providers"));
+      });
     return () => controller.abort();
-  }, [client]);
+  }, [client, providerRevision]);
 
   useEffect(() => {
     if (!teamMode) return;
@@ -81,7 +159,10 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
     setBusy(true);
     setError(null);
     try {
-      const turn = await client.assistantChat(next);
+      const turn = await client.assistantChat(
+        next,
+        selectedProvider ? { provider_id: selectedProvider.id, model: selectedModel } : null,
+      );
       setHistory([...next, { role: "assistant", content: turn.reply || "(no answer)" }]);
       if (turn.drafts.length) {
         setDrafts((current) => [...current, ...turn.drafts.map((draft) => ({ draft, status: "pending" as const }))]);
@@ -121,6 +202,81 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
     }
   };
 
+  const resetProviderForm = () => {
+    setEditingProvider(null);
+    setProviderForm(emptyProviderForm());
+  };
+
+  const editProvider = (provider: AssistantProvider) => {
+    setEditingProvider(provider);
+    setProviderForm({
+      name: provider.name,
+      baseUrl: provider.base_url ?? "",
+      apiKey: "",
+      models: provider.models.join(", "),
+      defaultModel: defaultModel(provider),
+      maxSteps: String(provider.max_steps ?? 8),
+      enabled: provider.enabled !== false,
+      clearApiKey: false,
+    });
+  };
+
+  const changeProvider = async (operation: () => Promise<unknown>) => {
+    if (!canManageProviders || providerBusy) return;
+    setProviderBusy(true);
+    setError(null);
+    try {
+      await operation();
+      resetProviderForm();
+      setProviderRevision((value) => value + 1);
+    } catch (failure) {
+      setError(message(failure, "The assistant provider was not updated"));
+    } finally {
+      setProviderBusy(false);
+    }
+  };
+
+  const saveProvider = (event: FormEvent) => {
+    event.preventDefault();
+    const input: AssistantProviderInput = {
+      name: providerForm.name.trim(),
+      base_url: providerForm.baseUrl.trim(),
+      models: formModels,
+      default_model: formDefaultModel,
+      max_steps: Number(providerForm.maxSteps),
+      enabled: providerForm.enabled,
+      ...(providerForm.apiKey ? { api_key: providerForm.apiKey } : {}),
+    };
+    if (editingProvider) {
+      void changeProvider(async () => {
+        if (!client.updateAssistantProvider) throw new Error("Provider editing is unavailable");
+        await client.updateAssistantProvider(editingProvider.id, {
+          ...input,
+          ...(providerForm.clearApiKey ? { clear_api_key: true } : {}),
+        });
+      });
+    } else {
+      void changeProvider(async () => {
+        if (!client.createAssistantProvider) throw new Error("Provider creation is unavailable");
+        await client.createAssistantProvider(input);
+      });
+    }
+  };
+
+  const toggleProvider = (provider: AssistantProvider) =>
+    changeProvider(async () => {
+      if (!client.updateAssistantProvider) throw new Error("Provider editing is unavailable");
+      await client.updateAssistantProvider(provider.id, { enabled: provider.enabled === false });
+    });
+
+  const deleteProvider = (provider: AssistantProvider) => {
+    if (!window.confirm(`Delete assistant provider “${provider.name}”?`)) return;
+    void changeProvider(async () => {
+      if (!client.deleteAssistantProvider) throw new Error("Provider deletion is unavailable");
+      await client.deleteAssistantProvider(provider.id);
+    });
+  };
+
   return (
     <div className="page-stack">
       {error && (
@@ -135,15 +291,50 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
           <div>
             <h2>Fleet assistant</h2>
             <p>
-              {status === null
+              {status === null || providerList === null
                 ? "Checking whether this plane runs an assistant…"
-                : status.enabled
-                  ? `Answers from this plane's real data with your own permissions (model ${status.model}). It drafts jobs; nothing runs until you confirm.`
-                  : "This plane has no assistant configured. Its operator adds an assistant section (url, model, api_key_file) to the server's platform file."}
+                : availableProviders.length > 0
+                  ? `Answers from this plane's real data with your own permissions (model ${selectedModel}). It drafts jobs; nothing runs until you confirm.`
+                  : "No assistant provider is configured yet."}
             </p>
+            {providerList !== null && availableProviders.length === 0 && (
+              <p>{canAdminister ? "Add one under Assistant providers below." : "Ask a fleet admin to add one."}</p>
+            )}
           </div>
         </div>
-        {status?.enabled && (
+        {availableProviders.length > 0 && (
+          <div className="form-grid form-grid-two">
+            <label className="field">
+              <span>Provider</span>
+              <select
+                value={selectedProvider?.id ?? ""}
+                disabled={busy}
+                onChange={(event) => {
+                  const provider = availableProviders.find((item) => item.id === event.target.value);
+                  setProviderId(event.target.value);
+                  setModel(provider ? defaultModel(provider) : "");
+                }}
+              >
+                {availableProviders.map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Model</span>
+              <select value={selectedModel} onChange={(event) => setModel(event.target.value)} disabled={busy}>
+                {selectedProvider?.models.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
+        {status?.enabled && selectedProvider && (
           <>
             <div className="assistant-log" aria-label="Conversation" role="log">
               {history.length === 0 && (
@@ -176,6 +367,193 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
           </>
         )}
       </section>
+
+      {canAdminister && (
+        <section className="panel data-panel" aria-label="Assistant providers">
+          <div className="panel-header">
+            <div>
+              <h2>Assistant providers</h2>
+              <p>Manage the models available to the fleet. API keys stay on the server and are never shown again.</p>
+            </div>
+          </div>
+          {providers.length > 0 && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Base URL</th>
+                    <th>Models</th>
+                    <th>Default model</th>
+                    <th>Enabled</th>
+                    <th>API key</th>
+                    <th aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {providers.map((provider) => (
+                    <tr key={provider.id}>
+                      <td>{provider.name}</td>
+                      <td>{provider.base_url ?? "—"}</td>
+                      <td>{provider.models.join(", ")}</td>
+                      <td>{provider.default_model}</td>
+                      <td>{provider.enabled ? "Enabled" : "Disabled"}</td>
+                      <td>{provider.has_api_key ? "key set" : "no key"}</td>
+                      <td>
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          disabled={providerBusy || !canManageProviders || !client.updateAssistantProvider}
+                          onClick={() => editProvider(provider)}
+                        >
+                          Edit
+                        </button>{" "}
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          disabled={providerBusy || !canManageProviders || !client.updateAssistantProvider}
+                          onClick={() => void toggleProvider(provider)}
+                        >
+                          {provider.enabled === false ? "Enable" : "Disable"}
+                        </button>{" "}
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          disabled={providerBusy || !canManageProviders || !client.deleteAssistantProvider}
+                          onClick={() => deleteProvider(provider)}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <h3>{editingProvider ? `Edit ${editingProvider.name}` : "Add provider"}</h3>
+          <form
+            className="form-grid form-grid-two"
+            aria-label={editingProvider ? `Edit ${editingProvider.name}` : "Add provider"}
+            onSubmit={saveProvider}
+          >
+            <label className="field">
+              <span>Name</span>
+              <input
+                required
+                value={providerForm.name}
+                disabled={providerBusy || !canManageProviders}
+                onChange={(event) => setProviderForm({ ...providerForm, name: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>Base URL</span>
+              <input
+                required
+                type="url"
+                placeholder="https://api.example.com/v1"
+                value={providerForm.baseUrl}
+                disabled={providerBusy || !canManageProviders}
+                onChange={(event) => setProviderForm({ ...providerForm, baseUrl: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>API key</span>
+              <input
+                type="password"
+                autoComplete="off"
+                placeholder={editingProvider ? "Stored key is kept when left empty" : "Optional API key"}
+                value={providerForm.apiKey}
+                disabled={providerBusy || !canManageProviders || providerForm.clearApiKey}
+                onChange={(event) => setProviderForm({ ...providerForm, apiKey: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>Models (comma separated)</span>
+              <input
+                required
+                value={providerForm.models}
+                disabled={providerBusy || !canManageProviders}
+                onChange={(event) => setProviderForm({ ...providerForm, models: event.target.value })}
+              />
+            </label>
+            <label className="field">
+              <span>Default model</span>
+              <select
+                required
+                value={formDefaultModel}
+                disabled={providerBusy || !canManageProviders || formModels.length === 0}
+                onChange={(event) => setProviderForm({ ...providerForm, defaultModel: event.target.value })}
+              >
+                {formModels.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Max steps</span>
+              <input
+                required
+                type="number"
+                min={1}
+                max={20}
+                step={1}
+                value={providerForm.maxSteps}
+                disabled={providerBusy || !canManageProviders}
+                onChange={(event) => setProviderForm({ ...providerForm, maxSteps: event.target.value })}
+              />
+            </label>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={providerForm.enabled}
+                disabled={providerBusy || !canManageProviders}
+                onChange={(event) => setProviderForm({ ...providerForm, enabled: event.target.checked })}
+              />
+              <span>Enabled</span>
+            </label>
+            {editingProvider && (
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={providerForm.clearApiKey}
+                  disabled={providerBusy || !canManageProviders}
+                  onChange={(event) =>
+                    setProviderForm({ ...providerForm, clearApiKey: event.target.checked, apiKey: "" })
+                  }
+                />
+                <span>Remove stored key</span>
+              </label>
+            )}
+            <div className="field-wide">
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={
+                  providerBusy ||
+                  !canManageProviders ||
+                  formModels.length === 0 ||
+                  (editingProvider ? !client.updateAssistantProvider : !client.createAssistantProvider)
+                }
+              >
+                {providerBusy ? "Saving…" : editingProvider ? "Save provider" : "Add provider"}
+              </button>{" "}
+              {editingProvider && (
+                <button
+                  className="button button-secondary"
+                  type="button"
+                  disabled={providerBusy}
+                  onClick={resetProviderForm}
+                >
+                  Cancel edit
+                </button>
+              )}
+            </div>
+          </form>
+        </section>
+      )}
 
       {drafts.length > 0 && (
         <section className="panel data-panel" aria-label="Drafted workloads">

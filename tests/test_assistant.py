@@ -20,7 +20,6 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from eyvan._internal.platform import AssistantConfig, EyvanPlatformConfig
 from eyvan.config import EyvanSettings
 from eyvan.server.api.app import create_app
 
@@ -56,15 +55,25 @@ class FakeProvider:
 
 def _client(provider: FakeProvider | None, *, configured: bool = True, team_mode: bool = True, steps: int = 6):
     settings = EyvanSettings(dev_auth_enabled=True, team_mode=team_mode, artifact_token_key="k" * 32)
-    assistant = (
-        AssistantConfig(url="http://provider.test/v1", model="test-model", api_key=KEY, max_steps=steps)
-        if configured
-        else None
-    )
-    app = create_app(settings=settings, platform_config=EyvanPlatformConfig(assistant=assistant))
+    app = create_app(settings=settings)
     if provider is not None:
         app.state.assistant_transport = httpx.MockTransport(provider)
-    return TestClient(app, base_url="http://127.0.0.1:8080")
+    http = TestClient(app, base_url="http://127.0.0.1:8080")
+    if configured:
+        # Configured the way an operator does it: a fleet admin adds the provider over the API.
+        created = http.post(
+            "/api/v1/assistant/providers",
+            json={
+                "name": "test",
+                "base_url": "http://provider.test/v1",
+                "api_key": KEY,
+                "models": ["test-model"],
+                "max_steps": steps,
+            },
+            headers=ADMIN,
+        )
+        assert created.status_code == 201, created.text
+    return http
 
 
 def _chat(http: TestClient, text: str, headers: dict[str, str] = ALICE) -> httpx.Response:
@@ -75,14 +84,15 @@ def _chat(http: TestClient, text: str, headers: dict[str, str] = ALICE) -> httpx
 
 def test_assistant_is_off_unless_a_provider_is_configured() -> None:
     http = _client(None, configured=False)
-    assert http.get("/api/v1/assistant/status", headers=ALICE).json() == {"enabled": False, "model": None}
+    status = http.get("/api/v1/assistant/status", headers=ALICE).json()
+    assert status == {"enabled": False, "model": None, "providers": 0}
     assert _chat(http, "hi").status_code == 404
 
 
 def test_status_names_the_model_and_never_the_key() -> None:
     http = _client(FakeProvider())
     status = http.get("/api/v1/assistant/status", headers=ALICE)
-    assert status.json() == {"enabled": True, "model": "test-model"}
+    assert status.json() == {"enabled": True, "model": "test-model", "providers": 1}
     assert KEY not in status.text
 
 

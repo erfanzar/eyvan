@@ -51,6 +51,10 @@ import type {
   DiscoveredTpus,
   AssistantDraft,
   AssistantMessage,
+  AssistantProvider,
+  AssistantProviderInput,
+  AssistantProviderList,
+  AssistantProviderUpdate,
   AssistantStatus,
   AssistantTurn,
   TeamRequest,
@@ -807,12 +811,46 @@ export class EyvanApiClient {
     return this.attachmentRequest<AssistantStatus>("/api/v1/assistant/status", { signal });
   }
 
-  async assistantChat(messages: AssistantMessage[], scope: AuthScope = this.activeScope): Promise<AssistantTurn> {
+  async listAssistantProviders(signal?: AbortSignal): Promise<AssistantProviderList> {
+    if (this.forceDemo) return { providers: [], can_manage: false };
+    return this.attachmentRequest<AssistantProviderList>("/api/v1/assistant/providers", { signal });
+  }
+
+  async createAssistantProvider(input: AssistantProviderInput): Promise<AssistantProvider> {
+    return this.attachmentRequest<AssistantProvider>("/api/v1/assistant/providers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updateAssistantProvider(id: string, changes: AssistantProviderUpdate): Promise<AssistantProvider> {
+    return this.attachmentRequest<AssistantProvider>(`/api/v1/assistant/providers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(changes),
+    });
+  }
+
+  async deleteAssistantProvider(id: string): Promise<{ deleted: string }> {
+    return this.attachmentRequest<{ deleted: string }>(`/api/v1/assistant/providers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async assistantChat(
+    messages: AssistantMessage[],
+    selection?: { provider_id: string; model: string } | null,
+    scope: AuthScope = this.activeScope,
+  ): Promise<AssistantTurn> {
     return this.attachmentRequest<AssistantTurn>(
       "/api/v1/assistant/chat",
       {
         method: "POST",
-        body: JSON.stringify({ messages, org_id: scope.orgId, project_id: scope.projectId }),
+        body: JSON.stringify({
+          messages,
+          org_id: scope.orgId,
+          project_id: scope.projectId,
+          ...(selection ? { provider_id: selection.provider_id, model: selection.model } : {}),
+        }),
       },
       150_000,
     );

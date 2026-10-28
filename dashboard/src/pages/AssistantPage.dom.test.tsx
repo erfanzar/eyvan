@@ -9,7 +9,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EyvanApiClient } from "../api/client";
-import type { AssistantTurn, TeamRequest } from "../types";
+import type { AssistantProvider, AssistantProviderUpdate, AssistantTurn, TeamRequest } from "../types";
 import { AssistantPage, type AssistantClient } from "./AssistantPage";
 
 const REQUEST: TeamRequest = {
@@ -31,9 +31,41 @@ function turn(overrides: Partial<AssistantTurn> = {}): AssistantTurn {
   return { reply: "ok", steps: 1, tool_calls: [], drafts: [], requests: [], ...overrides };
 }
 
-function mockClient(chat: AssistantTurn = turn()): AssistantClient {
+const PROVIDER: AssistantProvider = {
+  id: "provider_1",
+  name: "Primary",
+  base_url: "https://api.example.com/v1",
+  models: ["quick", "careful"],
+  default_model: "careful",
+  max_steps: 8,
+  enabled: true,
+  has_api_key: true,
+};
+
+const OTHER_PROVIDER: AssistantProvider = {
+  id: "provider_2",
+  name: "Alternative",
+  models: ["small", "large"],
+  default_model: "small",
+};
+
+function mockClient(chat: AssistantTurn = turn(), providers: AssistantProvider[] = [PROVIDER]): AssistantClient {
   return {
-    getAssistantStatus: vi.fn(async () => ({ enabled: true, model: "test-model" })),
+    getAssistantStatus: vi.fn(async () => ({
+      enabled: providers.some((provider) => provider.enabled !== false),
+      model: providers[0]?.default_model ?? null,
+      providers: providers.length,
+    })),
+    listAssistantProviders: vi.fn(async () => ({ providers, can_manage: true })),
+    createAssistantProvider: vi
+      .fn<NonNullable<AssistantClient["createAssistantProvider"]>>()
+      .mockResolvedValue(PROVIDER),
+    updateAssistantProvider: vi
+      .fn<NonNullable<AssistantClient["updateAssistantProvider"]>>()
+      .mockResolvedValue(PROVIDER),
+    deleteAssistantProvider: vi.fn<NonNullable<AssistantClient["deleteAssistantProvider"]>>().mockResolvedValue({
+      deleted: PROVIDER.id,
+    }),
     assistantChat: vi.fn(async () => chat),
     submitAssistantDraft: vi.fn(async () => ({ id: "wl_1" })),
     listTeamRequests: vi.fn(async () => [REQUEST]),
@@ -54,11 +86,13 @@ afterEach(() => {
 
 describe("Assistant page", () => {
   it("explains an unconfigured plane instead of showing a chat box", async () => {
-    const client = mockClient();
-    vi.mocked(client.getAssistantStatus).mockResolvedValueOnce({ enabled: false, model: null });
+    const client = mockClient(turn(), []);
+    vi.mocked(client.listAssistantProviders).mockResolvedValue({ providers: [], can_manage: false });
     render(<AssistantPage client={client} canAdminister={false} teamMode={false} />);
-    await screen.findByText(/no assistant configured/);
+    await screen.findByText("No assistant provider is configured yet.");
+    expect(screen.getByText("Ask a fleet admin to add one.")).toBeTruthy();
     expect(screen.queryByRole("form", { name: "Ask" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Assistant providers" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Requests" })).toBeNull();
   });
 
@@ -67,7 +101,202 @@ describe("Assistant page", () => {
     render(<AssistantPage client={client} canAdminister={false} teamMode />);
     await ask("how big a TPU for llama 8b?");
     await screen.findByText("Use a v5p-8.");
-    expect(client.assistantChat).toHaveBeenCalledWith([{ role: "user", content: "how big a TPU for llama 8b?" }]);
+    expect(client.assistantChat).toHaveBeenCalledWith([{ role: "user", content: "how big a TPU for llama 8b?" }], {
+      provider_id: PROVIDER.id,
+      model: PROVIDER.default_model,
+    });
+  });
+
+  it("lists providers and their models, resets the model on provider changes, and sends each selection", async () => {
+    const client = mockClient(turn(), [PROVIDER, OTHER_PROVIDER]);
+    render(<AssistantPage client={client} canAdminister={false} teamMode={false} />);
+    const provider = (await screen.findByLabelText("Provider")) as HTMLSelectElement;
+    const model = screen.getByLabelText("Model") as HTMLSelectElement;
+    expect(
+      within(provider)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Primary", "Alternative"]);
+    expect(
+      within(model)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["quick", "careful"]);
+    expect(model.value).toBe("careful");
+    expect(screen.queryByRole("region", { name: "Assistant providers" })).toBeNull();
+
+    fireEvent.change(model, { target: { value: "quick" } });
+    await ask("first question");
+    await waitFor(() => expect(client.assistantChat).toHaveBeenCalledTimes(1));
+    await screen.findByText("ok");
+    expect(client.assistantChat).toHaveBeenLastCalledWith([{ role: "user", content: "first question" }], {
+      provider_id: PROVIDER.id,
+      model: "quick",
+    });
+
+    fireEvent.change(provider, { target: { value: OTHER_PROVIDER.id } });
+    expect(
+      within(model)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["small", "large"]);
+    expect(model.value).toBe("small");
+    fireEvent.change(model, { target: { value: "large" } });
+    await ask("second question");
+    await waitFor(() => expect(client.assistantChat).toHaveBeenCalledTimes(2));
+    expect(client.assistantChat).toHaveBeenLastCalledWith(
+      [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "second question" },
+      ],
+      { provider_id: OTHER_PROVIDER.id, model: "large" },
+    );
+  });
+
+  it("lets an admin add a provider, reloads the configuration, and clears its write-only key", async () => {
+    const client = mockClient(turn(), []);
+    const { container } = render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    await screen.findByText("Add one under Assistant providers below.");
+    const form = screen.getByRole("form", { name: "Add provider" });
+    const fields = within(form);
+    fireEvent.change(fields.getByLabelText("Name"), { target: { value: " Primary " } });
+    fireEvent.change(fields.getByLabelText("Base URL"), { target: { value: "https://api.example.com/v1" } });
+    const key = fields.getByLabelText("API key") as HTMLInputElement;
+    expect(key.type).toBe("password");
+    expect(key.autocomplete).toBe("off");
+    fireEvent.change(key, { target: { value: "write-only-secret-123" } });
+    fireEvent.change(fields.getByLabelText("Models (comma separated)"), {
+      target: { value: " quick, careful , , " },
+    });
+    expect((fields.getByLabelText("Default model") as HTMLSelectElement).value).toBe("quick");
+    fireEvent.change(fields.getByLabelText("Default model"), { target: { value: "careful" } });
+    fireEvent.change(fields.getByLabelText("Max steps"), { target: { value: "7" } });
+    fireEvent.click(fields.getByLabelText("Enabled"));
+    vi.mocked(client.listAssistantProviders).mockResolvedValue({ providers: [PROVIDER], can_manage: true });
+    vi.mocked(client.getAssistantStatus).mockResolvedValue({ enabled: true, model: "careful", providers: 1 });
+    fireEvent.submit(form);
+
+    await waitFor(() =>
+      expect(client.createAssistantProvider).toHaveBeenCalledWith({
+        name: "Primary",
+        base_url: "https://api.example.com/v1",
+        api_key: "write-only-secret-123",
+        models: ["quick", "careful"],
+        default_model: "careful",
+        max_steps: 7,
+        enabled: false,
+      }),
+    );
+    await screen.findByText("key set");
+    expect(client.listAssistantProviders).toHaveBeenCalledTimes(2);
+    expect(client.getAssistantStatus).toHaveBeenCalledTimes(2);
+    expect(
+      (within(screen.getByRole("form", { name: "Add provider" })).getByLabelText("API key") as HTMLInputElement).value,
+    ).toBe("");
+    expect(container.innerHTML).not.toContain("write-only-secret-123");
+    expect(container.textContent).not.toContain("write-only-secret-123");
+  });
+
+  it("edits a provider without sending an empty API key or clearing the stored key", async () => {
+    const client = mockClient();
+    render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    const form = screen.getByRole("form", { name: "Edit Primary" });
+    const key = within(form).getByLabelText("API key") as HTMLInputElement;
+    expect(key.value).toBe("");
+    expect(key.placeholder).toMatch(/kept when left empty/);
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "Renamed" } });
+    fireEvent.submit(form);
+    await waitFor(() =>
+      expect(client.updateAssistantProvider).toHaveBeenCalledWith(PROVIDER.id, {
+        name: "Renamed",
+        base_url: PROVIDER.base_url,
+        models: PROVIDER.models,
+        default_model: PROVIDER.default_model,
+        max_steps: 8,
+        enabled: true,
+      }),
+    );
+    await screen.findByRole("form", { name: "Add provider" });
+    expect(client.listAssistantProviders).toHaveBeenCalledTimes(2);
+    expect(client.getAssistantStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("explicitly removes a stored key without sending a replacement", async () => {
+    const client = mockClient();
+    render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    const form = screen.getByRole("form", { name: "Edit Primary" });
+    fireEvent.change(within(form).getByLabelText("API key"), { target: { value: "discarded-replacement" } });
+    fireEvent.click(within(form).getByLabelText("Remove stored key"));
+    expect((within(form).getByLabelText("API key") as HTMLInputElement).value).toBe("");
+    fireEvent.submit(form);
+    await waitFor(() =>
+      expect(client.updateAssistantProvider).toHaveBeenCalledWith(PROVIDER.id, {
+        name: PROVIDER.name,
+        base_url: PROVIDER.base_url,
+        models: PROVIDER.models,
+        default_model: PROVIDER.default_model,
+        max_steps: 8,
+        enabled: true,
+        clear_api_key: true,
+      }),
+    );
+    await screen.findByRole("form", { name: "Add provider" });
+  });
+
+  it("asks for confirmation before deleting a provider and reloads after confirmation", async () => {
+    const client = mockClient();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Delete" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Primary"));
+    expect(client.deleteAssistantProvider).not.toHaveBeenCalled();
+    vi.mocked(client.listAssistantProviders).mockResolvedValue({ providers: [], can_manage: true });
+    vi.mocked(client.getAssistantStatus).mockResolvedValue({ enabled: false, model: null, providers: 0 });
+    fireEvent.click(within(row).getByRole("button", { name: "Delete" }));
+    await screen.findByText("No assistant provider is configured yet.");
+    expect(client.deleteAssistantProvider).toHaveBeenCalledWith(PROVIDER.id);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(client.listAssistantProviders).toHaveBeenCalledTimes(2);
+    expect(client.getAssistantStatus).toHaveBeenCalledTimes(2);
+    expect(screen.queryByLabelText("Provider")).toBeNull();
+  });
+
+  it("toggles a provider with a partial update and keeps disabled providers out of the chat picker", async () => {
+    const client = mockClient();
+    render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    vi.mocked(client.listAssistantProviders).mockResolvedValue({
+      providers: [{ ...PROVIDER, enabled: false }],
+      can_manage: true,
+    });
+    vi.mocked(client.getAssistantStatus).mockResolvedValue({ enabled: false, model: null, providers: 0 });
+    fireEvent.click(within(row).getByRole("button", { name: "Disable" }));
+    await screen.findByRole("button", { name: "Enable" });
+    expect(client.updateAssistantProvider).toHaveBeenLastCalledWith(PROVIDER.id, { enabled: false });
+    expect(screen.queryByLabelText("Provider")).toBeNull();
+    vi.mocked(client.listAssistantProviders).mockResolvedValue({ providers: [PROVIDER], can_manage: true });
+    vi.mocked(client.getAssistantStatus).mockResolvedValue({ enabled: true, model: "careful", providers: 1 });
+    fireEvent.click(within(row).getByRole("button", { name: "Enable" }));
+    await screen.findByLabelText("Provider");
+    expect(client.updateAssistantProvider).toHaveBeenLastCalledWith(PROVIDER.id, { enabled: true });
+    expect(client.listAssistantProviders).toHaveBeenCalledTimes(3);
+    expect(client.getAssistantStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows provider management failures in the existing alert", async () => {
+    const client = mockClient();
+    vi.mocked(client.updateAssistantProvider!).mockRejectedValueOnce(new Error("Provider name already exists"));
+    render(<AssistantPage client={client} canAdminister teamMode={false} />);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Disable" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Provider name already exists"));
+    expect(client.listAssistantProviders).toHaveBeenCalledTimes(1);
   });
 
   it("never submits a draft until the user confirms it", async () => {
@@ -121,9 +350,67 @@ describe("Assistant page", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("502"));
   });
 
+  it("manages providers through the real API client class without detaching its methods", async () => {
+    let providers: AssistantProvider[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      let response: unknown;
+      if (path === "/api/v1/assistant/status") {
+        response = {
+          enabled: providers.some((provider) => provider.enabled),
+          model: "careful",
+          providers: providers.length,
+        };
+      } else if (path === "/api/v1/assistant/providers" && init?.method === "POST") {
+        providers = [PROVIDER];
+        response = PROVIDER;
+      } else if (path === "/api/v1/assistant/providers") {
+        response = { providers, can_manage: true };
+      } else if (path === `/api/v1/assistant/providers/${PROVIDER.id}` && init?.method === "PUT") {
+        const changes = JSON.parse(String(init.body)) as AssistantProviderUpdate;
+        providers = providers.map((provider) => ({
+          ...provider,
+          name: changes.name ?? provider.name,
+          enabled: changes.enabled ?? provider.enabled,
+        }));
+        response = providers[0];
+      } else if (path === `/api/v1/assistant/providers/${PROVIDER.id}` && init?.method === "DELETE") {
+        providers = [];
+        response = { deleted: PROVIDER.id };
+      } else {
+        throw new Error(`Unexpected request: ${path}`);
+      }
+      return new Response(JSON.stringify(response), { headers: { "content-type": "application/json" } });
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<AssistantPage client={new EyvanApiClient("/api/v1", false)} canAdminister teamMode={false} />);
+    await screen.findByText("No assistant provider is configured yet.");
+    const form = screen.getByRole("form", { name: "Add provider" });
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: PROVIDER.name } });
+    fireEvent.change(within(form).getByLabelText("Base URL"), { target: { value: PROVIDER.base_url } });
+    fireEvent.change(within(form).getByLabelText("Models (comma separated)"), {
+      target: { value: PROVIDER.models.join(", ") },
+    });
+    fireEvent.submit(form);
+    const row = await screen.findByRole("row", { name: /Primary/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    const edit = screen.getByRole("form", { name: "Edit Primary" });
+    fireEvent.change(within(edit).getByLabelText("Name"), { target: { value: "Updated" } });
+    fireEvent.submit(edit);
+    const updated = await screen.findByRole("row", { name: /Updated/ });
+    fireEvent.click(within(updated).getByRole("button", { name: "Disable" }));
+    await within(updated).findByRole("button", { name: "Enable" });
+    fireEvent.click(within(updated).getByRole("button", { name: "Delete" }));
+    await screen.findByText("No assistant provider is configured yet.");
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "PUT")).toHaveLength(2);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("renders with the real API client class (methods are called on the client, not detached)", async () => {
     render(<AssistantPage client={new EyvanApiClient("/api/v1", true)} canAdminister teamMode />);
-    await screen.findByText(/no assistant configured/);
+    await screen.findByText("No assistant provider is configured yet.");
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });

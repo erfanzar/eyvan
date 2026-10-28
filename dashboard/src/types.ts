@@ -120,7 +120,40 @@ export interface TeamTokenCreated {
 export interface AssistantStatus {
   enabled: boolean;
   model: string | null;
+  providers?: number;
 }
+
+/** Provider keys are write-only; admin-only fields are omitted for other users. */
+export interface AssistantProvider {
+  id: string;
+  name: string;
+  models: string[];
+  default_model: string;
+  base_url?: string;
+  max_steps?: number;
+  enabled?: boolean;
+  has_api_key?: boolean;
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AssistantProviderList {
+  providers: AssistantProvider[];
+  can_manage: boolean;
+}
+
+export interface AssistantProviderInput {
+  name: string;
+  base_url: string;
+  api_key?: string;
+  models: string[];
+  default_model?: string;
+  max_steps?: number;
+  enabled?: boolean;
+}
+
+export type AssistantProviderUpdate = Partial<AssistantProviderInput> & { clear_api_key?: true };
 
 export interface AssistantMessage {
   role: "user" | "assistant";

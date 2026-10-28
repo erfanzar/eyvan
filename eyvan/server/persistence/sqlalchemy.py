@@ -48,6 +48,7 @@ from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import (
     ApiTokenRecord,
     ArtifactReferenceRecord,
+    AssistantProviderRecord,
     AuditEvent,
     BudgetRecord,
     CapacityPoolRecord,
@@ -88,7 +89,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0021_team_requests"
+SCHEMA_REVISION = "0022_assistant_providers"
 
 
 @tp.runtime_checkable
@@ -243,6 +244,14 @@ class TeamRequestRow(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     subject: Mapped[str] = mapped_column(String(256), index=True)
     state: Mapped[str] = mapped_column(String(16), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class AssistantProviderRow(Base):
+    """An assistant LLM endpoint; the key inside ``data`` is ciphertext only."""
+
+    __tablename__ = "assistant_providers"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -970,6 +979,27 @@ class SqlAlchemySession:
         await self.session.merge(
             TeamRequestRow(id=request.id, subject=request.subject, state=request.state, data=_dump(request))
         )
+
+    async def get_assistant_provider(self, provider_id: str) -> AssistantProviderRecord | None:
+        row = await self._get_locked(AssistantProviderRow, provider_id)
+        return None if row is None else AssistantProviderRecord.model_validate(row.data)
+
+    async def list_assistant_providers(self) -> list[AssistantProviderRecord]:
+        rows = (await self.session.scalars(select(AssistantProviderRow))).all()
+        return sorted(
+            _decode_rows(AssistantProviderRecord, rows, table="assistant_providers"),
+            key=lambda item: (item.name.lower(), item.id),
+        )
+
+    async def put_assistant_provider(self, provider: AssistantProviderRecord) -> None:
+        await self.session.merge(AssistantProviderRow(id=provider.id, data=_dump(provider)))
+
+    async def delete_assistant_provider(self, provider_id: str) -> bool:
+        row = await self._get_locked(AssistantProviderRow, provider_id)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        return True
 
     async def delete_role_grant(self, key: tuple[str, str, str, str]) -> bool:
         subject, role, org_id, project_id = key

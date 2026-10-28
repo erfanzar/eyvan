@@ -19,7 +19,6 @@ import pytest
 from click.testing import CliRunner
 from starlette.testclient import TestClient
 
-from eyvan._internal.platform import AssistantConfig, EyvanPlatformConfig
 from eyvan.config import EyvanSettings
 from eyvan.sdk import cli
 from eyvan.sdk.commands.http import EyvanApiError
@@ -53,8 +52,13 @@ def plane(tmp_path, monkeypatch):
         controller_enabled=False,
         artifact_token_key="k" * 32,
     )
-    assistant = AssistantConfig(url="http://provider.test/v1", model="test-model", api_key="sk-secret")
-    app = create_app(settings=settings, platform_config=EyvanPlatformConfig(assistant=assistant))
+    app = create_app(settings=settings)
+    created = TestClient(app, base_url=PLANE).post(
+        "/api/v1/assistant/providers",
+        json={"name": "test", "base_url": "http://provider.test/v1", "api_key": "sk-secret", "models": ["test-model"]},
+        headers=ADMIN_HEADERS,
+    )
+    assert created.status_code == 201, created.text
     script: list[dict] = []
     app.state.assistant_transport = httpx.MockTransport(
         lambda request: httpx.Response(
@@ -134,3 +138,63 @@ def test_size_and_requests_commands(plane, tmp_path) -> None:
     withdrawn = CliRunner().invoke(cli.main, [*ALICE, "requests", "withdraw", request_id])
     assert withdrawn.exit_code == 0, withdrawn.output
     assert f"{request_id} withdrawn" in withdrawn.output
+
+
+ADMIN = ["--user", "root", "--role", "fleet_admin"]
+CLI_KEY = "sk-cli-entered-key-0123456789"
+
+
+def test_admin_manages_providers_from_the_cli_and_the_key_is_never_printed(plane) -> None:
+    sent: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        reply = {"role": "assistant", "content": f"model={json.loads(request.content)['model']}"}
+        return httpx.Response(200, json={"choices": [{"message": reply}]})
+
+    plane.app.state.assistant_transport = httpx.MockTransport(record)
+    runner = CliRunner()
+    added = runner.invoke(
+        cli.main,
+        [
+            *ADMIN,
+            "assistant",
+            "providers",
+            "add",
+            "beta",
+            "--url",
+            "http://beta.test/v1",
+            "--models",
+            "b-1, b-2",
+            "--key-stdin",
+        ],
+        input=CLI_KEY + "\n",
+    )
+    assert added.exit_code == 0, added.output
+    assert "key set" in added.output and CLI_KEY not in added.output
+
+    refused = runner.invoke(
+        cli.main, [*ALICE, "assistant", "providers", "add", "x", "--url", "http://x/v1", "--models", "m"], input=""
+    )
+    assert refused.exit_code != 0
+
+    admin_list = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "list"])
+    assert "beta" in admin_list.output and "key set" in admin_list.output and CLI_KEY not in admin_list.output
+    user_list = runner.invoke(cli.main, [*ALICE, "assistant", "providers", "list"])
+    assert "beta" in user_list.output and "http://beta.test" not in user_list.output
+
+    asked = runner.invoke(cli.main, [*ALICE, "ask", "--provider", "BETA", "--model", "b-2", "hello"])
+    assert asked.exit_code == 0, asked.output
+    assert "model=b-2" in asked.output
+    assert str(sent[-1].url) == "http://beta.test/v1/chat/completions"
+    assert sent[-1].headers["authorization"] == f"Bearer {CLI_KEY}"
+    unknown = runner.invoke(cli.main, [*ALICE, "ask", "--provider", "nope", "hello"])
+    assert unknown.exit_code != 0 and "no assistant provider named 'nope'" in unknown.output
+
+    cleared = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "update", "beta", "--clear-key", "--disable"])
+    assert cleared.exit_code == 0, cleared.output
+    after = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "list"])
+    assert "disabled" in after.output and "no key" in after.output
+    removed = runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "remove", "beta"])
+    assert removed.exit_code == 0, removed.output
+    assert "beta" not in runner.invoke(cli.main, [*ADMIN, "assistant", "providers", "list"]).output

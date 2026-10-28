@@ -6,10 +6,11 @@
 """The fleet assistant: a bounded tool-calling loop the plane runs for one user.
 
 The plane, not the browser or CLI, talks to an OpenAI-compatible
-chat-completions endpoint configured by the operator in the platform file
-(``assistant:`` in ``/etc/eyvan/platform.yaml``; the key is read from ``api_key_file``).
-The provider key never leaves this process: it is sent only as the provider's
-``Authorization`` header and is scrubbed from anything echoed back.
+chat-completions endpoint. Fleet admins configure those endpoints ("providers")
+from the dashboard; every user picks one, and one of its models, per chat.
+A provider key is write-only: it is sealed at rest, decrypted only for the
+turn that uses it, sent only as the provider's ``Authorization`` header, and
+scrubbed from anything echoed back.
 
 Every tool is a typed call into ``ControlPlaneService`` made with the *asking
 user's* principal, so the assistant can never read or do more than that user
@@ -31,7 +32,6 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from eyvan._internal.platform import AssistantConfig
 from eyvan.config import EyvanSettings
 from eyvan.domain.sizing import (
     DEFAULT_CANDIDATE_TYPES,
@@ -41,6 +41,7 @@ from eyvan.domain.sizing import (
     size_job,
 )
 from eyvan.records import (
+    AssistantProviderRecord,
     CapacityClass,
     CommandExecution,
     Principal,
@@ -388,11 +389,21 @@ class AssistantProviderError(RuntimeError):
 class AssistantProvider:
     """One OpenAI-compatible chat-completions endpoint."""
 
-    def __init__(self, config: AssistantConfig, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self.url = config.url.rstrip("/") + "/chat/completions"
-        self.model = config.model
-        self._key = config.api_key
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str | None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.model = model
+        self._key = api_key
         self._transport = transport
+
+    def __repr__(self) -> str:
+        return f"AssistantProvider(url={self.url!r}, model={self.model!r})"
 
     async def complete(self, messages: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
         headers = {"Content-Type": "application/json"}
@@ -491,6 +502,54 @@ class ChatBody(_Body):
     messages: list[ChatMessage] = Field(min_length=1, max_length=MAX_CLIENT_MESSAGES)
     org_id: str = Field(default="default", min_length=1, max_length=128)
     project_id: str = Field(default="default", min_length=1, max_length=128)
+    #: Which configured provider and model answer; omitted means the first
+    #: enabled provider by name and its default model.
+    provider_id: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=128)
+
+
+class ProviderCreateBody(_Body):
+    name: str = Field(min_length=1, max_length=64)
+    base_url: str = Field(min_length=1, max_length=512)
+    #: Write-only; never returned.
+    api_key: str | None = Field(default=None, max_length=4096)
+    models: list[str] = Field(min_length=1, max_length=32)
+    default_model: str | None = Field(default=None, max_length=128)
+    max_steps: int = Field(default=6, ge=1, le=20)
+    enabled: bool = True
+
+
+class ProviderUpdateBody(_Body):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    base_url: str | None = Field(default=None, min_length=1, max_length=512)
+    api_key: str | None = Field(default=None, max_length=4096)
+    clear_api_key: bool = False
+    models: list[str] | None = Field(default=None, min_length=1, max_length=32)
+    default_model: str | None = Field(default=None, max_length=128)
+    max_steps: int | None = Field(default=None, ge=1, le=20)
+    enabled: bool | None = None
+
+
+def provider_document(provider: AssistantProviderRecord, *, admin: bool) -> dict[str, tp.Any]:
+    """Public view of a provider: never the key or its ciphertext."""
+
+    document: dict[str, tp.Any] = {
+        "id": provider.id,
+        "name": provider.name,
+        "models": list(provider.models),
+        "default_model": provider.default_model,
+    }
+    if admin:
+        document.update(
+            base_url=provider.base_url,
+            max_steps=provider.max_steps,
+            enabled=provider.enabled,
+            has_api_key=provider.api_key_ciphertext is not None,
+            created_by=provider.created_by,
+            created_at=provider.created_at.isoformat(),
+            updated_at=provider.updated_at.isoformat(),
+        )
+    return document
 
 
 class SizeBody(_Body):
@@ -526,40 +585,99 @@ def register_assistant_routes(
     *,
     settings: EyvanSettings,
     service: ControlPlaneService,
-    assistant: AssistantConfig | None,
 ) -> None:
-    """Register assistant, sizing and team-request routes.
+    """Register assistant, provider, sizing and team-request routes.
 
-    ``assistant`` comes from the operator's platform configuration file; when
-    it is ``None`` the chat route answers 404 and status reports disabled.
+    Providers live in the plane's own store and are managed by fleet admins
+    over this API (the dashboard's Assistant page). With none enabled, chat
+    answers 404 and status reports disabled.
     """
-
-    def provider(request: Request) -> AssistantProvider:
-        if assistant is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="the assistant is not configured")
-        # A test/embedding seam, not configuration: a fake provider transport.
-        return AssistantProvider(assistant, transport=getattr(request.app.state, "assistant_transport", None))
 
     @app.get("/api/v1/assistant/status", tags=["assistant"])
     async def assistant_status(principal: _Principal) -> dict[str, tp.Any]:
-        """Whether this plane runs the assistant, and with which model (never the key)."""
+        """Whether any provider is available to the caller, and its default model (never a key)."""
 
-        del principal
-        return {"enabled": assistant is not None, "model": assistant.model if assistant is not None else None}
+        providers = [item for item in await service.list_assistant_providers(principal) if item.enabled]
+        first = providers[0] if providers else None
+        return {
+            "enabled": first is not None,
+            "model": first.default_model if first is not None else None,
+            "providers": len(providers),
+        }
+
+    @app.get("/api/v1/assistant/providers", tags=["assistant"])
+    async def list_assistant_providers(principal: _Principal) -> dict[str, tp.Any]:
+        """Configured providers: every field but the key for fleet admins, names and models for others."""
+
+        admin = service.can_manage_assistant_providers(principal)
+        providers = await service.list_assistant_providers(principal)
+        return {"providers": [provider_document(item, admin=admin) for item in providers], "can_manage": admin}
+
+    @app.post("/api/v1/assistant/providers", status_code=201, tags=["assistant"])
+    async def create_assistant_provider(body: ProviderCreateBody, principal: _Principal) -> dict[str, tp.Any]:
+        """Add a provider (fleet admins). The key is sealed and never returned."""
+
+        created = await service.create_assistant_provider(
+            principal,
+            name=body.name,
+            base_url=body.base_url,
+            models=body.models,
+            api_key=body.api_key,
+            default_model=body.default_model,
+            max_steps=body.max_steps,
+            enabled=body.enabled,
+        )
+        return provider_document(created, admin=True)
+
+    @app.put("/api/v1/assistant/providers/{provider_id}", tags=["assistant"])
+    async def update_assistant_provider(
+        provider_id: str, body: ProviderUpdateBody, principal: _Principal
+    ) -> dict[str, tp.Any]:
+        """Change a provider (fleet admins); an omitted ``api_key`` keeps the stored one."""
+
+        updated = await service.update_assistant_provider(
+            principal,
+            provider_id,
+            name=body.name,
+            base_url=body.base_url,
+            models=body.models,
+            default_model=body.default_model,
+            max_steps=body.max_steps,
+            enabled=body.enabled,
+            api_key=body.api_key,
+            clear_api_key=body.clear_api_key,
+        )
+        return provider_document(updated, admin=True)
+
+    @app.delete("/api/v1/assistant/providers/{provider_id}", tags=["assistant"])
+    async def delete_assistant_provider(provider_id: str, principal: _Principal) -> dict[str, tp.Any]:
+        """Remove a provider (fleet admins)."""
+
+        await service.delete_assistant_provider(principal, provider_id)
+        return {"deleted": provider_id}
 
     @app.post("/api/v1/assistant/chat", tags=["assistant"])
     async def assistant_chat(body: ChatBody, request: Request, principal: _Principal) -> dict[str, tp.Any]:
-        """Run one assistant turn as the caller; drafts are returned, never submitted."""
+        """Run one assistant turn as the caller with the chosen provider; drafts are never submitted."""
 
-        chosen = provider(request)
+        record, model, key = await service.resolve_assistant_provider(
+            principal, provider_id=body.provider_id, model=body.model
+        )
+        chosen = AssistantProvider(
+            base_url=record.base_url,
+            model=model,
+            api_key=key,
+            # A test/embedding seam, not configuration: a fake provider transport.
+            transport=getattr(request.app.state, "assistant_transport", None),
+        )
         tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
         tools.team_mode = settings.team_mode
         history = [message.model_dump() for message in body.messages]
         try:
-            assert assistant is not None  # provider() already refused an unconfigured plane
-            return await run_chat(chosen, tools, history, max_steps=assistant.max_steps)
+            turn = await run_chat(chosen, tools, history, max_steps=record.max_steps)
         except AssistantProviderError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from None
+        return {**turn, "provider_id": record.id, "model": model}
 
     @app.post("/api/v1/assistant/size", tags=["assistant"])
     async def assistant_size(body: SizeBody, principal: _Principal) -> dict[str, tp.Any]:

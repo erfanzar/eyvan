@@ -58,6 +58,8 @@ def _submit_draft(session: CliSession, draft: dict[str, tp.Any]) -> tp.Any:
 @click.argument("question", nargs=-1, required=True)
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
+@click.option("--provider", "provider", help="Provider name or id (see `eyvan assistant providers list`).")
+@click.option("--model", "model", help="One of the chosen provider's models (default: its default model).")
 @click.option("--yes", is_flag=True, help="Submit drafted workloads without asking.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw assistant turn as JSON.")
 @click.pass_obj
@@ -66,6 +68,8 @@ def ask(
     question: tuple[str, ...],
     org_id: str | None,
     project_id: str | None,
+    provider: str | None,
+    model: str | None,
     yes: bool,
     as_json: bool,
 ) -> None:
@@ -75,16 +79,15 @@ def ask(
     status = session.client.request("GET", "/api/v1/assistant/status")
     if not (isinstance(status, dict) and status.get("enabled")):
         raise click.ClickException(
-            "this plane has no assistant configured; its operator adds an `assistant:` section "
-            "(url, model, api_key_file) to the server's platform file (/etc/eyvan/platform.yaml)"
+            "this plane has no assistant provider configured; a fleet admin adds one in the dashboard "
+            "(Assistant page) or with `eyvan assistant providers add`"
         )
-    payload = _object(
-        session.client.request(
-            "POST",
-            "/api/v1/assistant/chat",
-            json={"messages": [{"role": "user", "content": text}], **_scope(session, org_id, project_id)},
-        )
-    )
+    body: dict[str, tp.Any] = {"messages": [{"role": "user", "content": text}], **_scope(session, org_id, project_id)}
+    if provider is not None:
+        body["provider_id"] = _provider_id(session, provider)
+    if model is not None:
+        body["model"] = model
+    payload = _object(session.client.request("POST", "/api/v1/assistant/chat", json=body))
     if as_json:
         JsonRenderer().emit(payload)
         return
@@ -208,10 +211,171 @@ for _resolution in ("approved", "declined", "withdrawn"):
     requests_group.add_command(_resolver(_resolution))
 
 
-def register_assistant_commands(group: click.Group) -> None:
-    """Attach ask/size/requests to the CLI root."""
+def _providers(session: CliSession) -> dict[str, tp.Any]:
+    return _object(session.client.request("GET", "/api/v1/assistant/providers"))
 
-    for command in (ask, size, requests_group):
+
+def _provider_id(session: CliSession, name_or_id: str) -> str:
+    """Resolve a provider name (case-insensitive) or id to its id."""
+
+    rows = _objects(_providers(session).get("providers"))
+    for row in rows:
+        if row.get("id") == name_or_id or str(row.get("name", "")).lower() == name_or_id.lower():
+            return str(row["id"])
+    names = ", ".join(str(row.get("name")) for row in rows) or "none"
+    raise click.ClickException(f"no assistant provider named {name_or_id!r}; available: {names}")
+
+
+def _models(value: str) -> list[str]:
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def _read_key(key_stdin: bool) -> str | None:
+    """Read a provider key without putting it on the command line."""
+
+    if key_stdin:
+        return sys.stdin.read().strip() or None
+    if sys.stdin.isatty():
+        entered = click.prompt("API key (empty for none)", hide_input=True, default="", show_default=False)
+        return str(entered).strip() or None
+    return None
+
+
+@click.group("assistant")
+def assistant_group() -> None:
+    """The fleet assistant's LLM providers."""
+
+
+@assistant_group.group("providers")
+def providers_group() -> None:
+    """LLM providers fleet admins configure; everyone picks one in chat."""
+
+
+@providers_group.command("list")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def providers_list(session: CliSession, as_json: bool) -> None:
+    """List providers (fleet admins also see URLs, state and whether a key is set)."""
+
+    payload = _providers(session)
+    if as_json:
+        JsonRenderer().emit(payload)
+        return
+    rows = _objects(payload.get("providers"))
+    lines = []
+    for row in rows:
+        extra = ""
+        if "base_url" in row:
+            key = "key set" if row.get("has_api_key") else "no key"
+            extra = f"  {row['base_url']}  {'enabled' if row.get('enabled') else 'disabled'}  {key}"
+        models = ", ".join(str(item) for item in row.get("models") or [])
+        lines.append(f"{row['id']}  {row['name']:<20} models: {models} (default {row.get('default_model')}){extra}")
+    click.echo("\n".join(lines) or "no assistant providers configured")
+
+
+@providers_group.command("add")
+@click.argument("name")
+@click.option("--url", "base_url", required=True, help="OpenAI-compatible base URL, e.g. https://api.example.com/v1")
+@click.option("--models", required=True, help="Comma-separated model names.")
+@click.option("--default-model")
+@click.option("--max-steps", type=click.IntRange(1, 20), default=6, show_default=True)
+@click.option("--key-stdin", is_flag=True, help="Read the API key from stdin instead of a hidden prompt.")
+@click.option("--disabled", is_flag=True, help="Add it switched off.")
+@click.pass_obj
+def providers_add(
+    session: CliSession,
+    name: str,
+    base_url: str,
+    models: str,
+    default_model: str | None,
+    max_steps: int,
+    key_stdin: bool,
+    disabled: bool,
+) -> None:
+    """Add a provider (fleet admins). The key is never shown again."""
+
+    body: dict[str, tp.Any] = {
+        "name": name,
+        "base_url": base_url,
+        "models": _models(models),
+        "max_steps": max_steps,
+        "enabled": not disabled,
+    }
+    if default_model:
+        body["default_model"] = default_model
+    key = _read_key(key_stdin)
+    if key:
+        body["api_key"] = key
+    created = _object(session.client.request("POST", "/api/v1/assistant/providers", json=body))
+    click.echo(f"added {created['id']} ({created['name']}); key {'set' if created.get('has_api_key') else 'not set'}")
+
+
+@providers_group.command("update")
+@click.argument("provider")
+@click.option("--name")
+@click.option("--url", "base_url")
+@click.option("--models", help="Comma-separated model names; replaces the list.")
+@click.option("--default-model")
+@click.option("--max-steps", type=click.IntRange(1, 20))
+@click.option("--enable/--disable", "enabled", default=None)
+@click.option("--set-key", is_flag=True, help="Enter a new API key (hidden prompt, or stdin with --key-stdin).")
+@click.option("--key-stdin", is_flag=True)
+@click.option("--clear-key", is_flag=True, help="Remove the stored key.")
+@click.pass_obj
+def providers_update(
+    session: CliSession,
+    provider: str,
+    name: str | None,
+    base_url: str | None,
+    models: str | None,
+    default_model: str | None,
+    max_steps: int | None,
+    enabled: bool | None,
+    set_key: bool,
+    key_stdin: bool,
+    clear_key: bool,
+) -> None:
+    """Change a provider (fleet admins); the stored key is kept unless you set or clear it."""
+
+    body: dict[str, tp.Any] = {}
+    for field_name, value in (
+        ("name", name),
+        ("base_url", base_url),
+        ("default_model", default_model),
+        ("max_steps", max_steps),
+        ("enabled", enabled),
+    ):
+        if value is not None:
+            body[field_name] = value
+    if models is not None:
+        body["models"] = _models(models)
+    if clear_key:
+        body["clear_api_key"] = True
+    elif set_key or key_stdin:
+        key = _read_key(key_stdin)
+        if not key:
+            raise click.UsageError("no key was entered")
+        body["api_key"] = key
+    provider_id = _provider_id(session, provider)
+    updated = _object(session.client.request("PUT", f"/api/v1/assistant/providers/{provider_id}", json=body))
+    click.echo(f"updated {updated['id']} ({updated['name']})")
+
+
+@providers_group.command("remove")
+@click.argument("provider")
+@click.pass_obj
+def providers_remove(session: CliSession, provider: str) -> None:
+    """Remove a provider (fleet admins)."""
+
+    provider_id = _provider_id(session, provider)
+    session.client.request("DELETE", f"/api/v1/assistant/providers/{provider_id}")
+    click.echo(f"removed {provider_id}")
+
+
+def register_assistant_commands(group: click.Group) -> None:
+    """Attach ask/size/requests/assistant to the CLI root."""
+
+    for command in (ask, size, requests_group, assistant_group):
         group.add_command(command)
 
 
