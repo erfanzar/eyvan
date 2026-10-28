@@ -17,6 +17,7 @@ import socket
 import ssl
 import sys
 import typing as tp
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -472,6 +473,103 @@ def users_revoke_invite(session: CliSession, invite_id: str) -> None:
 
     session.client.request("DELETE", f"/api/v1/team/invites/{invite_id}")
     click.echo(f"revoked {invite_id}")
+
+
+@users.command("rules")
+@click.argument("subject")
+@click.option("--fleet", "fleets", multiple=True, help="Allowed fleet; repeat for several. Omit for no fleet rule.")
+@click.option("--approval-threshold", type=click.IntRange(min=0), help="Hold jobs above this many TPU units.")
+@click.option("--guarantee", type=click.IntRange(min=0), help="Guaranteed TPU units; usage above it is borrowed.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def users_rules(
+    session: CliSession,
+    subject: str,
+    fleets: tuple[str, ...],
+    approval_threshold: int | None,
+    guarantee: int | None,
+    as_json: bool,
+) -> None:
+    """Replace one account's governance rules (fleet admins); options left out are cleared."""
+
+    payload = _object(
+        session.client.request(
+            "PUT",
+            f"/api/v1/team/users/{subject}/rules",
+            json={
+                "allowed_fleets": list(fleets) if fleets else None,
+                "approval_tpu_threshold": approval_threshold,
+                "guaranteed_tpu_units": guarantee,
+            },
+        )
+    )
+    rules = _object(payload.get("rules", {}))
+    threshold = rules.get("approval_tpu_threshold")
+    guaranteed = rules.get("guaranteed_tpu_units")
+    text = (
+        f"{subject}: fleets {', '.join(rules.get('allowed_fleets') or []) or 'any'}; "
+        f"approval above {threshold if threshold is not None else 'never'}; "
+        f"guarantee {guaranteed if guaranteed is not None else 'none'}"
+    )
+    _emit(as_json, payload, text)
+
+
+@users.command("reclaim-plan")
+@click.argument("tpu_units", type=click.IntRange(min=1))
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def users_reclaim_plan(session: CliSession, tpu_units: int, as_json: bool) -> None:
+    """Show what reclaiming TPU_UNITS of borrowed capacity for you would take (read-only)."""
+
+    payload = _object(session.client.request("GET", "/api/v1/team/reclaim/plan", params={"tpu_units": tpu_units}))
+    if payload.get("allowed"):
+        victims = ", ".join(str(item) for item in payload.get("victims") or []) or "(hidden; ask a fleet admin)"
+        text = f"allowed: frees {payload.get('freed_tpu_units')} TPU units from {victims}"
+    else:
+        text = f"not allowed: {payload.get('reason')}"
+    _emit(as_json, payload, text)
+
+
+@users.command("reclaim")
+@click.argument("tpu_units", type=click.IntRange(min=1))
+@click.option("--reason", default="", help="Why you need it; recorded in the audit trail.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def users_reclaim(session: CliSession, tpu_units: int, reason: str, as_json: bool) -> None:
+    """Take back TPU_UNITS of borrowed capacity for you; each job is checkpointed, then requeued."""
+
+    payload = _object(
+        session.client.request(
+            "POST",
+            "/api/v1/team/reclaim",
+            json={"tpu_units": tpu_units, "reason": reason},
+            headers={"Idempotency-Key": f"reclaim-{uuid.uuid4().hex}"},
+        )
+    )
+    _emit(
+        as_json,
+        payload,
+        f"reclaiming {payload.get('freed_tpu_units')} TPU units from {payload.get('reclaimed')} job(s); "
+        "each is checkpointed, stopped and requeued",
+    )
+
+
+@users.command("reclaim-workload")
+@click.argument("workload_id")
+@click.option("--reason", required=True, help="Why; recorded in the audit trail and the job's status.")
+@click.pass_obj
+def users_reclaim_workload(session: CliSession, workload_id: str, reason: str) -> None:
+    """Checkpoint, stop and requeue one running workload (fleet admins)."""
+
+    payload = _object(
+        session.client.request(
+            "POST",
+            f"/api/v1/team/workloads/{workload_id}/reclaim",
+            json={"reason": reason},
+            headers={"Idempotency-Key": f"reclaim-{uuid.uuid4().hex}"},
+        )
+    )
+    click.echo(f"{payload.get('id')} {payload.get('state')}; it requeues once its checkpoint and stop finish")
 
 
 # ------------------------------------------------------------------ tokens

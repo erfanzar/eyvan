@@ -106,6 +106,16 @@ class WorkloadStorageMixin:
                     f"parent workload {parent_workload_id!r} is at generation {parent.generation}, not the "
                     f"{expected_parent_generation} the capability was issued for; resubmit against the current attempt"
                 )
+        # Team governance (off unless team mode): may refuse, or hold the job
+        # for a fleet admin's approval behind the existing ``schedulable`` gate.
+        verdict = await self._governance_admission(  # type: ignore[attr-defined]
+            tx,
+            spec=spec,
+            subject=created_by or principal.subject,
+            operation=operation,
+            top_level=parent_workload_id is None and schedulable and coordination_kind is None and not depends_on,
+        )
+        held = verdict is not None and verdict.action == "hold"
         workload_id = _new_id("wl")
         spec = self.result_spec_for_generation(spec, workload_id=workload_id, generation=1)
         workload = WorkloadRecord(
@@ -123,13 +133,16 @@ class WorkloadStorageMixin:
             # escape the quota its owner is subject to simply by fanning out.
             created_by=created_by or principal.subject,
             parent_workload_id=parent_workload_id,
-            schedulable=schedulable,
+            schedulable=schedulable and not held,
             coordination_kind=coordination_kind,
             depends_on=depends_on,
+            **({"scheduling_reason": verdict.reason} if held and verdict is not None else {}),
         )
         await self._put_workload_keeping_references(tx, workload)
         await self._bind_idempotency(tx, scope, operation, key, fingerprint, workload)
         await self._audit(tx, principal, workload, "workload.submitted", new_state=workload.state.value)
+        if held and verdict is not None:
+            await self._hold_for_approval(tx, principal, workload, verdict)  # type: ignore[attr-defined]
         return workload, False
 
     @staticmethod

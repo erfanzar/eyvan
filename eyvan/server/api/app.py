@@ -631,6 +631,8 @@ def create_app(
             # tested, and off everywhere.
             plane_id=settings.plane_id,
             correlation_enabled=settings.correlation_enabled,
+            # Per-user rules, approval holds and reclaim exist only where accounts do.
+            governance_enabled=settings.team_mode,
             # The seam that makes the fan-out ceiling an operator control rather
             # than a constant: without it the setting exists and no submission is
             # ever judged against it.

@@ -240,7 +240,20 @@ export function AssistantPage({ client, canAdminister, teamMode }: AssistantPage
                     <tr key={item.id}>
                       <td>{item.kind}</td>
                       <td className="monospace">{item.subject}</td>
-                      <td>{item.summary}</td>
+                      <td>
+                        {item.summary}
+                        {typeof item.details?.held_workload_id === "string" && (
+                          <div className="panel-note" data-testid={`held-${item.id}`}>
+                            Holds workload <span className="monospace">{item.details.held_workload_id}</span>
+                            {typeof item.details.tpu_units === "number" ? ` (${item.details.tpu_units} TPU units)` : ""}
+                            {item.state === "open"
+                              ? "; approving lets it run, declining cancels it"
+                              : item.state === "approved"
+                                ? "; released to the scheduler"
+                                : "; cancelled"}
+                          </div>
+                        )}
+                      </td>
                       <td>{item.state}</td>
                       <td>
                         {item.state === "open" && canAdminister && (

@@ -16,6 +16,7 @@ from __future__ import annotations
 import secrets
 import typing as tp
 
+from eyvan.domain.governance import HELD_WORKLOAD_KEY
 from eyvan.records import TeamRequestRecord
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
@@ -66,6 +67,10 @@ class TeamRequestsMixin:
     ) -> TeamRequestRecord:
         """File a capacity or approval request as ``principal``."""
 
+        if details and HELD_WORKLOAD_KEY in details:
+            # Only admission links a request to a held workload; a user-set link
+            # would let anyone's approval release a workload governance never held.
+            raise InputError(f"{HELD_WORKLOAD_KEY!r} is set by the plane, not by a request")
         try:
             request = TeamRequestRecord(
                 id=f"req_{secrets.token_hex(8)}",
@@ -128,6 +133,9 @@ class TeamRequestsMixin:
             await tx.append_event(
                 _event(principal.subject, resolved, f"team_request.{resolution}", {"note": resolved.resolution_note})
             )
+            # Same transaction: an approval that releases its held workload, or a
+            # decline/withdrawal that cancels it, commits together with the decision.
+            await self._apply_approval_resolution(tx, principal, resolved, resolution)  # type: ignore[attr-defined]
             return resolved
 
 

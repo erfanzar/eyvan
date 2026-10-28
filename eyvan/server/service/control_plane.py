@@ -22,6 +22,7 @@ from eyvan.server.service._control_plane.events import EventsMixin
 from eyvan.server.service._control_plane.expansion import ExpansionMixin
 from eyvan.server.service._control_plane.federation import FederationMixin
 from eyvan.server.service._control_plane.fleets import FleetsMixin
+from eyvan.server.service._control_plane.governance import GovernanceMixin
 from eyvan.server.service._control_plane.lease_settlement import LeaseSettlementMixin
 from eyvan.server.service._control_plane.leases import LeasesMixin
 from eyvan.server.service._control_plane.policies import PoliciesMixin
@@ -749,6 +750,7 @@ from eyvan.server.service._control_plane.workload_storage import WorkloadStorage
 class ControlPlaneService(
     AccountsMixin,
     TeamRequestsMixin,
+    GovernanceMixin,
     SchedulingMixin,
     SubmissionMixin,
     CallableSubmissionMixin,
@@ -810,7 +812,11 @@ class ControlPlaneService(
         #: and no waves -- so a deployment that configures nothing is unchanged.
         expansion_limits: ExpansionLimits = ExpansionLimits(),
         correlation_enabled: bool = False,
+        #: Team governance (per-user fleet rules, approval holds, reclaim). Off by
+        #: default; the API enables it only on a team-mode plane.
+        governance_enabled: bool = False,
     ):
+        self.governance_enabled = governance_enabled
         self.correlation_enabled = correlation_enabled
         self.repository = repository
         self.authorizer = authorizer or Authorizer()

@@ -28,6 +28,7 @@ modules =
     eyvan.server.service._control_plane.expansion
     eyvan.server.service._control_plane.federation
     eyvan.server.service._control_plane.fleets
+    eyvan.server.service._control_plane.governance
     eyvan.server.service._control_plane.lease_settlement
     eyvan.server.service._control_plane.leases
     eyvan.server.service._control_plane.policies

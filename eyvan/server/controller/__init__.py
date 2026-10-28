@@ -29,6 +29,7 @@ from eyvan.server.controller.loops import _ControllerLoops
 from eyvan.server.controller.observation import _ControllerObservation
 from eyvan.server.controller.outbox import _ControllerOutbox
 from eyvan.server.controller.preemption import _ControllerPreemption
+from eyvan.server.controller.reclaim import _ControllerReclaim
 from eyvan.server.controller.scheduling import _ControllerScheduling
 from eyvan.server.controller.services import HttpServiceHealthProbe, _ControllerServices
 from eyvan.server.controller.settlement import _ControllerSettlement
@@ -45,6 +46,7 @@ class EyvanController(
     _ControllerCapacityCommands,
     _ControllerWorkloadCommands,
     _ControllerPreemption,
+    _ControllerReclaim,
     _ControllerSettlement,
     _ControllerServices,
     _ControllerObservation,

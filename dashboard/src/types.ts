@@ -60,6 +60,14 @@ export interface TeamUser {
   disabled: boolean;
   created_at: string;
   created_by: string;
+  /** Governance rules; a null field means "no rule". Older planes omit the whole object. */
+  rules?: TeamUserRules;
+}
+
+export interface TeamUserRules {
+  allowed_fleets: string[] | null;
+  approval_tpu_threshold: number | null;
+  guaranteed_tpu_units: number | null;
 }
 
 export interface TeamRoleGrant {

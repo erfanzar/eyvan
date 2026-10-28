@@ -1,0 +1,279 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of Eyvan.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Pure team-governance decisions: fleet rules, approval holds and borrow/reclaim.
+
+Nothing here reads storage or talks to a provider. The service layer collects
+the facts (who submitted, which pools a spec names, who is running what) and
+asks these functions for a verdict, so every rule is deterministic, auditable
+and testable without a plane. In particular, *who may take capacity from whom*
+is decided here by arithmetic, never by a person's or a model's judgement.
+"""
+
+from __future__ import annotations
+
+import typing as tp
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+
+from eyvan.records import POOL_ALTERNATES_LABEL, POOL_LABEL, PriorityBand, WorkloadDefinition
+
+#: The request-detail key linking a system-filed approval request to the
+#: workload it holds. Only admission sets it; user-filed requests may not.
+HELD_WORKLOAD_KEY: tp.Final = "held_workload_id"
+
+#: Admission verdicts.
+ADMIT: tp.Final = "admit"
+HOLD: tp.Final = "hold"
+REFUSE: tp.Final = "refuse"
+
+#: Submission operations that create one top-level job a person can approve as
+#: a unit. Anything else (batch tasks, DAG nodes, group members, in-job
+#: children, coordinators) is refused rather than held over the threshold:
+#: those are released by their own machinery, which would bypass a hold.
+HOLDABLE_OPERATIONS = frozenset({"workload.submit", "workload.submit_pool", "workload.submit_pool_callable"})
+
+_BAND_RANK: Mapping[str, int] = {band.value: index for index, band in enumerate(PriorityBand)}
+
+
+def requested_tpu_units(spec: WorkloadDefinition) -> int:
+    """Return the TPU units one workload holds while running.
+
+    The same unit pools declare in ``allocatable.tpu`` and quotas count: per
+    replica, times replicas, times workers when the gang describes one worker,
+    times the number of cells in a multi-cell group.
+    """
+
+    per_cell = spec.gang.per_replica.tpu * spec.gang.replicas
+    if str(getattr(spec.worker_resource_scope, "value", spec.worker_resource_scope)) == "per_worker":
+        per_cell *= spec.worker_count
+    return int(per_cell * spec.cell_group_count)
+
+
+def targeted_pool_ids(spec: WorkloadDefinition) -> tuple[str, ...]:
+    """Return the pool ids a spec is pinned to (primary first), or ``()`` for a generic spec."""
+
+    primary = spec.required_labels.get(POOL_LABEL) or ""
+    alternates = spec.required_labels.get(POOL_ALTERNATES_LABEL) or ""
+    ordered = [primary, *(value.strip() for value in alternates.split(","))]
+    return tuple(dict.fromkeys(value for value in ordered if value))
+
+
+@dataclass(frozen=True, slots=True)
+class UserRules:
+    """The governance rules one account carries; ``None`` means no rule."""
+
+    allowed_fleets: tuple[str, ...] | None = None
+    approval_tpu_threshold: int | None = None
+    guaranteed_tpu_units: int | None = None
+
+    @property
+    def empty(self) -> bool:
+        return self.allowed_fleets is None and self.approval_tpu_threshold is None
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionVerdict:
+    """What admission does with one submission under one person's rules."""
+
+    action: tp.Literal["admit", "hold", "refuse"]
+    reason: str = ""
+    tpu_units: int = 0
+    refusal: tp.Literal["fleet", "approval", ""] = ""
+
+
+def admission_verdict(
+    rules: UserRules,
+    *,
+    tpu_units: int,
+    fleets: Iterable[str],
+    pinned: bool,
+    operation: str,
+    top_level: bool,
+) -> AdmissionVerdict:
+    """Decide admit / hold / refuse for one submission.
+
+    Args:
+        rules: the submitter's rules.
+        tpu_units: what the submission holds while running (``requested_tpu_units``).
+        fleets: fleet names of every pool the spec may land on.
+        pinned: whether the spec names pools at all; a generic spec can land anywhere.
+        operation: the submission operation name.
+        top_level: whether this is a schedulable job with no parent.
+    """
+
+    fleet_names = sorted(set(fleets))
+    if rules.allowed_fleets is not None:
+        allowed = set(rules.allowed_fleets)
+        if not pinned:
+            return AdmissionVerdict(
+                REFUSE,
+                f"your account may only submit to fleet(s) {', '.join(sorted(allowed)) or '(none)'}; name one",
+                tpu_units,
+                "fleet",
+            )
+        outside = [name for name in fleet_names if name not in allowed]
+        if outside or not fleet_names:
+            return AdmissionVerdict(
+                REFUSE,
+                f"your account may not submit to fleet {', '.join(outside or ['(unknown)'])}; "
+                f"allowed: {', '.join(sorted(allowed)) or '(none)'}",
+                tpu_units,
+                "fleet",
+            )
+    threshold = rules.approval_tpu_threshold
+    if threshold is None or tpu_units <= threshold:
+        return AdmissionVerdict(ADMIT, "", tpu_units)
+    reason = f"asks for {tpu_units} TPU units, above your approval threshold of {threshold}"
+    if top_level and operation in HOLDABLE_OPERATIONS:
+        return AdmissionVerdict(HOLD, f"{reason}; waiting for a fleet admin's approval", tpu_units)
+    return AdmissionVerdict(
+        REFUSE,
+        f"this submission {reason}; submit it as a single job to request approval, "
+        "or ask a fleet admin to raise your threshold",
+        tpu_units,
+        "approval",
+    )
+
+
+# ---------------------------------------------------------------- borrow/reclaim
+
+
+@dataclass(frozen=True, slots=True)
+class RunningJob:
+    """One running workload as the reclaim rule sees it."""
+
+    workload_id: str
+    subject: str
+    tpu_units: int
+    priority_band: str
+    started_order: int
+    """Higher means started later; ties broken by ``workload_id``."""
+    reclaimable: bool = True
+    """Counts toward usage either way; only a running job can actually be taken."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimPlan:
+    """Which running jobs a reclaim takes, and why it may or may not."""
+
+    allowed: bool
+    reason: str
+    victims: tuple[str, ...] = ()
+    freed_tpu_units: int = 0
+    requester_usage: int = 0
+    requester_guarantee: int | None = None
+    borrowed_by: Mapping[str, int] | None = None
+
+
+def usage_by_subject(jobs: Iterable[RunningJob]) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for job in jobs:
+        usage[job.subject] = usage.get(job.subject, 0) + job.tpu_units
+    return usage
+
+
+def plan_reclaim(
+    requester: str,
+    needed_tpu_units: int,
+    jobs: Sequence[RunningJob],
+    guarantees: Mapping[str, int],
+) -> ReclaimPlan:
+    """Return the deterministic reclaim plan for ``requester`` asking for ``needed_tpu_units``.
+
+    The rule:
+
+    * A person's *guarantee* is their ``guaranteed_tpu_units``; capacity they
+      use above it is **borrowed**. Someone with no guarantee is guaranteed 0,
+      so everything they run is borrowed.
+    * A requester may reclaim only while their usage plus the request stays
+      within their own guarantee. Reclaiming never lets anyone exceed theirs.
+    * Only borrowed capacity is taken, and never from the requester. A
+      borrower is never pushed below their own guarantee.
+    * Victims come from the most-over-guarantee borrower first; within a
+      borrower, the lowest priority band, then the most recently started job,
+      then the workload id. Same inputs, same plan.
+    * The plan must free at least ``needed_tpu_units``; otherwise it is refused
+      and takes nothing, so a partial reclaim never strands half a request.
+    """
+
+    if needed_tpu_units <= 0:
+        return ReclaimPlan(False, "ask for a positive number of TPU units")
+    usage = usage_by_subject(jobs)
+    own_usage = usage.get(requester, 0)
+    guarantee = guarantees.get(requester)
+    if guarantee is None or guarantee <= 0:
+        return ReclaimPlan(
+            False,
+            "you have no guaranteed TPU units, so there is nothing to reclaim for you",
+            (),
+            0,
+            own_usage,
+            guarantee,
+        )
+    if own_usage + needed_tpu_units > guarantee:
+        return ReclaimPlan(
+            False,
+            f"you use {own_usage} of your {guarantee} guaranteed TPU units; {needed_tpu_units} more would exceed it",
+            (),
+            0,
+            own_usage,
+            guarantee,
+        )
+    borrowed = {
+        subject: used - guarantees.get(subject, 0)
+        for subject, used in usage.items()
+        if subject != requester and used > guarantees.get(subject, 0)
+    }
+    order = sorted(borrowed, key=lambda subject: (-borrowed[subject], subject))
+    remaining = dict(borrowed)
+    victims: list[str] = []
+    freed = 0
+    for subject in order:
+        candidates = sorted(
+            (job for job in jobs if job.subject == subject and job.tpu_units > 0 and job.reclaimable),
+            key=lambda job: (_BAND_RANK.get(job.priority_band, 0), -job.started_order, job.workload_id),
+        )
+        for job in candidates:
+            if freed >= needed_tpu_units:
+                break
+            if job.tpu_units > remaining[subject]:
+                # Taking it would push the borrower below their own guarantee.
+                continue
+            victims.append(job.workload_id)
+            remaining[subject] -= job.tpu_units
+            freed += job.tpu_units
+        if freed >= needed_tpu_units:
+            break
+    if freed < needed_tpu_units:
+        return ReclaimPlan(
+            False,
+            f"only {freed} borrowed TPU units can be reclaimed without pushing anyone below their guarantee; "
+            f"{needed_tpu_units} were asked for",
+            (),
+            0,
+            own_usage,
+            guarantee,
+            borrowed,
+        )
+    return ReclaimPlan(True, "", tuple(victims), freed, own_usage, guarantee, borrowed)
+
+
+__all__ = (
+    "ADMIT",
+    "HELD_WORKLOAD_KEY",
+    "HOLD",
+    "HOLDABLE_OPERATIONS",
+    "REFUSE",
+    "AdmissionVerdict",
+    "ReclaimPlan",
+    "RunningJob",
+    "UserRules",
+    "admission_verdict",
+    "plan_reclaim",
+    "requested_tpu_units",
+    "targeted_pool_ids",
+    "usage_by_subject",
+)

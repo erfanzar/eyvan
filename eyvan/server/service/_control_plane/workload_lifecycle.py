@@ -14,6 +14,7 @@ from eyvan.server.service._control_plane.shared import (
     IdempotencyRecord,
     InputError,
     JsonValue,
+    LeaseState,
     NotFoundError,
     OutboxState,
     Permission,
@@ -176,6 +177,131 @@ class WorkloadLifecycleMixin:
                 },
             )
             await self._bind_idempotency(tx, scope, "workload.checkpoint", key, fingerprint, updated)
+            return updated, False
+
+    async def reclaim_workload(
+        self, principal: Principal, workload_id: str, *, idempotency_key: str, reason: str
+    ) -> tuple[WorkloadRecord, bool]:
+        """Take one running workload's capacity back without ending the workload.
+
+        An administrative preemption: the controller checkpoints the workload
+        (when it is checkpointable, has a hook and runs on one cell), stops its
+        remote process, and requeues it to PENDING at a new generation so it
+        resumes from the checkpoint. Not a cancel -- the workload stays runnable.
+
+        State choice. The workload moves to CHECKPOINTING when a hook will run
+        and to CANCELLING otherwise -- exactly the two states priority
+        preemption uses for its victims, and both are allowed from RUNNING and
+        accepted by ``settle_preempted_workload``. In the same transaction every
+        current lease is marked ``revocation_reason="preemption"`` (ACTIVE leases
+        become REVOKING; QUARANTINED ones keep their state, since the lease state
+        machine has no QUARANTINED -> REVOKING edge). That marker is what keeps
+        an in-flight reclaim from being misread: observation treats SUCCEEDED,
+        FAILED, STOPPED, LOST and NOT_FOUND as preemption-owned and leaves them to
+        the command, so the STOPPED that the reclaim itself causes is never
+        settled as CANCELLED or FAILED; lease recovery and host-fault attribution
+        skip the lease; the priority planner never picks a REVOKING lease as a
+        victim; and a lost cell requeues the workload through the
+        preemption-owned recovery path. ``preemption_id`` stays None, which is
+        how a reclaim differs from Eyvan's own priority preemption. A user cancel
+        still wins: ``_cancel_one`` clears the marker, after which the reclaim
+        command no longer owns the lease and retires as stale.
+
+        Multi-cell groups are stopped without a hook (checkpoint hooks are not
+        supported across independently fenced cells), keeping whatever
+        ``checkpoint_uri`` the workload already recorded.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        key = _validate_idempotency_key(idempotency_key)
+        reason = reason.strip()
+        if not reason:
+            raise InputError("reclaim reason must not be empty")
+        if len(reason) > 500:
+            raise InputError("reclaim reason must be at most 500 characters")
+        async with self.repository.transaction() as tx:
+            await self._lock_settlement(tx, workload_id)
+            workload = await self._require_workload(tx, workload_id)
+            scope = _scope(workload.org_id, workload.project_id)
+            fingerprint = _fingerprint({"workload_id": workload_id, "reason": reason})
+            existing = await self._idempotent_resource(tx, scope, "workload.reclaim", key, fingerprint)
+            if existing is not None:
+                return workload, True
+            if workload.state is not WorkloadState.RUNNING:
+                raise ConflictError(f"only a running workload can be reclaimed; this one is {workload.state.value}")
+            if workload.preemption_id is not None:
+                raise ConflictError("workload is part of a priority preemption; retry after it completes")
+            if workload.remote_id is None:
+                raise ConflictError("running workload has no remote execution to stop")
+            leases = await self._current_leases(tx, workload)
+            if not leases:
+                raise ConflictError("running workload holds no lease")
+            for lease in leases:
+                if (
+                    lease.state not in {LeaseState.ACTIVE, LeaseState.QUARANTINED}
+                    or lease.revocation_reason is not None
+                    or lease.generation != workload.generation
+                ):
+                    raise ConflictError(f"lease {lease.id!r} is already being revoked")
+            spec = workload.spec
+            checkpoint = bool(spec.checkpointable and spec.checkpoint_hook and spec.cell_group_count == 1)
+            target = WorkloadState.CHECKPOINTING if checkpoint else WorkloadState.CANCELLING
+            ensure_workload_transition(workload.state, target)
+            now = utcnow()
+            updated = workload.model_copy(
+                update={
+                    "state": target,
+                    "scheduling_reason": f"reclaim requested by {principal.subject}: {reason}",
+                    "updated_at": now,
+                }
+            )
+            await tx.put_workload(updated)
+            for lease in leases:
+                await tx.put_lease(
+                    lease.model_copy(
+                        update={
+                            "state": LeaseState.REVOKING if lease.state is LeaseState.ACTIVE else lease.state,
+                            "revocation_reason": "preemption",
+                            "updated_at": now,
+                        }
+                    )
+                )
+            lease_ids: list[JsonValue] = [lease.id for lease in leases]
+            # What an aborted checkpoint phase restores each lease to.
+            lease_states: dict[str, JsonValue] = {lease.id: lease.state.value for lease in leases}
+            command = await self._outbox(
+                tx,
+                topic="workload.reclaim",
+                aggregate_type="workload",
+                aggregate_id=updated.id,
+                idempotency_key=(
+                    f"reclaim:{updated.id}:{updated.generation}:{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+                ),
+                generation=updated.generation,
+                payload={
+                    "workload_id": updated.id,
+                    "lease_id": updated.lease_id,
+                    "lease_ids": lease_ids,
+                    "lease_states": lease_states,
+                    "remote_id": updated.remote_id,
+                    "checkpoint": checkpoint,
+                    "hook": spec.checkpoint_hook if checkpoint else None,
+                    "output_uri": spec.checkpoint_output_uri if checkpoint else None,
+                    "grace_period_seconds": spec.checkpoint_grace_seconds,
+                    "reason": reason,
+                    "actor": principal.subject,
+                },
+            )
+            await self._audit(
+                tx,
+                principal,
+                updated,
+                "workload.reclaim_requested",
+                previous_state=workload.state.value,
+                new_state=updated.state.value,
+                payload={"reason": reason, "checkpoint": checkpoint, "lease_ids": lease_ids, "command_id": command.id},
+            )
+            await self._bind_idempotency(tx, scope, "workload.reclaim", key, fingerprint, updated)
             return updated, False
 
     @staticmethod

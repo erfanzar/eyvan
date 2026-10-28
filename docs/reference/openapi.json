@@ -5837,6 +5837,28 @@
         "title": "ReadOnlyQueryResponse",
         "type": "object"
       },
+      "ReclaimBody": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "default": "",
+            "maxLength": 400,
+            "title": "Reason",
+            "type": "string"
+          },
+          "tpu_units": {
+            "maximum": 1000000.0,
+            "minimum": 1.0,
+            "title": "Tpu Units",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tpu_units"
+        ],
+        "title": "ReclaimBody",
+        "type": "object"
+      },
       "RegionCarbon": {
         "additionalProperties": false,
         "description": "What is known about one region's grid intensity, including nothing.\n\n``intensity`` is null and ``reason`` is populated whenever there is no\nusable reading, which today is always: no provider ships. Reported rather\nthan omitted, because an operator asking about carbon deserves the answer\n\"nothing is configured\" instead of an empty list they have to interpret.",
@@ -6261,6 +6283,55 @@
           "granted_by"
         ],
         "title": "RoleGrantRecord",
+        "type": "object"
+      },
+      "RulesBody": {
+        "additionalProperties": false,
+        "description": "A complete replacement of one account's governance rules; ``null`` clears a rule.",
+        "properties": {
+          "allowed_fleets": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Fleets"
+          },
+          "approval_tpu_threshold": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Tpu Threshold"
+          },
+          "guaranteed_tpu_units": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guaranteed Tpu Units"
+          }
+        },
+        "title": "RulesBody",
         "type": "object"
       },
       "ScopeQuota": {
@@ -8649,6 +8720,22 @@
         ],
         "title": "WorkloadProgressPhase",
         "type": "string"
+      },
+      "WorkloadReclaimBody": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "WorkloadReclaimBody",
+        "type": "object"
       },
       "WorkloadRecord": {
         "additionalProperties": false,
@@ -14215,6 +14302,110 @@
         ]
       }
     },
+    "/api/v1/team/reclaim": {
+      "post": {
+        "description": "Take back borrowed capacity for the caller; the rule picks victims, each is checkpointed first.",
+        "operationId": "reclaim_team_borrowed_api_v1_team_reclaim_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 160,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReclaimBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reclaim Team Borrowed Api V1 Team Reclaim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reclaim Team Borrowed",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/reclaim/plan": {
+      "get": {
+        "description": "What reclaiming ``tpu_units`` for the caller would take, by the deterministic borrow rule.",
+        "operationId": "plan_team_reclaim_api_v1_team_reclaim_plan_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tpu_units",
+            "required": true,
+            "schema": {
+              "maximum": 1000000,
+              "minimum": 1,
+              "title": "Tpu Units",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Plan Team Reclaim Api V1 Team Reclaim Plan Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Plan Team Reclaim",
+        "tags": [
+          "team"
+        ]
+      }
+    },
     "/api/v1/team/requests": {
       "get": {
         "operationId": "list_team_requests_api_v1_team_requests_get",
@@ -14600,6 +14791,127 @@
           }
         },
         "summary": "Enable Team User",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/users/{subject}/rules": {
+      "put": {
+        "description": "Replace one account's fleet allow-list, approval threshold and TPU guarantee (fleet admins).",
+        "operationId": "set_team_user_rules_api_v1_team_users__subject__rules_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "title": "Subject",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RulesBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Team User Rules Api V1 Team Users  Subject  Rules Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Team User Rules",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/workloads/{workload_id}/reclaim": {
+      "post": {
+        "description": "Checkpoint, stop and requeue one running workload (fleet admins).",
+        "operationId": "reclaim_team_workload_api_v1_team_workloads__workload_id__reclaim_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workload_id",
+            "required": true,
+            "schema": {
+              "title": "Workload Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkloadReclaimBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reclaim Team Workload Api V1 Team Workloads  Workload Id  Reclaim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reclaim Team Workload",
         "tags": [
           "team"
         ]

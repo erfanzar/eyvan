@@ -60,6 +60,7 @@ import type {
   TeamToken,
   TeamTokenCreated,
   TeamUser,
+  TeamUserRules,
   AvailableShape,
   BillingReport,
   CapacityPoolSummary,
@@ -748,6 +749,14 @@ export class EyvanApiClient {
       disabled ? `/api/v1/team/users/${name}/disable` : `/api/v1/team/users/${name}/enable`,
       { method: "POST" },
     );
+  }
+
+  /** Replace one account's governance rules (fleet admins); a null field clears that rule. */
+  async setTeamUserRules(subject: string, rules: TeamUserRules): Promise<TeamUser> {
+    return this.attachmentRequest<TeamUser>(`/api/v1/team/users/${encodeURIComponent(subject)}/rules`, {
+      method: "PUT",
+      body: JSON.stringify(rules),
+    });
   }
 
   async listTeamInvites(signal?: AbortSignal): Promise<TeamInvite[]> {

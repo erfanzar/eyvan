@@ -223,6 +223,13 @@ EXEMPT_ROUTES: dict[str, str] = {
     # Assistant: every tool call runs as the caller (test_assistant proves a non-admin's
     # fleet read is refused through it); sizing and status read no tenant data.
     "GET /api/v1/assistant/status": "reports only whether the assistant is configured and its model name",
+    "GET /api/v1/team/reclaim/plan": (
+        "the caller's own verdict and counts; victim ids and per-user borrowing only for a fleet admin (test_governance)"
+    ),
+    "POST /api/v1/team/reclaim": (
+        "the deterministic borrow rule picks victims for the caller's own guarantee, never the caller; "
+        "victim ids only for a fleet admin (test_governance)"
+    ),
     "POST /api/v1/assistant/chat": "tools call the service with the caller's own principal (test_assistant)",
     "POST /api/v1/assistant/size": "pure memory arithmetic over the request body; no stored data",
     "POST /api/v1/team/requests": "files a request as the caller only",
@@ -239,6 +246,8 @@ FLEET_ONLY_ROUTES.update(
         "GET /api/v1/team/users": "the plane-wide account directory",
         "POST /api/v1/team/users/{subject}/disable": "disable an account and revoke its tokens",
         "POST /api/v1/team/users/{subject}/enable": "re-enable an account",
+        "PUT /api/v1/team/users/{subject}/rules": "set any account's fleet rules, approval threshold and guarantee",
+        "POST /api/v1/team/workloads/{workload_id}/reclaim": "checkpoint, stop and requeue any tenant's workload",
     }
 )
 

@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import typing as tp
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan.config import EyvanSettings
 from eyvan.identity.team_secrets import TEAM_SESSION_COOKIE, SignInThrottle
-from eyvan.records import ApiTokenRecord, InviteRecord, Principal, Role, RoleGrant, UserRecord
+from eyvan.records import ApiTokenRecord, InviteRecord, Permission, Principal, Role, RoleGrant, UserRecord
 from eyvan.server.api.auth import authenticated_principal
 
 if tp.TYPE_CHECKING:
@@ -79,6 +79,23 @@ class TokenBody(_Body):
     expires_in_days: int | None = Field(default=None, ge=1, le=3650)
 
 
+class RulesBody(_Body):
+    """A complete replacement of one account's governance rules; ``null`` clears a rule."""
+
+    allowed_fleets: list[str] | None = Field(default=None, max_length=64)
+    approval_tpu_threshold: int | None = Field(default=None, ge=0, le=1_000_000)
+    guaranteed_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class ReclaimBody(_Body):
+    tpu_units: int = Field(ge=1, le=1_000_000)
+    reason: str = Field(default="", max_length=400)
+
+
+class WorkloadReclaimBody(_Body):
+    reason: str = Field(min_length=1, max_length=500)
+
+
 def user_document(user: UserRecord) -> dict[str, tp.Any]:
     """Public view of an account; never the password hash."""
 
@@ -89,6 +106,11 @@ def user_document(user: UserRecord) -> dict[str, tp.Any]:
         "disabled": user.disabled,
         "created_at": user.created_at.isoformat(),
         "created_by": user.created_by,
+        "rules": {
+            "allowed_fleets": None if user.allowed_fleets is None else list(user.allowed_fleets),
+            "approval_tpu_threshold": user.approval_tpu_threshold,
+            "guaranteed_tpu_units": user.guaranteed_tpu_units,
+        },
     }
 
 
@@ -276,6 +298,77 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
     @app.post("/api/v1/team/users/{subject}/enable", tags=["team"])
     async def enable_team_user(subject: str, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
         return user_document(await service.set_user_disabled(principal, subject, disabled=False))
+
+    @app.put("/api/v1/team/users/{subject}/rules", tags=["team"])
+    async def set_team_user_rules(subject: str, body: RulesBody, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
+        """Replace one account's fleet allow-list, approval threshold and TPU guarantee (fleet admins)."""
+
+        return user_document(
+            await service.set_user_rules(
+                principal,
+                subject,
+                allowed_fleets=body.allowed_fleets,
+                approval_tpu_threshold=body.approval_tpu_threshold,
+                guaranteed_tpu_units=body.guaranteed_tpu_units,
+            )
+        )
+
+    @app.get("/api/v1/team/reclaim/plan", tags=["team"])
+    async def plan_team_reclaim(
+        principal: _Principal, _on: _On, tpu_units: tp.Annotated[int, Query(ge=1, le=1_000_000)]
+    ) -> dict[str, tp.Any]:
+        """What reclaiming ``tpu_units`` for the caller would take, by the deterministic borrow rule."""
+
+        plan = await service.plan_reclaim_for(principal, tpu_units=tpu_units)
+        document: dict[str, tp.Any] = {
+            "allowed": plan.allowed,
+            "reason": plan.reason,
+            "freed_tpu_units": plan.freed_tpu_units,
+            "requester_usage": plan.requester_usage,
+            "requester_guarantee": plan.requester_guarantee,
+        }
+        # Which jobs would be taken, and who borrows how much, names other
+        # people's work: only a fleet admin sees it. Everyone else gets the verdict.
+        if service.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            document["victims"] = list(plan.victims)
+            document["borrowed_by"] = dict(plan.borrowed_by or {})
+        return document
+
+    @app.post("/api/v1/team/reclaim", tags=["team"])
+    async def reclaim_team_borrowed(
+        body: ReclaimBody,
+        principal: _Principal,
+        _on: _On,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=160)],
+    ) -> dict[str, tp.Any]:
+        """Take back borrowed capacity for the caller; the rule picks victims, each is checkpointed first."""
+
+        plan, issued = await service.reclaim_borrowed(
+            principal, tpu_units=body.tpu_units, reason=body.reason, idempotency_key=idempotency_key
+        )
+        document: dict[str, tp.Any] = {
+            "allowed": plan.allowed,
+            "freed_tpu_units": plan.freed_tpu_units,
+            "reclaimed": len(issued),
+        }
+        if service.authorizer.allows(principal, Permission.MANAGE_FLEET):
+            document["victims"] = issued
+        return document
+
+    @app.post("/api/v1/team/workloads/{workload_id}/reclaim", tags=["team"])
+    async def reclaim_team_workload(
+        workload_id: str,
+        body: WorkloadReclaimBody,
+        principal: _Principal,
+        _on: _On,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+    ) -> dict[str, tp.Any]:
+        """Checkpoint, stop and requeue one running workload (fleet admins)."""
+
+        workload, replayed = await service.reclaim_workload(
+            principal, workload_id, idempotency_key=idempotency_key, reason=body.reason
+        )
+        return {"id": workload.id, "state": workload.state.value, "replayed": replayed}
 
 
 __all__ = ("TEAM_SESSION_COOKIE", "register_team_routes")

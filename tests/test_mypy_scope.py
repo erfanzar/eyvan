@@ -19,5 +19,12 @@ def test_mypy_import_reporting_is_explicit_without_skipping_type_analysis():
         "eyvan/server/api/dashboard_sessions.py",
         "eyvan/server/api/server_bind.py",
         "eyvan/server/api/server_startup.py",
+        "eyvan/sdk/commands/team.py",
+        "eyvan/sdk/commands/assistant.py",
+        "eyvan/server/api/assistant.py",
+        "eyvan/server/api/team_routes.py",
+        "eyvan/server/api/bootstrap_admin.py",
+        "eyvan/server/service/_control_plane/accounts.py",
+        "eyvan/server/service/_control_plane/team_requests.py",
     ]
     assert not config.get("ignore_errors", False)

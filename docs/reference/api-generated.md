@@ -112,6 +112,8 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/team/login` | Team Login | 200, 422 |
 | POST | `/api/v1/team/logout` | Team Logout | 200 |
 | GET | `/api/v1/team/me` | Team Me | 200 |
+| POST | `/api/v1/team/reclaim` | Reclaim Team Borrowed | 200, 422 |
+| GET | `/api/v1/team/reclaim/plan` | Plan Team Reclaim | 200, 422 |
 | GET | `/api/v1/team/requests` | List Team Requests | 200, 422 |
 | POST | `/api/v1/team/requests` | File Team Request | 201, 422 |
 | POST | `/api/v1/team/requests/{request_id}/resolve` | Resolve Team Request | 200, 422 |
@@ -122,6 +124,8 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/team/users` | List Team Users | 200 |
 | POST | `/api/v1/team/users/{subject}/disable` | Disable Team User | 200, 422 |
 | POST | `/api/v1/team/users/{subject}/enable` | Enable Team User | 200, 422 |
+| PUT | `/api/v1/team/users/{subject}/rules` | Set Team User Rules | 200, 422 |
+| POST | `/api/v1/team/workloads/{workload_id}/reclaim` | Reclaim Team Workload | 200, 422 |
 | GET | `/api/v1/tracking/health` | Tracking Health | 200 |
 | GET | `/api/v1/tracking/runs` | Tracking Runs | 200, 422 |
 | GET | `/api/v1/tracking/runs/{run_id}` | Tracking Run | 200, 422 |

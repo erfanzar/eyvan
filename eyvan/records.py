@@ -818,9 +818,35 @@ class UserRecord(EyvanModel):
     created_by: str = Field(min_length=1, max_length=256)
     created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
     updated_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    #: Governance rules a fleet admin sets for this person. ``None`` means "no
+    #: rule", which is every account's default, so a plane whose admin never
+    #: sets one admits exactly what it admitted before rules existed.
+    #:
+    #: ``allowed_fleets``: the only fleets this person's submissions may target.
+    allowed_fleets: tuple[str, ...] | None = Field(default=None, max_length=64)
+    #: Submissions asking for more TPU units than this (the unit the pool
+    #: declares in ``allocatable.tpu``, the same one quotas count) are held for
+    #: a fleet admin's approval instead of being scheduled.
+    approval_tpu_threshold: int | None = Field(default=None, ge=0, le=1_000_000)
+    #: TPU units this person is guaranteed. Usage above it is *borrowed* and may
+    #: be reclaimed (checkpoint first, then requeue) by someone still within
+    #: their own guarantee. ``None`` means no guarantee: everything is borrowed.
+    guaranteed_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # An account with no rules serializes exactly as it did before rules
+        # existed, so stored documents and older readers are unaffected.
+        document = handler(self)
+        for name in ("allowed_fleets", "approval_tpu_threshold", "guaranteed_tpu_units"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_user(self) -> UserRecord:
+        if self.allowed_fleets is not None:
+            _validate_strings(self.allowed_fleets, field_name="allowed fleets")
         if self.email != self.email.lower():
             raise ValueError("user email must be lower-case")
         return self

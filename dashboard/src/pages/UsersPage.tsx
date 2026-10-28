@@ -4,13 +4,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertTriangle, Copy, KeyRound, UserPlus } from "lucide-react";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useState, type FormEvent } from "react";
 
-import type { TeamInvite, TeamInviteCreated, TeamInviteInput, TeamToken, TeamTokenCreated, TeamUser } from "../types";
+import type {
+  TeamInvite,
+  TeamInviteCreated,
+  TeamInviteInput,
+  TeamToken,
+  TeamTokenCreated,
+  TeamUser,
+  TeamUserRules,
+} from "../types";
 
 export interface TeamClient {
   listTeamUsers: (signal?: AbortSignal) => Promise<TeamUser[]>;
   setTeamUserDisabled: (subject: string, disabled: boolean) => Promise<TeamUser>;
+  /** Optional so older callers and tests that never edit rules still type-check. */
+  setTeamUserRules?: (subject: string, rules: TeamUserRules) => Promise<TeamUser>;
   listTeamInvites: (signal?: AbortSignal) => Promise<TeamInvite[]>;
   createTeamInvite: (input: TeamInviteInput) => Promise<TeamInviteCreated>;
   revokeTeamInvite: (inviteId: string) => Promise<TeamInvite>;
@@ -37,6 +47,105 @@ const ROLES = [
 ] as const;
 
 const message = (error: unknown, fallback: string) => (error instanceof Error ? error.message : fallback);
+
+/** One line a person can read: what this account may do without asking. */
+export function rulesSummary(rules: TeamUserRules | undefined): string {
+  if (!rules) return "no rules";
+  const parts = [
+    rules.allowed_fleets ? `fleets: ${rules.allowed_fleets.join(", ") || "none"}` : null,
+    rules.approval_tpu_threshold !== null ? `approval above ${rules.approval_tpu_threshold} TPU` : null,
+    rules.guaranteed_tpu_units !== null ? `guaranteed ${rules.guaranteed_tpu_units} TPU` : null,
+  ].filter(Boolean);
+  return parts.join("; ") || "no rules";
+}
+
+const optionalCount = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`"${value}" is not a whole number of TPU units`);
+  return parsed;
+};
+
+function RulesEditor({
+  user,
+  onSave,
+  onCancel,
+}: {
+  user: TeamUser;
+  onSave: (rules: TeamUserRules) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const current = user.rules;
+  const [fleets, setFleets] = useState(current?.allowed_fleets?.join(", ") ?? "");
+  const [threshold, setThreshold] = useState(current?.approval_tpu_threshold?.toString() ?? "");
+  const [guarantee, setGuarantee] = useState(current?.guaranteed_tpu_units?.toString() ?? "");
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    setProblem(null);
+    let rules: TeamUserRules;
+    try {
+      const names = fleets
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+      rules = {
+        allowed_fleets: names.length ? names : null,
+        approval_tpu_threshold: optionalCount(threshold),
+        guaranteed_tpu_units: optionalCount(guarantee),
+      };
+    } catch (failure) {
+      setProblem(message(failure, "Check the numbers"));
+      return;
+    }
+    setBusy(true);
+    try {
+      await onSave(rules);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      className="form-grid form-grid-two"
+      aria-label={`Rules for ${user.subject}`}
+      onSubmit={(event) => void save(event)}
+    >
+      <label className="field">
+        <span>Allowed fleets (comma separated; empty = any)</span>
+        <input value={fleets} onChange={(event) => setFleets(event.target.value)} />
+      </label>
+      <label className="field">
+        <span>Needs approval above (TPU units; empty = never)</span>
+        <input inputMode="numeric" value={threshold} onChange={(event) => setThreshold(event.target.value)} />
+      </label>
+      <label className="field">
+        <span>Guaranteed TPU units (above it is borrowed; empty = none)</span>
+        <input inputMode="numeric" value={guarantee} onChange={(event) => setGuarantee(event.target.value)} />
+      </label>
+      <div className="field">
+        <span>&nbsp;</span>
+        <div>
+          <button className="button button-primary" type="submit" disabled={busy}>
+            Save rules
+          </button>{" "}
+          <button className="button button-secondary" type="button" onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
+      </div>
+      {problem && (
+        <p className="panel-note" role="alert">
+          {problem}
+        </p>
+      )}
+    </form>
+  );
+}
 const when = (value: string | null) => (value ? new Date(value).toLocaleString() : "—");
 
 function CopyOnce({ label, value }: { label: string; value: string }) {
@@ -72,6 +181,8 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
   const [role, setRole] = useState<string>("project_submitter");
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState<string | null>(null);
+
+  const [editingRules, setEditingRules] = useState<string | null>(null);
 
   const [tokenName, setTokenName] = useState("");
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -213,7 +324,10 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
           <div className="panel-header">
             <div>
               <h2>Users</h2>
-              <p>Disabling an account signs it out everywhere and revokes its tokens.</p>
+              <p>
+                Disabling an account signs it out everywhere and revokes its tokens. Rules limit fleets, hold big jobs
+                for your approval, and set a guarantee; usage above it is borrowed and can be reclaimed.
+              </p>
             </div>
           </div>
           {users.length === 0 ? (
@@ -226,27 +340,60 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
                     <th>User</th>
                     <th>Email</th>
                     <th>Status</th>
+                    <th>Rules</th>
                     <th>Created</th>
                     <th aria-label="Actions" />
                   </tr>
                 </thead>
                 <tbody>
                   {users.map((user) => (
-                    <tr key={user.subject}>
-                      <td className="monospace">{user.subject}</td>
-                      <td>{user.email}</td>
-                      <td>{user.disabled ? "disabled" : "active"}</td>
-                      <td>{when(user.created_at)}</td>
-                      <td>
-                        <button
-                          className="button button-secondary"
-                          type="button"
-                          onClick={() => void act(() => client.setTeamUserDisabled(user.subject, !user.disabled))}
-                        >
-                          {user.disabled ? "Enable" : "Disable"}
-                        </button>
-                      </td>
-                    </tr>
+                    <Fragment key={user.subject}>
+                      <tr>
+                        <td className="monospace">{user.subject}</td>
+                        <td>{user.email}</td>
+                        <td>{user.disabled ? "disabled" : "active"}</td>
+                        <td data-testid={`rules-${user.subject}`}>{rulesSummary(user.rules)}</td>
+                        <td>{when(user.created_at)}</td>
+                        <td>
+                          {client.setTeamUserRules && (
+                            <>
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                onClick={() => setEditingRules(editingRules === user.subject ? null : user.subject)}
+                              >
+                                Rules
+                              </button>{" "}
+                            </>
+                          )}
+                          <button
+                            className="button button-secondary"
+                            type="button"
+                            onClick={() => void act(() => client.setTeamUserDisabled(user.subject, !user.disabled))}
+                          >
+                            {user.disabled ? "Enable" : "Disable"}
+                          </button>
+                        </td>
+                      </tr>
+                      {editingRules === user.subject && client.setTeamUserRules && (
+                        <tr>
+                          <td colSpan={6}>
+                            <RulesEditor
+                              user={user}
+                              onCancel={() => setEditingRules(null)}
+                              onSave={async (rules) => {
+                                if (!client.setTeamUserRules) return;
+                                await act(async () => {
+                                  // Called as a method: the real client class needs its `this`.
+                                  await client.setTeamUserRules?.(user.subject, rules);
+                                  setEditingRules(null);
+                                });
+                              }}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>

@@ -131,6 +131,50 @@ describe("Settings → Users & tokens", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("403"));
   });
 
+  it("shows each user's rules and lets an admin replace them", async () => {
+    const client = mockClient();
+    const withRules: TeamUser = {
+      ...USER,
+      rules: { allowed_fleets: ["research"], approval_tpu_threshold: 8, guaranteed_tpu_units: null },
+    };
+    vi.mocked(client.listTeamUsers).mockResolvedValue([withRules]);
+    client.setTeamUserRules = vi.fn(async (_subject, rules) => ({ ...USER, rules }));
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+
+    const users = await screen.findByRole("region", { name: "Users" });
+    await waitFor(() =>
+      expect(within(users).getByTestId("rules-alice").textContent).toBe("fleets: research; approval above 8 TPU"),
+    );
+    fireEvent.click(within(users).getByRole("button", { name: "Rules" }));
+    const form = await within(users).findByRole("form", { name: "Rules for alice" });
+    fireEvent.change(within(form).getByLabelText(/Allowed fleets/), { target: { value: "research, prod" } });
+    fireEvent.change(within(form).getByLabelText(/Needs approval above/), { target: { value: "" } });
+    fireEvent.change(within(form).getByLabelText(/Guaranteed TPU units/), { target: { value: "32" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save rules" }));
+    await waitFor(() =>
+      expect(client.setTeamUserRules).toHaveBeenCalledWith("alice", {
+        allowed_fleets: ["research", "prod"],
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: 32,
+      }),
+    );
+  });
+
+  it("refuses a non-number rule without calling the plane", async () => {
+    const client = mockClient();
+    client.setTeamUserRules = vi.fn(async () => USER);
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+
+    const users = await screen.findByRole("region", { name: "Users" });
+    fireEvent.click(await within(users).findByRole("button", { name: "Rules" }));
+    const form = await within(users).findByRole("form", { name: "Rules for alice" });
+    expect(within(users).getByTestId("rules-alice").textContent).toBe("no rules");
+    fireEvent.change(within(form).getByLabelText(/Needs approval above/), { target: { value: "lots" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save rules" }));
+    await within(form).findByRole("alert");
+    expect(client.setTeamUserRules).not.toHaveBeenCalled();
+  });
+
   it("renders with the real API client class (methods are called on the client, not detached)", async () => {
     const client = new EyvanApiClient("/api/v1", true);
     render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);

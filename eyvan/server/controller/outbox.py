@@ -259,6 +259,8 @@ class _ControllerOutbox:
                 )
             elif command.topic == "workload.preempt":
                 await self._recover_stale_preemption_command(command, diagnostic=diagnostic)
+            elif command.topic == "workload.reclaim":
+                await self._recover_stale_reclaim_command(command, diagnostic=diagnostic)
             else:
                 await self._discard_outbox(command, provider_diagnostic=diagnostic)
         except CellAgentBusyError as exc:
@@ -387,6 +389,8 @@ class _ControllerOutbox:
             await self._dispatch_checkpoint(command)
         elif command.topic == "workload.preempt":
             await self._dispatch_preemption(command)
+        elif command.topic == "workload.reclaim":
+            await self._dispatch_reclaim(command)
         else:
             raise ValueError(f"unsupported outbox topic {command.topic!r}")
 
