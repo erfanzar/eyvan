@@ -280,7 +280,12 @@ describe("AssistantDock", () => {
     expect(running.textContent).toContain("org_id=acme project_id=r");
     // Text of a round that ended in a tool call is narration, kept dim in the trace.
     expect(within(log()).getByText("Let me look.").closest(".dock-narration")).not.toBeNull();
-    expect(within(log()).getByRole("button", { name: "Thinking" }).getAttribute("aria-expanded")).toBe("true");
+    // Thinking starts collapsed even while it streams; the user opens it.
+    const thinking = within(log()).getByRole("button", { name: "Thinking" });
+    expect(thinking.getAttribute("aria-expanded")).toBe("false");
+    expect(within(log()).queryByText("Check the quota first.")).toBeNull();
+    fireEvent.click(thinking);
+    expect(thinking.getAttribute("aria-expanded")).toBe("true");
     expect(within(log()).getByText("Check the quota first.")).toBeTruthy();
 
     await stream.emit(

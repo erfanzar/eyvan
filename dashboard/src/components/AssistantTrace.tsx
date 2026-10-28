@@ -64,10 +64,10 @@ function ToolRow({ entry }: { entry: ToolEntry }) {
   );
 }
 
-function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
-  // Open while it is being written, so the reader sees it move; closed when
-  // somebody re-opens a finished trace.
-  const [open, setOpen] = useState(live);
+function ThinkingBlock({ text }: { text: string }) {
+  // Always starts collapsed, live or not: reasoning is there for whoever wants
+  // it, not something every reader has to scroll past.
+  const [open, setOpen] = useState(false);
   return (
     <li className="dock-thinking">
       <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
@@ -80,12 +80,12 @@ function ThinkingBlock({ text, live }: { text: string; live: boolean }) {
   );
 }
 
-function TraceList({ answer, live }: { answer: AssistantAnswer; live: boolean }) {
+function TraceList({ answer }: { answer: AssistantAnswer }) {
   return (
     <ul className="dock-trace" aria-label="Assistant steps">
       {answer.trace.map((entry, index) => {
         if (entry.kind === "tool") return <ToolRow key={`tool-${entry.id}-${index}`} entry={entry} />;
-        if (entry.kind === "thinking") return <ThinkingBlock key={`thinking-${index}`} text={entry.text} live={live} />;
+        if (entry.kind === "thinking") return <ThinkingBlock key={`thinking-${index}`} text={entry.text} />;
         return (
           <li key={`narration-${index}`} className="dock-narration">
             <AssistantMarkdown text={entry.text} />
@@ -115,7 +115,7 @@ export function AnswerView({ answer }: { answer: AssistantAnswer }) {
       )}
       {hasTrace &&
         (streaming ? (
-          <TraceList answer={answer} live />
+          <TraceList answer={answer} />
         ) : (
           <>
             <button
@@ -127,7 +127,7 @@ export function AnswerView({ answer }: { answer: AssistantAnswer }) {
               <ChevronRight className="dock-tool-chevron" size={11} aria-hidden="true" />
               {traceLabel(answer)}
             </button>
-            {expanded && <TraceList answer={answer} live={false} />}
+            {expanded && <TraceList answer={answer} />}
           </>
         ))}
       {content && <AssistantMarkdown text={content} />}
