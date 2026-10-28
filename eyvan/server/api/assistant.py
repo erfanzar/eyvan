@@ -257,9 +257,12 @@ class AssistantTools:
         return await self.service.list_capacity_pools(self.principal, fleet_name=fleet_name)
 
     async def _tool_get_quota(self) -> tp.Any:
-        return await self.service.get_quota(
+        quota = await self.service.get_quota(
             self.principal, org_id=self.org_id, project_id=self.project_id, principal_id=self.principal.subject
         )
+        # ``unlimited`` is a property, which model_dump drops; without it the
+        # model would have to infer "no limit" from an empty-looking chain.
+        return {**quota.model_dump(mode="json"), "unlimited": quota.unlimited}
 
     async def _tool_list_workloads(self, state: str | None = None) -> tp.Any:
         workloads = await self.service.list_workloads(

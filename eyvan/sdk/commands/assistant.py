@@ -26,6 +26,18 @@ from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 
 
+def _object(payload: object) -> dict[str, tp.Any]:
+    """Narrow one decoded API answer to a JSON object, or fail with a readable error."""
+
+    if not isinstance(payload, dict):
+        raise click.ClickException("the plane returned an unexpected answer")
+    return payload
+
+
+def _objects(value: object) -> list[dict[str, tp.Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
 def _scope(session: CliSession, org_id: str | None, project_id: str | None) -> dict[str, str]:
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     return {"org_id": scope.org_id, "project_id": scope.project_id}
@@ -61,24 +73,25 @@ def ask(
 
     text = " ".join(question).strip()
     status = session.client.request("GET", "/api/v1/assistant/status")
-    if not (is_json_object(status) and status.get("enabled")):
+    if not (isinstance(status, dict) and status.get("enabled")):
         raise click.ClickException(
             "this plane has no assistant configured; its operator sets EYVAN_ASSISTANT_URL and "
             "EYVAN_ASSISTANT_MODEL (and EYVAN_ASSISTANT_API_KEY) on the server"
         )
-    payload = session.client.request(
-        "POST",
-        "/api/v1/assistant/chat",
-        json={"messages": [{"role": "user", "content": text}], **_scope(session, org_id, project_id)},
+    payload = _object(
+        session.client.request(
+            "POST",
+            "/api/v1/assistant/chat",
+            json={"messages": [{"role": "user", "content": text}], **_scope(session, org_id, project_id)},
+        )
     )
-    assert is_json_object(payload)
     if as_json:
         JsonRenderer().emit(payload)
         return
     click.echo(str(payload.get("reply", "")).strip())
-    for request in payload.get("requests", []):
+    for request in _objects(payload.get("requests")):
         click.echo(f"\nfiled request {request['id']} ({request['kind']}): {request['summary']}")
-    for draft in payload.get("drafts", []):
+    for draft in _objects(payload.get("drafts")):
         spec = draft.get("spec", {})
         click.echo(f"\ndraft workload in {draft['org_id']}/{draft['project_id']}:")
         click.echo(json.dumps(spec, indent=2, sort_keys=True))
@@ -116,14 +129,13 @@ def size(
         body["parameters"] = parameters
     if "model_config" not in body and "parameters" not in body:
         raise click.UsageError("pass --config CONFIG.json or --parameters N")
-    payload = session.client.request("POST", "/api/v1/assistant/size", json=body)
-    assert is_json_object(payload)
+    payload = _object(session.client.request("POST", "/api/v1/assistant/size", json=body))
     if as_json:
         JsonRenderer().emit(payload)
         return
-    estimate = payload["estimate"]
+    estimate = _object(payload.get("estimate"))
     click.echo(f"{payload['parameters']:,} parameters; total {estimate['total_gib']} GiB")
-    for fit in payload.get("fits", []):
+    for fit in _objects(payload.get("fits")):
         click.echo(f"  {fit['accelerator_type']:<14} {fit['per_chip_gib']} GiB/chip of {fit['hbm_per_chip_gib']}")
     click.echo(f"recommended: {payload.get('recommended') or 'nothing in the candidate list fits'}")
 
@@ -140,8 +152,8 @@ def requests_group() -> None:
 def requests_list(session: CliSession, state: str | None, as_json: bool) -> None:
     """Your requests (fleet admins see everyone's)."""
 
-    payload = session.client.request("GET", "/api/v1/team/requests", params={"state": state} if state else None)
-    rows = payload.get("requests", []) if is_json_object(payload) else []
+    payload = _object(session.client.request("GET", "/api/v1/team/requests", params={"state": state} if state else None))
+    rows = _objects(payload.get("requests"))
     if as_json:
         JsonRenderer().emit(payload)
         return
@@ -158,12 +170,13 @@ def requests_list(session: CliSession, state: str | None, as_json: bool) -> None
 def requests_file(session: CliSession, kind: str, summary: str, org_id: str | None, project_id: str | None) -> None:
     """File a request to the fleet admins."""
 
-    payload = session.client.request(
-        "POST",
-        "/api/v1/team/requests",
-        json={"kind": kind, "summary": summary, **_scope(session, org_id, project_id)},
+    payload = _object(
+        session.client.request(
+            "POST",
+            "/api/v1/team/requests",
+            json={"kind": kind, "summary": summary, **_scope(session, org_id, project_id)},
+        )
     )
-    assert is_json_object(payload)
     click.echo(f"filed {payload['id']}")
 
 

@@ -297,3 +297,41 @@ def test_requests_persist_in_every_backend(backend: str, tmp_path) -> None:
         assert [(item.id, item.state, item.resolution_note) for item in stored] == [(filed.id, "declined", "too big")]
 
     asyncio.run(run())
+
+
+def test_every_read_tool_runs_against_the_real_service() -> None:
+    provider = FakeProvider()
+    http = _client(provider)
+    spec = {"name": "probe-job", "execution": {"kind": "command", "command": "echo hi"}}
+    submitted = http.post(
+        "/api/v1/workloads", json={**SCOPE, "spec": spec}, headers={**ALICE, "Idempotency-Key": "probe-1"}
+    )
+    assert submitted.status_code == 201, submitted.text
+    workload_id = submitted.json()["id"]
+    filed = http.post("/api/v1/team/requests", json={"kind": "approval", "summary": "probe"}, headers=ALICE)
+    assert filed.status_code == 201, filed.text
+
+    calls = [
+        _call("list_fleets", {}, "c0"),
+        _call("list_capacity", {}, "c1"),
+        _call("get_quota", {}, "c2"),
+        _call("list_workloads", {}, "c3"),
+        _call("explain_workload", {"workload_id": workload_id}, "c4"),
+        _call("list_my_requests", {}, "c5"),
+    ]
+    provider.script.extend(
+        [{"role": "assistant", "content": None, "tool_calls": calls}, {"role": "assistant", "content": "done"}]
+    )
+    # Reads need READ: a submitter who is also a viewer of acme/r, as a real project member would be.
+    reader = {**ALICE, "X-Eyvan-Roles": "project_submitter,project_viewer"}
+    response = _chat(http, "tell me everything", headers=reader)
+    assert response.status_code == 200, response.text
+    sent = provider.sent(1)["messages"]
+    results = {message["tool_call_id"]: json.loads(message["content"]) for message in sent if message["role"] == "tool"}
+    assert response.json()["tool_calls"] == [{"tool": call["function"]["name"], "ok": True} for call in calls], results
+    assert results["c1"] == []
+    assert "unlimited" in results["c2"]
+    assert results["c3"]["total"] == 1 and results["c3"]["workloads"][0]["id"] == workload_id
+    assert results["c3"]["workloads"][0]["created_by"] == "alice"
+    assert results["c4"]["workload_id"] == workload_id or workload_id in json.dumps(results["c4"])
+    assert [item["id"] for item in results["c5"]] == [filed.json()["id"]]
