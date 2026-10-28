@@ -14,6 +14,8 @@ import type {
   AssistantConversationSummary,
   AssistantProvider,
   AssistantStreamEvent,
+  ResearchPlan,
+  ResearchPlanSummary,
   TeamRequest,
 } from "../types";
 import {
@@ -60,6 +62,39 @@ const REQUEST: TeamRequest = {
 };
 
 const DRAFT = { org_id: "acme", project_id: "r", spec: { name: "llama-sft", execution: { kind: "command" } } };
+
+const PLAN: ResearchPlanSummary = {
+  id: "rp_0123456789abcdef",
+  title: "lr sweep",
+  subject: "alice",
+  org_id: "acme",
+  project_id: "r",
+  state: "proposed",
+  iterate: true,
+  provider_id: null,
+  model: null,
+  current_round: 0,
+  jobs_planned: 2,
+  budget: { max_jobs: 2, max_chip_hours: 1, max_wall_seconds: 600, max_rounds: 3 },
+  spent: { chip_hours: 0, jobs_submitted: 0, rounds: 0 },
+  stop_reason: null,
+  approved_at: null,
+  approved_by: null,
+  started_at: null,
+  finished_at: null,
+  created_at: "2026-10-28T10:00:00+00:00",
+  updated_at: "2026-10-28T10:00:00+00:00",
+};
+const planDocument = (state: ResearchPlan["state"], extra: Partial<ResearchPlan> = {}): ResearchPlan => ({
+  ...PLAN,
+  state,
+  goal: "",
+  jobs: [],
+  workload_ids: [],
+  remaining: { jobs: 2, chip_hours: 1 },
+  notes: [],
+  ...extra,
+});
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const NOW = Date.now();
@@ -129,6 +164,8 @@ function mockClient(events: AssistantStreamEvent[] = answer("ok"), providers = [
     })),
     deleteAssistantConversation: vi.fn(async (id: string) => ({ deleted: id })),
     submitAssistantDraft: vi.fn(async () => ({ id: "wl_1" })),
+    approveResearchPlan: vi.fn<AssistantDockClient["approveResearchPlan"]>(async () => planDocument("approved")),
+    stopResearchPlan: vi.fn<AssistantDockClient["stopResearchPlan"]>(async () => planDocument("stopping")),
     listTeamRequests: vi.fn(async () => [REQUEST]),
     resolveTeamRequest: vi.fn(async () => ({ ...REQUEST, state: "approved" as const })),
   } satisfies AssistantDockClient;
@@ -414,6 +451,114 @@ describe("AssistantDock", () => {
     expect(client.submitAssistantDraft).not.toHaveBeenCalled();
     expect(screen.getAllByTestId("assistant-request")).toHaveLength(1);
     expect(screen.getByTestId("assistant-request").textContent).toContain("need a v5p-32");
+  });
+
+  it("renders a streamed research plan as its own card, shown once, never as a draft", async () => {
+    const client = mockClient(
+      answer("Approve it to start.", [{ type: "plan", plan: PLAN }]).map((event) =>
+        event.type === "done" ? { ...event, plans: [PLAN] } : event,
+      ),
+    );
+    renderDock(client, { currentSubject: "alice" });
+    await ask("sweep the learning rate");
+    await screen.findByText("Approve it to start.");
+    expect(screen.getAllByTestId("assistant-plan")).toHaveLength(1);
+    expect(screen.queryByTestId("assistant-draft")).toBeNull();
+    const card = screen.getByTestId("assistant-plan");
+    expect(within(card).getByText("lr sweep")).toBeTruthy();
+    expect(card.textContent).toContain("2 jobs");
+    expect(within(card).getByTestId("plan-budget").textContent).toBe("2 jobs · 1 chip-hour · 10 min · 3 rounds");
+    expect(within(card).getByTestId("research-state").textContent).toBe("proposed");
+    expect(card.textContent).toContain("yes — may plan further rounds");
+    expect(card.textContent).toContain("Nothing runs until you approve.");
+    expect(within(card).getByRole("link", { name: "Open in Research" }).getAttribute("href")).toBe(
+      "#/research/rp_0123456789abcdef",
+    );
+    // A proposed plan offers no Stop; only the owner's Approve.
+    expect(within(card).queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  it("approves a plan after confirmation, never through the draft submission path, then stops it", async () => {
+    const client = mockClient(answer("Proposed.", [{ type: "plan", plan: PLAN }]));
+    renderDock(client, { currentSubject: "alice" });
+    await ask("plan it");
+    const card = await screen.findByTestId("assistant-plan");
+    fireEvent.click(within(card).getByRole("button", { name: "Approve" }));
+    expect(client.approveResearchPlan).not.toHaveBeenCalled();
+    expect(card.textContent).toContain("under your identity");
+    fireEvent.click(within(card).getByRole("button", { name: "Confirm approve" }));
+    await waitFor(() => expect(within(card).getByTestId("research-state").textContent).toBe("approved"));
+    expect(client.approveResearchPlan).toHaveBeenCalledWith(PLAN.id);
+    expect(client.submitAssistantDraft).not.toHaveBeenCalled();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Stop" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Confirm stop" }));
+    await waitFor(() => expect(within(card).getByTestId("research-state").textContent).toBe("stopping"));
+    expect(client.stopResearchPlan).toHaveBeenCalledWith(PLAN.id);
+    expect(client.submitAssistantDraft).not.toHaveBeenCalled();
+  });
+
+  it("shows why an approval failed and keeps the plan approvable", async () => {
+    const client = mockClient(answer("Proposed.", [{ type: "plan", plan: PLAN }]));
+    client.approveResearchPlan.mockRejectedValueOnce(new Error("Eyvan API request failed with 409: already approved"));
+    renderDock(client, { currentSubject: "alice" });
+    await ask("plan it");
+    const card = await screen.findByTestId("assistant-plan");
+    fireEvent.click(within(card).getByRole("button", { name: "Approve" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Confirm approve" }));
+    expect((await within(card).findByRole("alert")).textContent).toContain("already approved");
+    expect(within(card).getByRole("button", { name: "Approve" })).toBeTruthy();
+    expect(client.submitAssistantDraft).not.toHaveBeenCalled();
+  });
+
+  it("does not offer Approve on someone else's plan", async () => {
+    const client = mockClient(answer("Proposed.", [{ type: "plan", plan: PLAN }]));
+    renderDock(client, { currentSubject: "bob" });
+    await ask("plan it");
+    const card = await screen.findByTestId("assistant-plan");
+    expect(within(card).queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(card.textContent).toContain("Only the person who proposed this plan can approve it.");
+  });
+
+  it("re-renders a saved conversation's plans as cards", async () => {
+    localStorage.setItem(ACTIVE_CONVERSATION_KEY, "conv_9");
+    const client = mockClient();
+    client.getAssistantConversation.mockResolvedValueOnce({
+      ...CONVERSATION,
+      messages: [
+        CONVERSATION.messages[0],
+        { ...CONVERSATION.messages[1], drafts: undefined, plans: [{ ...PLAN, state: "running" }] },
+      ],
+    });
+    renderDock(client, { currentSubject: "alice" });
+    const card = await screen.findByTestId("assistant-plan");
+    expect(within(card).getByText("lr sweep")).toBeTruthy();
+    expect(within(card).getByTestId("research-state").textContent).toBe("running");
+    expect(within(card).getByRole("button", { name: "Stop" })).toBeTruthy();
+    expect(within(card).queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByTestId("assistant-draft")).toBeNull();
+  });
+
+  it("refreshes a saved plan card from the plane, so an already-approved plan is not offered for approval", async () => {
+    localStorage.setItem(ACTIVE_CONVERSATION_KEY, "conv_9");
+    const client = {
+      ...mockClient(),
+      getResearchPlan: vi.fn(async () => ({ ...PLAN, state: "running" as const }) as unknown as ResearchPlan),
+    };
+    client.getAssistantConversation.mockResolvedValueOnce({
+      ...CONVERSATION,
+      messages: [
+        CONVERSATION.messages[0],
+        { ...CONVERSATION.messages[1], drafts: undefined, plans: [{ ...PLAN, state: "proposed" }] },
+      ],
+    });
+    renderDock(client, { currentSubject: "alice" });
+    const card = await screen.findByTestId("assistant-plan");
+    await waitFor(() => expect(within(card).getByTestId("research-state").textContent).toBe("running"));
+    expect(client.getResearchPlan).toHaveBeenCalledTimes(1);
+    expect(client.getResearchPlan).toHaveBeenCalledWith(PLAN.id, expect.anything());
+    expect(within(card).queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(within(card).getByRole("button", { name: "Stop" })).toBeTruthy();
   });
 
   it("tells an admin to set up a provider and everyone else to ask an admin", async () => {

@@ -5272,6 +5272,125 @@ body.dock-resizing {
   margin-top: 3px;
   color: var(--accent-fg);
 }
+/* Research plans: a card in the dock and a page of their own. */
+.dock-card-plan .dock-card-title strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.dock-card-plan .dock-card-title .status-badge {
+  flex: none;
+  font-size: var(--text-3xs);
+}
+.dock-card-plan-running,
+.dock-card-plan-approved {
+  border-left-color: var(--ok);
+}
+.dock-card-plan-stopping {
+  border-left-color: var(--amber);
+}
+.dock-card-plan-settled {
+  border-left-color: var(--border-strong);
+}
+.research-card-facts {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+}
+.research-card-facts > div {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+}
+.research-card-facts dt {
+  color: var(--text-soft);
+  font-size: var(--text-2xs);
+}
+.research-card-facts dd {
+  margin: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.research-gate {
+  margin: 0;
+  color: var(--accent-fg);
+  font-size: var(--text-2xs);
+}
+.research-card-link {
+  align-self: flex-start;
+  font-size: var(--text-2xs);
+}
+.research-table {
+  min-width: 860px;
+}
+.research-heading .research-goal {
+  max-width: 760px;
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+.research-budget-line {
+  margin: 0 0 10px;
+  color: var(--text-soft);
+  font-size: 11.5px;
+}
+.research-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 640px;
+  font-size: 12px;
+}
+.research-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  padding: 14px 16px 18px;
+}
+.research-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.research-meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-soft);
+  font-size: 11.5px;
+}
+.research-meter-head .numeric {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.research-job-error {
+  display: block;
+  color: var(--red);
+  font-size: 10.5px;
+}
+.research-notes {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.research-notes li {
+  display: grid;
+  grid-template-columns: 110px 90px 1fr;
+  gap: 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.research-note-time {
+  color: var(--text-soft);
+}
+.research-note-kind {
+  color: var(--accent-fg);
+  text-transform: uppercase;
+  font-size: 10.5px;
+}
 .dock-typing {
   display: inline-flex;
   gap: 4px;

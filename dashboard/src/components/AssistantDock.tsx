@@ -34,9 +34,12 @@ import type {
   AssistantProvider,
   AssistantProviderList,
   AssistantStreamEvent,
+  ResearchPlan,
+  ResearchPlanSummary,
   TeamRequest,
 } from "../types";
 import { AssistantHistory, type AssistantHistoryClient } from "./AssistantHistory";
+import { ResearchPlanCard } from "./ResearchPlanCard";
 import { AnswerView } from "./AssistantTrace";
 import {
   answerFromSaved,
@@ -57,6 +60,11 @@ export interface AssistantDockClient extends AssistantHistoryClient {
   ): Promise<void>;
   getAssistantConversation(id: string, signal?: AbortSignal): Promise<AssistantConversation>;
   submitAssistantDraft(draft: AssistantDraft): Promise<{ id: string }>;
+  /** Research plans are approved or stopped as a whole; never submitted as drafts. */
+  approveResearchPlan(planId: string): Promise<ResearchPlan>;
+  stopResearchPlan(planId: string, reason?: string): Promise<ResearchPlan>;
+  /** Current state of a plan, so a card reopened from a saved chat is not stale. */
+  getResearchPlan?(planId: string, signal?: AbortSignal): Promise<ResearchPlan>;
   listTeamRequests(signal?: AbortSignal): Promise<TeamRequest[]>;
   resolveTeamRequest(
     requestId: string,
@@ -80,6 +88,11 @@ export interface AssistantDockProps {
   onOpenWorkload?: (workloadId: string) => void;
   /** Bumped when Settings changes the providers, so the picker re-reads them. */
   providersRevision?: number;
+  /**
+   * The signed-in subject, when known. Only a plan's owner may approve it; an
+   * unknown subject leaves the decision to the plane (which refuses others).
+   */
+  currentSubject?: string;
 }
 
 /**
@@ -105,7 +118,8 @@ export type ChatItem =
   | { kind: "user"; id: string; content: string }
   | AssistantAnswer
   | { kind: "draft"; id: string; draft: AssistantDraft; status: DraftStatus; workloadId?: string; error?: string }
-  | { kind: "request"; id: string; request: TeamRequest };
+  | { kind: "request"; id: string; request: TeamRequest }
+  | { kind: "plan"; id: string; plan: ResearchPlanSummary };
 
 type Selection = { provider_id: string; model: string };
 
@@ -164,6 +178,7 @@ export function itemsFromConversation(conversation: AssistantConversation): Chat
       ...(saved.requests ?? []).map(
         (request, index): ChatItem => ({ kind: "request", id: `${saved.id}-request-${index}`, request }),
       ),
+      ...(saved.plans ?? []).map((plan, index): ChatItem => ({ kind: "plan", id: `${saved.id}-plan-${index}`, plan })),
     ];
   });
 }
@@ -525,6 +540,7 @@ export function AssistantDock({
   onOpenSettings,
   onOpenWorkload,
   providersRevision = 0,
+  currentSubject,
 }: AssistantDockProps) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(readActiveConversation);
@@ -547,6 +563,16 @@ export function AssistantDock({
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dockRef = useRef<HTMLElement>(null);
+
+  // Stable across renders (each streamed token re-renders the dock), so a plan
+  // card fetches its current state once per plan rather than once per token.
+  const refreshPlan = useMemo(
+    () =>
+      client.getResearchPlan
+        ? (planId: string, signal: AbortSignal) => client.getResearchPlan!(planId, signal)
+        : undefined,
+    [client],
+  );
 
   const chooseConversation = useCallback((id: string | null) => {
     conversationRef.current = id;
@@ -687,6 +713,7 @@ export function AssistantDock({
     const append = (added: ChatItem[]) => setItems((existing) => [...existing, ...added]);
     let draftsSeen = 0;
     let requestsSeen = 0;
+    let plansSeen = 0;
     const onEvent = (event: AssistantStreamEvent) => {
       if (controller.signal.aborted) return;
       switch (event.type) {
@@ -703,6 +730,11 @@ export function AssistantDock({
           append([{ kind: "request", id: nextId(), request: event.request }]);
           setRequestsRevision((value) => value + 1);
           return;
+        case "plan":
+          // Its own card, never a draft: a plan reaches the plane only through approve/stop.
+          plansSeen += 1;
+          append([{ kind: "plan", id: nextId(), plan: event.plan }]);
+          return;
         case "done": {
           updateAnswer((answer) => applyStreamEvent(answer, event));
           // A plane that reports drafts only in the summary still shows them once.
@@ -713,6 +745,7 @@ export function AssistantDock({
             ...(requestsSeen ? [] : (event.requests ?? [])).map(
               (request): ChatItem => ({ kind: "request", id: nextId(), request }),
             ),
+            ...(plansSeen ? [] : (event.plans ?? [])).map((plan): ChatItem => ({ kind: "plan", id: nextId(), plan })),
           ];
           if (late.length) append(late);
           if (!requestsSeen && event.requests?.length) setRequestsRevision((value) => value + 1);
@@ -994,6 +1027,27 @@ export function AssistantDock({
                       onOpenWorkload={onOpenWorkload}
                     />
                   );
+                case "plan": {
+                  const owner = currentSubject === undefined || item.plan.subject === currentSubject;
+                  return (
+                    <ResearchPlanCard
+                      key={item.id}
+                      plan={item.plan}
+                      canApprove={owner}
+                      canStop={owner || canAdminister}
+                      approve={(planId) => client.approveResearchPlan(planId)}
+                      stop={(planId) => client.stopResearchPlan(planId)}
+                      refresh={refreshPlan}
+                      onUpdated={(updated) =>
+                        setItems((existing) =>
+                          existing.map((entry) =>
+                            entry.id === item.id && entry.kind === "plan" ? { ...entry, plan: updated } : entry,
+                          ),
+                        )
+                      }
+                    />
+                  );
+                }
                 default:
                   return (
                     <div key={item.id} className="dock-note" data-testid="assistant-request">

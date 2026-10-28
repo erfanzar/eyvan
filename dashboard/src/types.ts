@@ -243,12 +243,93 @@ export interface TeamRequest {
   resolution_note: string;
 }
 
+export type ResearchPlanState =
+  | "proposed"
+  | "approved"
+  | "running"
+  | "stopping"
+  | "finished"
+  | "stopped"
+  | "failed"
+  | "over_budget";
+
+/** What a research plan may spend; the plane enforces it, never the model. */
+export interface ResearchBudget {
+  max_jobs: number;
+  max_chip_hours: number;
+  max_wall_seconds: number;
+  max_rounds: number | null;
+}
+
+export interface ResearchSpend {
+  chip_hours: number;
+  jobs_submitted: number;
+  rounds: number;
+}
+
+/**
+ * The list view of a research plan (`plan_summary`). A plan is never a
+ * workload draft: it is approved as a whole and the plane submits its jobs.
+ */
+export interface ResearchPlanSummary {
+  id: string;
+  title: string;
+  subject: string;
+  org_id: string;
+  project_id: string;
+  state: ResearchPlanState;
+  iterate: boolean;
+  provider_id: string | null;
+  model: string | null;
+  current_round: number;
+  jobs_planned: number;
+  budget: ResearchBudget;
+  spent: ResearchSpend;
+  stop_reason: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** One job of a plan with its workload's current (raw) state, `not_submitted`, `refused` or `unknown`. */
+export interface ResearchPlanJob {
+  index: number;
+  name: string;
+  round: number;
+  spec: Record<string, unknown>;
+  state: string;
+  workload_id?: string;
+  failure_reason?: string | null;
+  error?: string | null;
+  submitted_at?: string | null;
+}
+
+export interface ResearchPlanNote {
+  t: string | null;
+  kind: string;
+  text: string;
+}
+
+/** One plan in full (`plan_document`). */
+export interface ResearchPlan extends ResearchPlanSummary {
+  goal: string;
+  jobs: ResearchPlanJob[];
+  workload_ids: string[];
+  remaining: { jobs: number; chip_hours: number };
+  notes: ResearchPlanNote[];
+}
+
 export interface AssistantTurn {
   reply: string;
   steps: number;
   tool_calls: Array<{ tool: string; ok: boolean }>;
   drafts: AssistantDraft[];
   requests: TeamRequest[];
+  /** Research plans proposed this turn; each waits for its owner's approval. */
+  plans?: ResearchPlanSummary[];
   provider_id?: string;
   model?: string;
 }
@@ -273,6 +354,7 @@ export type AssistantStreamEvent =
   | { type: "tool_result"; id: string; name: string; ok: boolean; summary: string }
   | { type: "draft"; draft: AssistantDraft }
   | { type: "request"; request: TeamRequest }
+  | { type: "plan"; plan: ResearchPlanSummary }
   | {
       type: "done";
       reply: string;
@@ -280,6 +362,7 @@ export type AssistantStreamEvent =
       tool_calls: Array<{ tool: string; ok: boolean }>;
       drafts: AssistantDraft[];
       requests: TeamRequest[];
+      plans?: ResearchPlanSummary[];
       message_id?: string;
     }
   | { type: "error"; detail: string };
@@ -311,6 +394,8 @@ export interface AssistantConversationMessage {
   trace?: AssistantTraceEntry[];
   drafts?: AssistantDraft[];
   requests?: TeamRequest[];
+  /** Omitted when the turn proposed no plan. */
+  plans?: ResearchPlanSummary[];
   provider_id?: string | null;
   model?: string | null;
 }

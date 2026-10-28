@@ -58,6 +58,29 @@ export function formatRelativeTime(value: string): string {
   return formatter.format(deltaSeconds, "second");
 }
 
+/**
+ * A duration the way a person says it: "45 s", "10 min", "1 h 30 min", "2 d 4 h".
+ * A missing or negative duration is unknown, never zero.
+ */
+export function formatDurationSeconds(seconds: number | null | undefined): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "unknown";
+  const whole = Math.round(seconds);
+  if (whole < 60) return `${whole} s`;
+  const minutes = Math.floor(whole / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`;
+  const days = Math.floor(hours / 24);
+  return hours % 24 ? `${days} d ${hours % 24} h` : `${days} d`;
+}
+
+/** Chip-hours with at most two decimals: "1 chip-hour", "0.25 chip-hours". */
+export function formatChipHours(value: number, unit = true): string {
+  const rounded = Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
+  const text = rounded.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  return unit ? `${text} chip-hour${rounded === 1 ? "" : "s"}` : text;
+}
+
 export function percent(value: number, total: number): number {
   if (total <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((value / total) * 100)));

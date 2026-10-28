@@ -11,6 +11,7 @@ import {
   ChevronRight,
   CircleDollarSign,
   ClipboardList,
+  FlaskConical,
   Gauge,
   LayoutDashboard,
   LogOut,
@@ -70,6 +71,7 @@ const navigation: Array<{
   { section: "overview", label: "Overview", icon: LayoutDashboard },
   { section: "workloads", label: "Workloads", icon: ClipboardList },
   { section: "runs", label: "Runs", icon: ChartNoAxesCombined },
+  { section: "research", label: "Research", icon: FlaskConical },
   { section: "fleet", label: "Fleet", icon: ServerCog },
   { section: "capacity", label: "Quota & capacity", icon: Gauge },
   { section: "billing", label: "Billing", icon: Receipt },
@@ -82,6 +84,10 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   overview: { title: "Operations overview", description: "Global scheduling and capacity state" },
   workloads: { title: "Workloads", description: "Queue, placement, and execution lifecycle" },
   runs: { title: "Runs", description: "Training metrics, evaluation and attempt history" },
+  research: {
+    title: "Research",
+    description: "Budgeted research plans the assistant proposed; nothing runs until you approve one",
+  },
   fleet: { title: "Fleet", description: "Cells, topology, resources, and capacity leases" },
   capacity: {
     title: "Quota & capacity",
@@ -142,7 +148,14 @@ export function Shell({
     document.documentElement.dataset.theme = theme;
   }, [theme]);
   const meta = pageMeta[route.section];
-  const detailId = "workloadId" in route ? route.workloadId : "runId" in route ? route.runId : undefined;
+  const detailId =
+    "workloadId" in route
+      ? route.workloadId
+      : "runId" in route
+        ? route.runId
+        : "planId" in route
+          ? route.planId
+          : undefined;
   const connected = health?.status === "ok";
   const initials =
     identity?.displayName
@@ -360,7 +373,15 @@ export function Shell({
               reader already has from the rail; the record ID is the one thing
               the rail cannot say, and the thing they copy into a terminal. */}
           <nav className="page-title" aria-label="Breadcrumb">
-            <h1>{detailId ? (route.section === "runs" ? "Run detail" : "Workload detail") : meta.title}</h1>
+            <h1>
+              {detailId
+                ? route.section === "runs"
+                  ? "Run detail"
+                  : route.section === "research"
+                    ? "Research plan"
+                    : "Workload detail"
+                : meta.title}
+            </h1>
             {detailId && (
               <>
                 <ChevronRight size={13} strokeWidth={1.7} aria-hidden="true" />

@@ -7,6 +7,7 @@ export type Section =
   | "overview"
   | "workloads"
   | "runs"
+  | "research"
   | "fleet"
   | "capacity"
   | "billing"
@@ -20,7 +21,8 @@ export type RunTab = "charts" | "episodes" | "histograms" | "rollouts" | "comple
 export type Route =
   | { section: Section }
   | { section: "workloads"; workloadId: string }
-  | { section: "runs"; runId: string; tab?: RunTab };
+  | { section: "runs"; runId: string; tab?: RunTab }
+  | { section: "research"; planId: string };
 
 export type SectionAvailability = Partial<Record<Section, boolean>>;
 
@@ -34,6 +36,14 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // page, never part of the route itself.
   const path = hash.replace(/^#\/?/, "").split("?")[0];
   const [section, id, tab] = path.split("/");
+  if (section === "research" && id) {
+    try {
+      return { section: "research", planId: decodeURIComponent(id) };
+    } catch (error) {
+      if (!(error instanceof URIError)) throw error;
+      return { section: "research" };
+    }
+  }
   if ((section === "workloads" || section === "runs") && id) {
     try {
       return section === "runs"
@@ -62,7 +72,18 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // parsed back to overview, and the section could only be reached by not
   // reloading.
   if (
-    ["workloads", "runs", "fleet", "capacity", "billing", "budgets", "audit", "assistant", "settings"].includes(section)
+    [
+      "workloads",
+      "runs",
+      "research",
+      "fleet",
+      "capacity",
+      "billing",
+      "budgets",
+      "audit",
+      "assistant",
+      "settings",
+    ].includes(section)
   ) {
     return { section: section as Section };
   }
@@ -78,6 +99,9 @@ export function routeHash(route: Route): string {
   }
   if ("workloadId" in route) {
     return `#/workloads/${encodeURIComponent(route.workloadId)}`;
+  }
+  if ("planId" in route) {
+    return `#/research/${encodeURIComponent(route.planId)}`;
   }
   return `#/${route.section}`;
 }

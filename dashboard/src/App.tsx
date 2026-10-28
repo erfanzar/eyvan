@@ -33,6 +33,7 @@ import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
+import { ResearchPage, ResearchPlanPage } from "./pages/ResearchPage";
 import { AssistantDock } from "./components/AssistantDock";
 import { useAssistantDockState } from "./components/assistantDockState";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -645,6 +646,8 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const sectionAvailability: SectionAvailability = {
     workloads: canReadSelectedScope || capabilities.submitWorkloads,
     runs: canReadSelectedScope,
+    // A plan is approved by someone who may submit in its project.
+    research: canReadSelectedScope || capabilities.submitWorkloads,
     budgets: canReadSelectedScope,
     fleet: capabilities.manageFleet && (data?.access.fleetInventory ?? true),
     // Provider quota is a property of the cloud project this fleet's pools
@@ -1006,6 +1009,18 @@ export default function App({ client = apiClient, identityProvider = currentIden
     (signal: AbortSignal) => client.listRuns({}, fleetScope, signal),
     [client, fleetScope.orgId, fleetScope.projectId],
   );
+  // Research plans are owner-scoped rather than project-scoped: the route
+  // answers this principal's plans (every plan for a fleet admin).
+  const loadResearchPlans = useCallback(
+    (signal: AbortSignal) => withAuthorityRefresh(() => client.listResearchPlans(undefined, signal)),
+    [client, withAuthorityRefresh],
+  );
+  const loadResearchPlan = useCallback(
+    (planId: string, signal: AbortSignal) => withAuthorityRefresh(() => client.getResearchPlan(planId, signal)),
+    [client, withAuthorityRefresh],
+  );
+  const approveResearchPlan = useCallback((planId: string) => client.approveResearchPlan(planId), [client]);
+  const stopResearchPlan = useCallback((planId: string) => client.stopResearchPlan(planId), [client]);
   const loadRun = useCallback(
     (id: string, signal: AbortSignal) => client.getRun(id, fleetScope, signal),
     [client, fleetScope.orgId, fleetScope.projectId],
@@ -1207,6 +1222,29 @@ export default function App({ client = apiClient, identityProvider = currentIden
             />
           );
         break;
+      case "research":
+        content =
+          "planId" in activeRoute ? (
+            <ResearchPlanPage
+              key={activeRoute.planId}
+              planId={activeRoute.planId}
+              loadPlan={loadResearchPlan}
+              onBack={() => goToSection("research")}
+              onOpenWorkload={openWorkload}
+              approve={approveResearchPlan}
+              stop={stopResearchPlan}
+              currentSubject={authority?.subject}
+              canAdminister={capabilities.manageFleet}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          ) : (
+            <ResearchPage
+              loadPlans={loadResearchPlans}
+              onOpenPlan={(planId) => navigate({ section: "research", planId })}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          );
+        break;
       case "workloads":
         content = (
           <WorkloadsPage
@@ -1336,6 +1374,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             onOpenSettings={sectionAvailability.settings ? () => goToSection("settings") : undefined}
             onOpenWorkload={openWorkload}
             providersRevision={assistantProvidersRevision}
+            currentSubject={authority?.subject}
           />
         }
       >

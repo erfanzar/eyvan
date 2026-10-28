@@ -66,6 +66,9 @@ import type {
   AssistantProviderUpdate,
   AssistantStatus,
   AssistantTurn,
+  ResearchPlan,
+  ResearchPlanState,
+  ResearchPlanSummary,
   OpenRouterSignInInput,
   OpenRouterSignInStart,
   TeamRequest,
@@ -1058,6 +1061,38 @@ export class EyvanApiClient {
       method: "POST",
       headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `assistant-${Date.now()}` },
       body: JSON.stringify(draft),
+    });
+  }
+
+  // Research plans. The assistant only proposes one; its owner approves it
+  // here and the plane then submits the jobs. A plan is never a workload draft.
+
+  /** Your plans (fleet admins see everyone's), oldest first. */
+  async listResearchPlans(state?: ResearchPlanState, signal?: AbortSignal): Promise<ResearchPlanSummary[]> {
+    if (this.forceDemo) return [];
+    const query = state ? `?state=${encodeURIComponent(state)}` : "";
+    return (
+      await this.attachmentRequest<{ plans: ResearchPlanSummary[] }>(`/api/v1/research/plans${query}`, { signal })
+    ).plans;
+  }
+
+  async getResearchPlan(planId: string, signal?: AbortSignal): Promise<ResearchPlan> {
+    if (this.forceDemo) throw new ApiError("Research plan not found", 404);
+    return this.attachmentRequest<ResearchPlan>(`/api/v1/research/plans/${encodeURIComponent(planId)}`, { signal });
+  }
+
+  /** Approve a proposed plan (its owner only); nothing ran before this. */
+  async approveResearchPlan(planId: string): Promise<ResearchPlan> {
+    return this.attachmentRequest<ResearchPlan>(`/api/v1/research/plans/${encodeURIComponent(planId)}/approve`, {
+      method: "POST",
+    });
+  }
+
+  /** Stop a plan (owner or fleet admin); the plane cancels its running workloads. */
+  async stopResearchPlan(planId: string, reason = ""): Promise<ResearchPlan> {
+    return this.attachmentRequest<ResearchPlan>(`/api/v1/research/plans/${encodeURIComponent(planId)}/stop`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
     });
   }
 
