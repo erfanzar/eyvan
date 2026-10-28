@@ -223,6 +223,7 @@ async def run_turn_stream(
             name = str(function.get("name", ""))
             call_id = str(call.get("id", ""))
             drafts_before, requests_before = len(tools.drafts), len(tools.requests)
+            plans_before = len(_plans(tools))
             try:
                 arguments = json.loads(function.get("arguments") or "{}")
                 if not isinstance(arguments, dict):
@@ -238,6 +239,8 @@ async def run_turn_stream(
                 yield {"type": "draft", "draft": draft}
             for request in tools.requests[requests_before:]:
                 yield {"type": "request", "request": request.model_dump(mode="json")}
+            for plan in _plans(tools)[plans_before:]:
+                yield {"type": "plan", "plan": plan}
             content = json.dumps(result, default=str)
             if len(content) > MAX_TOOL_RESULT_CHARS:
                 content = content[:MAX_TOOL_RESULT_CHARS] + '..."(truncated)"'
@@ -248,6 +251,13 @@ async def run_turn_stream(
     )
 
 
+def _plans(tools: ToolRunner) -> list[dict[str, tp.Any]]:
+    """Research plans a tool set proposed this turn; a runner without the channel has none."""
+
+    plans = getattr(tools, "plans", None)
+    return plans if isinstance(plans, list) else []
+
+
 def _done(reply: str, steps: int, trace: list[dict[str, tp.Any]], tools: ToolRunner) -> StreamEvent:
     return {
         "type": "done",
@@ -256,6 +266,7 @@ def _done(reply: str, steps: int, trace: list[dict[str, tp.Any]], tools: ToolRun
         "tool_calls": trace,
         "drafts": list(tools.drafts),
         "requests": [request.model_dump(mode="json") for request in tools.requests],
+        "plans": list(_plans(tools)),
     }
 
 

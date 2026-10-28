@@ -66,6 +66,7 @@ from eyvan.server.api.assistant_stream import (
     run_turn_stream,
 )
 from eyvan.server.api.auth import authenticated_principal
+from eyvan.server.api.research_routes import plan_document, plan_summary
 from eyvan.server.api.team_routes import require_team_mode
 from eyvan.server.service._control_plane.assistant_conversations import (
     clip_message,
@@ -105,6 +106,10 @@ dataset, learning_rate, total_batch_size, training length, save_directory/save_s
 stating the default for each so they can accept it. Do not draft until they have answered.
 Then validate_easydel_arguments, fix what it flags, and draft_workload with easydel_trainer,
 trainer_arguments and easydel_launch; size_job and list_capacity decide tpu_chips and the accelerator.
+Research mode: when the user wants several runs explored ("run these four jobs and auto-research on
+them"), agree the jobs and ASK for a budget (max jobs, chip-hours, wall-clock time, rounds), then call
+propose_research_plan. Say plainly that nothing runs until they approve it; after approval the plane
+runs it as them and get_research_plan reports progress.
 You cannot submit anything. draft_workload prepares a submission the user must confirm themselves.
 If the user needs capacity or an approval they do not have, offer to file_request to the fleet admins;
 only file one when the user asks for it. Be brief and concrete."""
@@ -280,6 +285,61 @@ TOOL_SPECS: tuple[dict[str, tp.Any], ...] = (
             ["kind", "summary"],
         ),
     },
+    {
+        "name": "propose_research_plan",
+        "description": (
+            "Propose (NOT start) a research plan: several jobs plus a budget the plane enforces. Each job is "
+            "{name, spec} or the draft_workload fields (command, or easydel_trainer + trainer_arguments + "
+            "easydel_launch, with accelerator_type/tpu_chips). Nothing runs until the user approves it; then the "
+            "plane submits the jobs as the user, monitors them and, when iterate is true, asks for further rounds "
+            "inside the budget. Ask the user for the budget first."
+        ),
+        "parameters": _schema(
+            {
+                "title": _STR,
+                "goal": _STR,
+                "jobs": {"type": "array", "items": {"type": "object"}},
+                "budget": {
+                    "type": "object",
+                    "properties": {
+                        "max_jobs": _INT,
+                        "max_chip_hours": {"type": "number"},
+                        "max_wall_seconds": _INT,
+                        "max_rounds": _INT,
+                    },
+                    "required": ["max_jobs", "max_chip_hours", "max_wall_seconds"],
+                },
+                "iterate": {"type": "boolean"},
+            },
+            ["title", "jobs", "budget"],
+        ),
+    },
+    {
+        "name": "list_research_plans",
+        "description": "Research plans (yours; fleet admins see everyone's) with state, budget and spend.",
+        "parameters": _schema(
+            {
+                "state": {
+                    "type": "string",
+                    "enum": [
+                        "proposed",
+                        "approved",
+                        "running",
+                        "stopping",
+                        "finished",
+                        "stopped",
+                        "failed",
+                        "over_budget",
+                    ],
+                }
+            }
+        ),
+    },
+    {
+        "name": "get_research_plan",
+        "description": "One research plan: each job's workload state and failure, spend against budget, notes.",
+        "parameters": _schema({"plan_id": _STR}, ["plan_id"]),
+    },
 )
 TOOL_NAMES = frozenset(spec["name"] for spec in TOOL_SPECS)
 
@@ -300,7 +360,12 @@ class AssistantTools:
         self.project_id = project_id
         self.drafts: list[dict[str, tp.Any]] = []
         self.requests: list[TeamRequestRecord] = []
+        #: Research plans proposed this turn (summaries); each still needs the user's approval.
+        self.plans: list[dict[str, tp.Any]] = []
         self.team_mode = False
+        #: The chat's own provider and model, used for a proposed plan's iteration rounds.
+        self.provider_id: str | None = None
+        self.model: str | None = None
 
     async def call(self, name: str, arguments: dict[str, tp.Any]) -> ToolOutcome:
         if name not in TOOL_NAMES:
@@ -399,7 +464,7 @@ class AssistantTools:
     async def _tool_validate_easydel_arguments(self, trainer: str, arguments: dict[str, tp.Any]) -> tp.Any:
         return easydel.validate_trainer_arguments(trainer, arguments)
 
-    async def _tool_draft_workload(
+    def _render_draft(
         self,
         name: str,
         command: str | None = None,
@@ -413,7 +478,9 @@ class AssistantTools:
         easydel_trainer: str | None = None,
         trainer_arguments: dict[str, tp.Any] | None = None,
         easydel_launch: dict[str, tp.Any] | None = None,
-    ) -> tp.Any:
+    ) -> tuple[dict[str, tp.Any], dict[str, tp.Any] | None]:
+        """Validate one job and return ``(tool outcome, draft or None when refused)``; records nothing."""
+
         launch: dict[str, tp.Any] | None = None
         if easydel_trainer is not None:
             if command:
@@ -425,12 +492,13 @@ class AssistantTools:
             if not launch["runnable"]:
                 # Not drafted: a launch eLarge would refuse, or silently run with
                 # dropped arguments, must go back to the user first.
-                return {
+                refusal = {
                     "drafted": False,
                     "blocking": launch["blocking"],
                     "missing_essential": launch["validation"]["missing_essential"],
                     "suggestions": launch["validation"]["suggestions"],
                 }
+                return refusal, None
             command = launch["script"].strip()
         if not command:
             raise ValueError("pass command, or easydel_trainer with easydel_launch")
@@ -472,8 +540,69 @@ class AssistantTools:
                 "missing_essential": launch["validation"]["missing_essential"],
                 "config_yaml": launch["config_yaml"],
             }
-        self.drafts.append(draft)
+        return outcome, draft
+
+    async def _tool_draft_workload(self, **arguments: tp.Any) -> tp.Any:
+        outcome, draft = self._render_draft(**arguments)
+        if draft is not None:
+            self.drafts.append(draft)
         return outcome
+
+    async def _tool_propose_research_plan(
+        self,
+        title: str,
+        jobs: list[tp.Any],
+        budget: dict[str, tp.Any],
+        goal: str = "",
+        iterate: bool = False,
+    ) -> tp.Any:
+        if not isinstance(jobs, list) or not jobs:
+            raise ValueError("jobs must be a non-empty list")
+        planned: list[dict[str, tp.Any]] = []
+        for index, job in enumerate(jobs):
+            if not isinstance(job, dict):
+                raise ValueError(f"job {index} must be an object")
+            if "spec" in job:
+                spec = job["spec"]
+                name = job.get("name") or (spec.get("name") if isinstance(spec, dict) else None)
+                if set(job) - {"name", "spec"} or not name:
+                    raise ValueError(f"job {index}: pass {{name, spec}} or the draft_workload fields, not both")
+                planned.append({"name": str(name), "spec": spec})
+                continue
+            # The same validation a single draft gets, EasyDeL launches included.
+            outcome, draft = self._render_draft(**job)
+            if draft is None:
+                return {"proposed": False, "job": index, **outcome}
+            planned.append({"name": str(job["name"]), "spec": draft["spec"]})
+        plan = await self.service.propose_research_plan(
+            self.principal,
+            title=title,
+            goal=goal,
+            org_id=self.org_id,
+            project_id=self.project_id,
+            jobs=planned,
+            budget=budget,
+            iterate=iterate,
+            provider_id=self.provider_id if iterate else None,
+            model=self.model if iterate else None,
+        )
+        self.plans.append(plan_summary(plan))
+        return {
+            "proposed": True,
+            "approved": False,
+            "plan_id": plan.id,
+            "jobs": len(plan.jobs),
+            "budget": plan.budget.model_dump(mode="json"),
+            "note": "nothing runs until the user approves this plan (dashboard or `eyvan research approve`)",
+        }
+
+    async def _tool_list_research_plans(self, state: str | None = None) -> tp.Any:
+        plans = await self.service.list_research_plans(self.principal, state=state)
+        return [plan_summary(plan) for plan in plans]
+
+    async def _tool_get_research_plan(self, plan_id: str) -> tp.Any:
+        plan, workloads = await self.service.describe_research_plan(self.principal, plan_id)
+        return plan_document(plan, workloads)
 
     async def _tool_list_my_requests(self, state: str | None = None) -> tp.Any:
         if not self.team_mode:
@@ -818,6 +947,7 @@ def register_assistant_routes(
         chosen = chat_model_for(record, model, key, request)
         tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
         tools.team_mode = settings.team_mode
+        tools.provider_id, tools.model = record.id, model
         history = [message.model_dump() for message in body.messages]
         try:
             turn = await run_chat(chosen, tools, history, max_steps=record.max_steps)
@@ -873,6 +1003,7 @@ def register_assistant_routes(
         chosen = chat_model_for(record, model, key, request)
         tools = AssistantTools(service, principal, org_id=body.org_id, project_id=body.project_id)
         tools.team_mode = settings.team_mode
+        tools.provider_id, tools.model = record.id, model
 
         async def events() -> tp.AsyncIterator[bytes]:
             def line(event: StreamEvent) -> bytes:
@@ -941,6 +1072,7 @@ def register_assistant_routes(
                                 trace=clip_trace(trace),
                                 drafts=tuple(event.get("drafts") or ())[:32],
                                 requests=tuple(event.get("requests") or ())[:32],
+                                plans=tuple(event.get("plans") or ())[:8],
                             )
                         )
                         continue

@@ -172,6 +172,15 @@ def ask(
         click.secho(f"\n(chat {payload['conversation_id']}; continue with --chat)", dim=True, err=True)
     for request in _objects(payload.get("requests")):
         click.echo(f"\nfiled request {request['id']} ({request['kind']}): {request['summary']}")
+    for plan in _objects(payload.get("plans")):
+        raw_budget = plan.get("budget")
+        budget: dict[str, tp.Any] = raw_budget if isinstance(raw_budget, dict) else {}
+        click.echo(
+            f"\nproposed research plan {plan.get('id')} ({plan.get('title')}): {plan.get('jobs_planned')} jobs, "
+            f"budget {budget.get('max_jobs')} jobs / {budget.get('max_chip_hours')} chip-hours / "
+            f"{budget.get('max_wall_seconds')} s"
+        )
+        click.echo(f"nothing runs until you approve it: eyvan research approve {plan.get('id')}")
     for draft in _objects(payload.get("drafts")):
         spec = draft.get("spec", {})
         click.echo(f"\ndraft workload in {draft['org_id']}/{draft['project_id']}:")

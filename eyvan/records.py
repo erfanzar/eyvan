@@ -1006,6 +1006,17 @@ class AssistantMessageRecord(EyvanModel):
     requests: tuple[dict[str, tp.Any], ...] = Field(default=(), max_length=32)
     #: Set when the turn ended in an error or was stopped, so history shows it honestly.
     error: str | None = Field(default=None, max_length=2000)
+    #: Research plans the turn proposed (summaries; the plan record is the source of truth).
+    plans: tuple[dict[str, tp.Any], ...] = Field(default=(), max_length=8)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # A turn that proposed no plan serializes exactly as before the field
+        # existed, so stored chats and older ``extra="forbid"`` readers agree.
+        document = handler(self)
+        if not self.plans and isinstance(document, dict):
+            document.pop("plans", None)
+        return document
 
 
 class AssistantConversationRecord(EyvanModel):

@@ -43,6 +43,7 @@ from eyvan.records import Permission, Principal, WorkloadRecord
 from eyvan.server.api.assistant import TOOL_SPECS as ASSISTANT_TOOL_SPECS
 from eyvan.server.api.assistant import AssistantTools
 from eyvan.server.api.auth import DEFAULT_DEVELOPMENT_SCOPE, authenticated_principal
+from eyvan.server.api.research_routes import plan_document
 from eyvan.server.api.schemas import WorkloadSubmitRequest
 from eyvan.server.local.daemon import LocalDaemonError
 from eyvan.server.local.tracker import LocalTrackerError, read_tracker_record, read_tracker_token
@@ -311,7 +312,15 @@ def _granted_scope(principal: Principal) -> tuple[str | None, str | None, tuple[
 
 #: Assistant tools that read or write inside one org/project.
 _SCOPED_ASSISTANT_TOOLS: tp.Final = frozenset(
-    {"list_fleets", "list_capacity", "get_quota", "list_workloads", "draft_workload", "file_request"}
+    {
+        "list_fleets",
+        "list_capacity",
+        "get_quota",
+        "list_workloads",
+        "draft_workload",
+        "file_request",
+        "propose_research_plan",
+    }
 )
 _DRAFT_NOTE = "not submitted; call submit_workload with draft.spec (and draft.org_id/project_id) to submit it"
 
@@ -345,6 +354,7 @@ def _assistant_handler(name: str) -> Handler:
 
 _ASSISTANT_ANNOTATIONS: tp.Final[dict[str, dict[str, tp.Any]]] = {
     "file_request": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "propose_research_plan": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
 }
 
 for _spec in ASSISTANT_TOOL_SPECS:
@@ -535,6 +545,53 @@ register_tool(
         input_schema=_schema({"workload_id": _STR, "tail": _INT}, ["workload_id"]),
         handler=_get_workload_logs,
         annotations=dict(_READ_ONLY),
+    )
+)
+
+
+# ------------------------------------------------------------------ research plans
+
+
+async def _approve_research_plan(
+    service: ControlPlaneService, principal: Principal, scope: McpScope, args: dict[str, tp.Any]
+) -> tp.Any:
+    plan_id = _string(args, "plan_id", required=True)
+    assert plan_id is not None
+    await service.approve_research_plan(principal, plan_id)
+    plan, workloads = await service.describe_research_plan(principal, plan_id)
+    return plan_document(plan, workloads)
+
+
+async def _stop_research_plan(
+    service: ControlPlaneService, principal: Principal, scope: McpScope, args: dict[str, tp.Any]
+) -> tp.Any:
+    plan_id = _string(args, "plan_id", required=True)
+    assert plan_id is not None
+    reason = _string(args, "reason", limit=2000) or ""
+    await service.stop_research_plan(principal, plan_id, reason=reason)
+    plan, workloads = await service.describe_research_plan(principal, plan_id)
+    return plan_document(plan, workloads)
+
+
+register_tool(
+    McpTool(
+        name="approve_research_plan",
+        description=(
+            "Approve one of your proposed research plans NOW (owner only): the plane then submits its jobs as you, "
+            "monitors them and iterates inside the plan's budget. Only on the user's explicit instruction."
+        ),
+        input_schema=_schema({"plan_id": _STR}, ["plan_id"]),
+        handler=_approve_research_plan,
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+    )
+)
+register_tool(
+    McpTool(
+        name="stop_research_plan",
+        description="Stop a research plan NOW (owner or fleet admin); its running workloads are cancelled.",
+        input_schema=_schema({"plan_id": _STR, "reason": _STR}, ["plan_id"]),
+        handler=_stop_research_plan,
+        annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     )
 )
 
