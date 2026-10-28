@@ -1030,6 +1030,145 @@ class AssistantConversationRecord(EyvanModel):
         return self
 
 
+#: Bounds on one research plan, so neither a plan nor the model iterating on it
+#: can grow a record without limit.
+MAX_RESEARCH_JOBS = 64
+MAX_RESEARCH_ROUNDS = 20
+MAX_RESEARCH_NOTES = 200
+MAX_RESEARCH_NOTE_CHARS = 2000
+MAX_RESEARCH_GOAL_CHARS = 8000
+MAX_RESEARCH_JOB_SPEC_BYTES = 64 * 1024
+#: Thirty days: a research plan is a bounded experiment, not a standing service.
+MAX_RESEARCH_WALL_SECONDS = 30 * 86_400
+ResearchPlanState: tp.TypeAlias = Literal[
+    "proposed", "approved", "running", "stopping", "finished", "stopped", "failed", "over_budget"
+]
+#: States the plane never moves a plan out of.
+RESEARCH_PLAN_TERMINAL_STATES: frozenset[str] = frozenset({"finished", "stopped", "failed", "over_budget"})
+#: States the research runner acts on each tick.
+RESEARCH_PLAN_ACTIVE_STATES: frozenset[str] = frozenset({"approved", "running", "stopping"})
+
+
+class ResearchJob(EyvanModel):
+    """One job of a research plan: a name and the workload spec the submit route accepts.
+
+    The spec is kept as the JSON document that was validated as a
+    ``WorkloadDefinition`` when it was planned, so a later schema change never
+    makes a stored plan unreadable; it is validated again at submission.
+    """
+
+    name: str = Field(min_length=1, max_length=200)
+    spec: JsonDocument
+    #: Which round planned it: 0 for the approved jobs, then one per iteration.
+    round: int = Field(default=0, ge=0, le=MAX_RESEARCH_ROUNDS)
+
+    @model_validator(mode="after")
+    def validate_job(self) -> ResearchJob:
+        _validate_string(self.name, field_name="research job name")
+        if len(json.dumps(self.spec, separators=(",", ":"), default=str)) > MAX_RESEARCH_JOB_SPEC_BYTES:
+            raise ValueError(f"a research job spec must be at most {MAX_RESEARCH_JOB_SPEC_BYTES} bytes")
+        return self
+
+
+class ResearchBudget(EyvanModel):
+    """What a research plan may spend; enforced by the plane, never by the model."""
+
+    max_jobs: int = Field(ge=1, le=MAX_RESEARCH_JOBS)
+    max_chip_hours: float = Field(gt=0, le=10_000_000)
+    max_wall_seconds: int = Field(gt=0, le=MAX_RESEARCH_WALL_SECONDS)
+    max_rounds: int | None = Field(default=None, ge=1, le=MAX_RESEARCH_ROUNDS)
+
+
+class ResearchSubmission(EyvanModel):
+    """One job the plane submitted (or tried to) for a plan, in submission order."""
+
+    job_index: int = Field(ge=0, lt=MAX_RESEARCH_JOBS)
+    round: int = Field(ge=0, le=MAX_RESEARCH_ROUNDS)
+    workload_id: str | None = Field(default=None, max_length=96)
+    #: Why the plane refused the job (policy, validation); never a credential.
+    error: str | None = Field(default=None, max_length=500)
+    submitted_at: Annotated[datetime, AwareDatetime]
+
+    @model_validator(mode="after")
+    def validate_submission(self) -> ResearchSubmission:
+        if (self.workload_id is None) == (self.error is None):
+            raise ValueError("a research submission has exactly one of workload_id or error")
+        return self
+
+
+class ResearchSpend(EyvanModel):
+    """The plane's own conservative accounting of what a plan has used."""
+
+    chip_hours: float = Field(default=0, ge=0)
+    jobs_submitted: int = Field(default=0, ge=0)
+    rounds: int = Field(default=0, ge=0)
+
+
+class ResearchNote(EyvanModel):
+    """One bounded line of a plan's log: what the plane or the iteration model did and why."""
+
+    t: Annotated[datetime, AwareDatetime]
+    kind: str = Field(min_length=1, max_length=32)
+    text: str = Field(max_length=MAX_RESEARCH_NOTE_CHARS)
+
+
+class ResearchPlanRecord(EyvanModel):
+    """A budgeted set of jobs a user approved once; the plane runs and iterates it as that user.
+
+    ``approval_grants`` is the authority the approving request carried from its
+    own credential (not from the plane's durable grants), narrowed to the plan's
+    project and to submit/operate. The runner acts with that plus the owner's
+    *current* durable grants, so revoking a durable grant or disabling the
+    account takes effect on the next tick. It never acts with admin rights.
+    """
+
+    id: str = Field(pattern=r"^rp_[0-9a-f]{16}$")
+    subject: str = Field(min_length=1, max_length=256)
+    org_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=200)
+    goal: str = Field(default="", max_length=MAX_RESEARCH_GOAL_CHARS)
+    jobs: tuple[ResearchJob, ...] = Field(min_length=1, max_length=MAX_RESEARCH_JOBS)
+    budget: ResearchBudget
+    iterate: bool = False
+    provider_id: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=128)
+    state: ResearchPlanState = "proposed"
+    current_round: int = Field(default=0, ge=0, le=MAX_RESEARCH_ROUNDS)
+    approved_at: Annotated[datetime, AwareDatetime] | None = None
+    approved_by: str | None = Field(default=None, max_length=256)
+    approval_grants: tuple[RoleGrant, ...] = Field(default=(), max_length=2)
+    started_at: Annotated[datetime, AwareDatetime] | None = None
+    finished_at: Annotated[datetime, AwareDatetime] | None = None
+    stop_reason: str | None = Field(default=None, max_length=2000)
+    #: Where a ``stopping`` plan lands once its workloads are cancelled.
+    stop_target: Literal["stopped", "over_budget", "failed"] | None = None
+    stop_requested_by: str | None = Field(default=None, max_length=256)
+    submitted: tuple[ResearchSubmission, ...] = Field(default=(), max_length=MAX_RESEARCH_JOBS)
+    spent: ResearchSpend = Field(default_factory=ResearchSpend)
+    #: Consecutive failed calls to the iteration model; bounded so a broken
+    #: provider ends the plan instead of retrying forever.
+    iteration_errors: int = Field(default=0, ge=0, le=100)
+    notes: tuple[ResearchNote, ...] = Field(default=(), max_length=MAX_RESEARCH_NOTES)
+    created_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+    updated_at: Annotated[datetime, AwareDatetime] = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> ResearchPlanRecord:
+        _validate_string(self.title, field_name="research plan title")
+        _validate_string(self.subject, field_name="research plan owner")
+        if len(self.jobs) > self.budget.max_jobs:
+            raise ValueError("a research plan cannot plan more jobs than its max_jobs budget")
+        indexes = [item.job_index for item in self.submitted]
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("a research plan submits each job at most once")
+        if any(index >= len(self.jobs) for index in indexes):
+            raise ValueError("a research submission must name a planned job")
+        if self.current_round > max(job.round for job in self.jobs):
+            raise ValueError("a research plan's current round must have planned jobs")
+        return self
+
+
 class ResourceVector(EyvanModel):
     """Scalar resources requested by one workload replica or offered by a cell."""
 

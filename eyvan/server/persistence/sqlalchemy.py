@@ -69,6 +69,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    ResearchPlanRecord,
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
@@ -90,7 +91,7 @@ from eyvan.server.persistence.base import (
 )
 from eyvan.server.service.federation import BudgetGrantRecord, PlanePeerRecord, QuotaGrantRecord
 
-SCHEMA_REVISION = "0023_assistant_conversations"
+SCHEMA_REVISION = "0024_research_plans"
 
 
 @tp.runtime_checkable
@@ -262,6 +263,16 @@ class AssistantConversationRow(Base):
     __tablename__ = "assistant_conversations"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     subject: Mapped[str] = mapped_column(String(256), index=True)
+    data: Mapped[JsonObject] = mapped_column(JSON)
+
+
+class ResearchPlanRow(Base):
+    """A user's budgeted research plan; ``subject`` and ``state`` are filtered on (owner lists, runner ticks)."""
+
+    __tablename__ = "research_plans"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(256), index=True)
+    state: Mapped[str] = mapped_column(String(16), index=True)
     data: Mapped[JsonObject] = mapped_column(JSON)
 
 
@@ -1031,6 +1042,33 @@ class SqlAlchemySession:
 
     async def delete_assistant_conversation(self, conversation_id: str) -> bool:
         row = await self._get_locked(AssistantConversationRow, conversation_id)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        return True
+
+    async def get_research_plan(self, plan_id: str) -> ResearchPlanRecord | None:
+        row = await self._get_locked(ResearchPlanRow, plan_id)
+        return None if row is None else ResearchPlanRecord.model_validate(row.data)
+
+    async def list_research_plans(
+        self, *, subject: str | None = None, states: frozenset[str] | None = None
+    ) -> list[ResearchPlanRecord]:
+        statement = select(ResearchPlanRow)
+        if subject is not None:
+            statement = statement.where(ResearchPlanRow.subject == subject)
+        if states is not None:
+            statement = statement.where(ResearchPlanRow.state.in_(sorted(states)))
+        rows = (await self.session.scalars(statement)).all()
+        return sorted(
+            _decode_rows(ResearchPlanRecord, rows, table="research_plans"), key=lambda item: (item.created_at, item.id)
+        )
+
+    async def put_research_plan(self, plan: ResearchPlanRecord) -> None:
+        await self.session.merge(ResearchPlanRow(id=plan.id, subject=plan.subject, state=plan.state, data=_dump(plan)))
+
+    async def delete_research_plan(self, plan_id: str) -> bool:
+        row = await self._get_locked(ResearchPlanRow, plan_id)
         if row is None:
             return False
         await self.session.delete(row)

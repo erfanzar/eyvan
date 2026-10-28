@@ -96,6 +96,7 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/health` | Health | 200 |
 | GET | `/api/v1/leases` | List Leases | 200, 422 |
 | GET | `/api/v1/leases/{lease_id}` | Get Lease | 200, 422 |
+| POST | `/api/v1/mcp` | Mcp Endpoint | 200 |
 | GET | `/api/v1/organizations` | List Organizations | 200 |
 | GET | `/api/v1/organizations/{org_id}` | Get Organization | 200, 422 |
 | PUT | `/api/v1/organizations/{org_id}` | Register Organization | 200, 422 |
@@ -112,6 +113,11 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/quotas` | List Quotas | 200, 422 |
 | PUT | `/api/v1/quotas` | Put Quota | 200, 422 |
 | GET | `/api/v1/quotas/current` | Get Quota | 200, 422 |
+| GET | `/api/v1/research/plans` | List Research Plans | 200, 422 |
+| POST | `/api/v1/research/plans` | Propose Research Plan | 201, 422 |
+| GET | `/api/v1/research/plans/{plan_id}` | Get Research Plan | 200, 422 |
+| POST | `/api/v1/research/plans/{plan_id}/approve` | Approve Research Plan | 200, 422 |
+| POST | `/api/v1/research/plans/{plan_id}/stop` | Stop Research Plan | 200, 422 |
 | POST | `/api/v1/secrets/rotate` | Rotate Secret Credential | 200, 422 |
 | GET | `/api/v1/session` | Session Authority | 200, 422 |
 | GET | `/api/v1/system/invariants` | Fleet Invariants | 200 |

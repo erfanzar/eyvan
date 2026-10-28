@@ -39,6 +39,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    ResearchPlanRecord,
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
@@ -85,6 +86,8 @@ class ControlPlaneState:
     assistant_providers: dict[str, AssistantProviderRecord] = field(default_factory=dict)
     #: Users' saved assistant chats (id -> conversation); each is owner-only.
     assistant_conversations: dict[str, AssistantConversationRecord] = field(default_factory=dict)
+    #: Users' budgeted research plans (id -> plan); owner-scoped, admins see all.
+    research_plans: dict[str, ResearchPlanRecord] = field(default_factory=dict)
     organizations: dict[str, OrganizationRecord] = field(default_factory=dict)
     #: Keyed by (org, project): project names are unique only within a tenant,
     #: and two organizations both having a "research" project is the ordinary case.
@@ -350,6 +353,25 @@ class StateSession(RepositorySession):
 
     async def delete_assistant_conversation(self, conversation_id: str) -> bool:
         return self._state.assistant_conversations.pop(conversation_id, None) is not None
+
+    async def get_research_plan(self, plan_id: str) -> ResearchPlanRecord | None:
+        return self._state.research_plans.get(plan_id)
+
+    async def list_research_plans(
+        self, *, subject: str | None = None, states: frozenset[str] | None = None
+    ) -> list[ResearchPlanRecord]:
+        items = (
+            item
+            for item in self._state.research_plans.values()
+            if (subject is None or item.subject == subject) and (states is None or item.state in states)
+        )
+        return sorted(items, key=lambda item: (item.created_at, item.id))
+
+    async def put_research_plan(self, plan: ResearchPlanRecord) -> None:
+        self._state.research_plans[plan.id] = plan
+
+    async def delete_research_plan(self, plan_id: str) -> bool:
+        return self._state.research_plans.pop(plan_id, None) is not None
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None:
         return self._state.organizations.get(org_id)

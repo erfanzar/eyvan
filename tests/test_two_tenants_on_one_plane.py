@@ -256,6 +256,18 @@ EXEMPT_ROUTES: dict[str, str] = {
     "POST /api/v1/team/requests/{request_id}/resolve": (
         "approve/decline needs fleet admin, withdraw only the filer's own request (test_assistant)"
     ),
+    "POST /api/v1/research/plans": (
+        "proposes a plan owned by the caller; needs SUBMIT in that project (test_research_plans)"
+    ),
+    "GET /api/v1/research/plans": "the caller's own plans; everyone's only for a fleet admin (test_research_plans)",
+    "GET /api/v1/research/plans/{plan_id}": ("owner or fleet admin; anyone else gets 404 (test_research_plans)"),
+    "POST /api/v1/research/plans/{plan_id}/approve": "owner only; others get 403/404 (test_research_plans)",
+    "POST /api/v1/research/plans/{plan_id}/stop": "owner or fleet admin; anyone else gets 404 (test_research_plans)",
+    "POST /api/v1/mcp": (
+        "every tool runs as the authenticated caller through the service, which refuses other tenants (test_mcp_server)"
+    ),
+    "GET /api/v1/mcp": "static 405; no server-initiated stream and no data",
+    "DELETE /api/v1/mcp": "static 405; the endpoint is sessionless and holds no data",
 }
 
 FLEET_ONLY_ROUTES.update(

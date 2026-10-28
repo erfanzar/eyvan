@@ -125,6 +125,9 @@ from eyvan.server.api.dashboard_sessions import (
     DashboardSessionStore,
     register_dashboard_auth_routes,
 )
+from eyvan.server.api.mcp_routes import register_mcp_routes
+from eyvan.server.api.research_routes import register_research_routes
+from eyvan.server.api.research_runner import ResearchRunner
 from eyvan.server.api.schemas import (
     ArtifactHoldRequest,
     ArtifactInventoryReindexRequest,
@@ -745,6 +748,13 @@ def create_app(
         task = (
             asyncio.create_task(controller.run(stop), name="eyvan-controller") if settings.controller_enabled else None
         )
+        # Research plans run beside the controller, only while this replica holds its leadership.
+        _app.state.research_runner = ResearchRunner(service, app=_app, leader=controller.leader)
+        research_task = (
+            asyncio.create_task(_app.state.research_runner.run(stop), name="eyvan-research")
+            if settings.controller_enabled
+            else None
+        )
         if startup.development_auth_mode is DevelopmentAuthMode.LOOPBACK_DEFAULT:
             logger.info(
                 "Eyvan loopback development auth enabled; owner credential and local identity headers are required"
@@ -764,6 +774,8 @@ def create_app(
             yield
         finally:
             stop.set()
+            if research_task is not None:
+                await research_task
             if task is not None:
                 await task
             await controller.close()
@@ -792,6 +804,8 @@ def create_app(
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     register_team_routes(app, settings=settings, service=service)
     register_assistant_routes(app, settings=settings, service=service)
+    register_research_routes(app, settings=settings, service=service)
+    register_mcp_routes(app, settings=settings, service=service)
     # The seam that makes durable grants real. Without it the records exist, the
     # routes issue them, and no request is ever authorized by one.
     app.state.grant_resolver = service.active_grants_for

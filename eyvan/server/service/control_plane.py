@@ -29,6 +29,7 @@ from eyvan.server.service._control_plane.lease_settlement import LeaseSettlement
 from eyvan.server.service._control_plane.leases import LeasesMixin
 from eyvan.server.service._control_plane.policies import PoliciesMixin
 from eyvan.server.service._control_plane.reporting import ReportingMixin
+from eyvan.server.service._control_plane.research import ResearchPlansMixin
 from eyvan.server.service._control_plane.scheduling import SchedulingMixin
 from eyvan.server.service._control_plane.services import ServicesMixin
 from eyvan.server.service._control_plane.shared import (
@@ -753,6 +754,7 @@ class ControlPlaneService(
     AccountsMixin,
     AssistantProvidersMixin,
     AssistantConversationsMixin,
+    ResearchPlansMixin,
     TeamRequestsMixin,
     GovernanceMixin,
     SchedulingMixin,

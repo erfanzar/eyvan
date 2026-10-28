@@ -5550,6 +5550,86 @@
         "title": "ProjectUsageReport",
         "type": "object"
       },
+      "ProposeResearchBody": {
+        "additionalProperties": false,
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/ResearchBudget"
+          },
+          "goal": {
+            "default": "",
+            "maxLength": 8000,
+            "title": "Goal",
+            "type": "string"
+          },
+          "iterate": {
+            "default": false,
+            "title": "Iterate",
+            "type": "boolean"
+          },
+          "jobs": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Jobs",
+            "type": "array"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "org_id": {
+            "default": "default",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Org Id",
+            "type": "string"
+          },
+          "project_id": {
+            "default": "default",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Project Id",
+            "type": "string"
+          },
+          "provider_id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Id"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "jobs",
+          "budget"
+        ],
+        "title": "ProposeResearchBody",
+        "type": "object"
+      },
       "ProviderCreateBody": {
         "additionalProperties": false,
         "properties": {
@@ -6270,6 +6350,50 @@
           "summary"
         ],
         "title": "RequestBody",
+        "type": "object"
+      },
+      "ResearchBudget": {
+        "additionalProperties": false,
+        "description": "What a research plan may spend; enforced by the plane, never by the model.",
+        "properties": {
+          "max_chip_hours": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 10000000.0,
+            "title": "Max Chip Hours",
+            "type": "number"
+          },
+          "max_jobs": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Jobs",
+            "type": "integer"
+          },
+          "max_rounds": {
+            "anyOf": [
+              {
+                "maximum": 20.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Rounds"
+          },
+          "max_wall_seconds": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 2592000.0,
+            "title": "Max Wall Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_jobs",
+          "max_chip_hours",
+          "max_wall_seconds"
+        ],
+        "title": "ResearchBudget",
         "type": "object"
       },
       "ResolveBody": {
@@ -7312,6 +7436,19 @@
           }
         },
         "title": "SizeBody",
+        "type": "object"
+      },
+      "StopResearchBody": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "StopResearchBody",
         "type": "object"
       },
       "StreamChatBody": {
@@ -13866,6 +14003,26 @@
         ]
       }
     },
+    "/api/v1/mcp": {
+      "post": {
+        "description": "MCP Streamable HTTP endpoint: one JSON-RPC message per POST, tools run as the caller.",
+        "operationId": "mcp_endpoint_api_v1_mcp_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Mcp Endpoint",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
     "/api/v1/organizations": {
       "get": {
         "description": "List tenants the caller has any grant for; everything, for a fleet admin.",
@@ -14715,6 +14872,252 @@
         "summary": "Get Quota",
         "tags": [
           "governance"
+        ]
+      }
+    },
+    "/api/v1/research/plans": {
+      "get": {
+        "description": "Your plans (fleet admins see everyone's), oldest first.",
+        "operationId": "list_research_plans_api_v1_research_plans_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Research Plans Api V1 Research Plans Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Research Plans",
+        "tags": [
+          "research"
+        ]
+      },
+      "post": {
+        "description": "Propose a plan; every job spec is validated now. Nothing runs until its owner approves it.",
+        "operationId": "propose_research_plan_api_v1_research_plans_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeResearchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Propose Research Plan Api V1 Research Plans Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose Research Plan",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/plans/{plan_id}": {
+      "get": {
+        "description": "One plan: its jobs and their workloads' states, spend against budget, and notes.",
+        "operationId": "get_research_plan_api_v1_research_plans__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Research Plan Api V1 Research Plans  Plan Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Research Plan",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/plans/{plan_id}/approve": {
+      "post": {
+        "description": "Approve a proposed plan (owner only); the plane then submits and iterates it as you.",
+        "operationId": "approve_research_plan_api_v1_research_plans__plan_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Approve Research Plan Api V1 Research Plans  Plan Id  Approve Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve Research Plan",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/plans/{plan_id}/stop": {
+      "post": {
+        "description": "Stop a plan (owner or fleet admin); its running workloads are cancelled now.",
+        "operationId": "stop_research_plan_api_v1_research_plans__plan_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/StopResearchBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Stop Research Plan Api V1 Research Plans  Plan Id  Stop Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Research Plan",
+        "tags": [
+          "research"
         ]
       }
     },

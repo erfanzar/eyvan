@@ -34,6 +34,7 @@ from eyvan.records import (
     PolicyRecord,
     ProjectRecord,
     QuotaRecord,
+    ResearchPlanRecord,
     RoleGrantRecord,
     ServiceDecisionRecord,
     ServiceReplicaHealthRecord,
@@ -212,6 +213,16 @@ class RepositorySession(tp.Protocol):
     async def put_assistant_conversation(self, conversation: AssistantConversationRecord) -> None: ...
 
     async def delete_assistant_conversation(self, conversation_id: str) -> bool: ...
+
+    async def get_research_plan(self, plan_id: str) -> ResearchPlanRecord | None: ...
+
+    async def list_research_plans(
+        self, *, subject: str | None = None, states: frozenset[str] | None = None
+    ) -> list[ResearchPlanRecord]: ...
+
+    async def put_research_plan(self, plan: ResearchPlanRecord) -> None: ...
+
+    async def delete_research_plan(self, plan_id: str) -> bool: ...
 
     async def get_organization(self, org_id: str) -> OrganizationRecord | None: ...
 
