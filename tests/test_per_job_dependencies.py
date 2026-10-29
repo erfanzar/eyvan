@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import typing as tp
 from pathlib import Path
 
 import pytest
@@ -281,6 +282,175 @@ def test_the_wrapper_runs_before_the_workspace_entry() -> None:
 
     assert wrapped.index("dependency_entry") < wrapped.index("workspace_entry")
     assert wrapped.endswith("-- python train.py -- --fast")
+
+
+_FAKE_WRAPPER_PYTHON = """#!/bin/sh
+# Stands in for `python -m <entry> ... -- COMMAND`: marks the environment, then
+# execs what follows its `--`, as the real dependency/workspace entries do.
+[ "$1" = -I ] && shift
+[ "$1" = -m ] || exit 97
+case "$2" in
+  eyvan.worker.runtime.dependency_entry) export INSIDE_DEPENDENCIES=1 ;;
+  eyvan.worker.runtime.workspace_entry) export INSIDE_WORKSPACE=1 ;;
+  *) exit 98 ;;
+esac
+shift 2
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+"""
+
+
+def _run_through_host_shell(tmp_path: Path, entrypoint: str) -> str:
+    """Run an entrypoint the way the native host does (`/bin/sh -c`), with the fake wrapper first on PATH."""
+
+    import subprocess
+
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    fake = binaries / "python"
+    fake.write_text(_FAKE_WRAPPER_PYTHON, encoding="utf-8")
+    fake.chmod(0o755)
+    environment = {"PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin"}
+    completed = subprocess.run(
+        ["/bin/sh", "-c", entrypoint], cwd=tmp_path, env=environment, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    return (tmp_path / "seen.txt").read_text(encoding="utf-8")
+
+
+#: Every line must run with the packages it declared. Seen live on a v5p-32 on
+#: 2026-10-29: a rendered EasyDeL launch script was appended unquoted after the
+#: wrapper's `--`, so only its first line (`set -e`, a builtin execvp cannot
+#: find) went through the wrapper and the rest ran on the bare worker Python
+#: with `No module named 'easydel'`.
+_COMPOUND_COMMANDS = (
+    'set -e\necho "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt\necho "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
+    'echo "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt && echo "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
+    'MARK=1; echo "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt; echo "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
+    'cd . && echo "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt | true; echo "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
+)
+
+
+@pytest.mark.parametrize("command", _COMPOUND_COMMANDS)
+def test_every_part_of_a_compound_command_runs_with_its_packages(tmp_path, command) -> None:
+    seen = _run_through_host_shell(tmp_path, _entrypoint("flax", command=command))
+
+    assert "a=no" not in seen and "b=no" not in seen, seen
+    assert "b=1" in seen
+
+
+def test_a_compound_command_runs_inside_both_the_workspace_and_its_packages(tmp_path) -> None:
+    """The workspace entry appended the command the same way and had the same flaw."""
+
+    from eyvan.records import WorkspaceRef
+    from eyvan.server.controller.workload_commands import _ControllerWorkloadCommands
+
+    command = (
+        "set -e\n"
+        'echo "ws=${INSIDE_WORKSPACE:-no} deps=${INSIDE_DEPENDENCIES:-no}" > seen.txt\n'
+        'echo "ws=${INSIDE_WORKSPACE:-no} deps=${INSIDE_DEPENDENCIES:-no}" >> seen.txt'
+    )
+    workspace = WorkspaceRef(uri="file:///w.tar.gz", sha256="0" * 64)
+    inner, _environment = _ControllerWorkloadCommands._workspace_entrypoint(
+        tp_cast_any(object()), tp_cast_any(None), workspace, command, {}
+    )
+    seen = _run_through_host_shell(tmp_path, _ControllerWorkloadCommands._dependency_entrypoint(("flax",), inner))
+
+    assert seen.splitlines() == ["ws=1 deps=1", "ws=1 deps=1"]
+
+
+_MULTIHOST_HOOK = """import os
+if os.environ.get("EYVAN_JAX_MULTIHOST") == "1":
+    # Like eyvan_multihost: consume the marker, then join (here: record which process joined).
+    os.environ.pop("EYVAN_JAX_MULTIHOST")
+    with open(os.environ["HOOK_LOG"], "a") as handle:
+        handle.write(os.environ.get("VIRTUAL_ENV", "outside-the-job-environment") + "\\n")
+"""
+
+
+def test_the_multihost_join_runs_in_the_job_not_in_the_dependency_wrapper(tmp_path) -> None:
+    """Seen live on a v5p-32 on 2026-10-29: no job declaring ``dependencies`` ever joined its gang.
+
+    The wrapper is itself a Python interpreter on the job's ``PYTHONPATH``, so
+    Eyvan's multi-host ``sitecustomize`` ran *there*: it consumed
+    ``EYVAN_JAX_MULTIHOST`` and died on ``import jax`` (the worker venv has
+    none, printing "Error in sitecustomize"), and the job it then exec'd found
+    no marker and never joined. Real interpreter, real ``sitecustomize``, real
+    dependency entry over a prepared environment.
+    """
+
+    import subprocess
+
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    shim = binaries / "python"
+    shim.write_text(f'#!/bin/sh\nexec {sys.executable} "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    hook_directory = tmp_path / "multihost"
+    hook_directory.mkdir()
+    (hook_directory / "sitecustomize.py").write_text(_MULTIHOST_HOOK, encoding="utf-8")
+    (tmp_path / "job.py").write_text(
+        "import os\nopen('job.txt', 'w').write(os.environ.get('EYVAN_JAX_MULTIHOST', 'consumed'))\n",
+        encoding="utf-8",
+    )
+    environments = tmp_path / "envs"
+    environments.mkdir()
+    base = {"PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(tmp_path)}
+    # Prepared ahead, so nothing is installed: the key is computed by the same interpreter the wrapper runs.
+    key = subprocess.run(
+        [
+            str(shim),
+            "-I",
+            "-c",
+            "from eyvan.worker.runtime.dependency_entry import environment_key; "
+            "print(environment_key(['eyvan-test-requirement']))",
+        ],
+        env=base,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    environment = environments / key
+    environment.mkdir()
+    (environment / dependency_entry.COMPLETE_MARKER).write_text("eyvan-test-requirement", encoding="utf-8")
+    job_environment = {
+        **base,
+        "PYTHONPATH": str(hook_directory),
+        "EYVAN_JAX_MULTIHOST": "1",
+        "EYVAN_RUNTIME_ENV_DIR": str(environments),
+        "HOOK_LOG": str(tmp_path / "hooks.txt"),
+    }
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", _entrypoint("eyvan-test-requirement", command="python job.py")],
+        cwd=tmp_path,
+        env=job_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    joined = (tmp_path / "hooks.txt").read_text(encoding="utf-8").splitlines()
+    assert joined == [str(environment)], "the hook must run once, inside the job's own environment"
+    assert (tmp_path / "job.txt").read_text(encoding="utf-8") == "consumed"
+
+
+def tp_cast_any(value: object) -> tp.Any:
+    """Hand the unbound helper a stand-in where only file:// workspaces are exercised."""
+
+    return value
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("python train.py", "python tool.py -- --fast", "'jax>=0.4' --flag"),
+)
+def test_a_plain_command_is_still_appended_verbatim(command) -> None:
+    """One exec'd program keeps the PID systemd started; only shell syntax needs a shell."""
+
+    assert _entrypoint("flax", command=command).endswith(" -- " + command)
 
 
 def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path, monkeypatch) -> None:

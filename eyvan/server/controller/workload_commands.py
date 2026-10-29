@@ -81,6 +81,94 @@ _SECRET_MATERIALIZING_EXECUTORS = frozenset({"eyvan-native"})
 _DISPATCH_RESERVATION_KEY = "dispatch_reservation"
 _RETRIABLE_DISPATCH_OUTBOX_STATES = frozenset({OutboxState.PENDING, OutboxState.PROCESSING, OutboxState.FAILED})
 
+#: Characters that mean something to a shell when they appear unquoted. A
+#: command containing one is shell syntax, not one program and its arguments.
+_SHELL_SYNTAX = frozenset("\n;&|<>()$`*?[]{}~#")
+
+#: First words execvp cannot run because the shell itself implements them.
+_SHELL_ONLY_FIRST_WORDS = frozenset(
+    {
+        ".", ":", "!", "{", "[[", "alias", "break", "case", "cd", "command", "continue", "eval", "exec", "exit",
+        "export", "for", "function", "if", "read", "readonly", "return", "set", "shift", "source", "times", "trap",
+        "type", "ulimit", "umask", "unset", "until", "wait", "while",
+    }
+)  # fmt: skip
+
+
+#: Isolated mode for the wrapper interpreters (dependency and workspace entries).
+#: They run on the job's environment, whose ``PYTHONPATH`` carries Eyvan's
+#: multi-host ``sitecustomize``. Without ``-I`` that hook ran in the *wrapper*:
+#: it consumed ``EYVAN_JAX_MULTIHOST``, failed on ``import jax`` (the worker venv
+#: has none) and the job exec'd afterwards never joined its gang -- seen on every
+#: dependency-declaring job on a v5p-32 on 2026-10-29. ``-I`` only changes how
+#: the wrapper itself starts; the environment it execs the job with is untouched.
+_WRAPPER_INTERPRETER_FLAGS = ("-I",)
+
+
+def _needs_shell(command: str) -> bool:
+    """Return whether ``command`` uses shell syntax rather than naming one program.
+
+    Scans for unquoted shell metacharacters, honouring single quotes, double
+    quotes (where ``$`` and backticks still expand) and backslash escapes, then
+    checks whether the first word is a variable assignment or a shell builtin.
+    """
+
+    quote: str | None = None
+    escaped = False
+    for character in command:
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = None
+            elif character in "$`":
+                return True
+            continue
+        if character in "'\"":
+            quote = character
+        elif character in _SHELL_SYNTAX:
+            return True
+    if quote is not None or escaped:
+        # Unbalanced: let the shell report it rather than guessing at a split.
+        return True
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return True
+    if not words:
+        return True
+    first = words[0]
+    name, assigns, _ = first.partition("=")
+    return first in _SHELL_ONLY_FIRST_WORDS or bool(assigns and name.isidentifier())
+
+
+def _exec_argument(command: str) -> str:
+    """Return ``command`` in the form a wrapper's ``-- COMMAND`` tail must take.
+
+    The wrappers ``exec`` what follows their ``--``, and the whole entrypoint
+    reaches the host as ``/bin/sh -c``. Appending shell syntax unquoted handed
+    only its first simple command to the wrapper: seen live on a v5p-32 on
+    2026-10-29, a rendered EasyDeL launch script ran ``set -e`` (which execvp
+    cannot find) inside the dependency wrapper and every later line on the bare
+    worker Python, where ``easydel`` did not exist. Such a command now travels
+    as one ``/bin/sh -c`` argument, so all of it runs inside the wrapper. A
+    plain program and its arguments is still appended verbatim; it is exec'd
+    directly and keeps the PID its supervisor started.
+    """
+
+    if not _needs_shell(command):
+        return command
+    return shlex.join(("/bin/sh", "-c", command))
+
+
 #: How many times one workload may be requeued because a cell turned out to
 #: run a stale build. Each such requeue follows a drain of a cell that answered
 #: with a wrong digest, so the honest causes are finite; the limit exists for
@@ -472,11 +560,11 @@ class _ControllerWorkloadCommands:
 
         if not dependencies:
             return command
-        parts = ["python", "-m", "eyvan.worker.runtime.dependency_entry"]
+        parts = ["python", *_WRAPPER_INTERPRETER_FLAGS, "-m", "eyvan.worker.runtime.dependency_entry"]
         for requirement in dependencies:
             parts.extend(("--require", requirement))
         parts.append("--")
-        return " ".join(shlex.quote(part) for part in parts) + " " + command
+        return " ".join(shlex.quote(part) for part in parts) + " " + _exec_argument(command)
 
     def _workspace_entrypoint(
         self,
@@ -494,6 +582,7 @@ class _ControllerWorkloadCommands:
 
         parts = [
             "python",
+            *_WRAPPER_INTERPRETER_FLAGS,
             "-m",
             "eyvan.worker.runtime.workspace_entry",
             "--workspace-sha256",
@@ -523,7 +612,7 @@ class _ControllerWorkloadCommands:
         else:
             parts.extend(("--workspace-uri", workspace.uri))
         parts.append("--")
-        return " ".join(shlex.quote(part) for part in parts) + " " + command, environment
+        return " ".join(shlex.quote(part) for part in parts) + " " + _exec_argument(command), environment
 
     def _refuse_unreachable_callback(self, workload: WorkloadRecord, cell: CellRecord) -> None:
         """Refuse a dispatch whose callback URL the target cell cannot reach.
