@@ -74,16 +74,54 @@ export function formatDurationSeconds(seconds: number | null | undefined): strin
   return hours % 24 ? `${days} d ${hours % 24} h` : `${days} d`;
 }
 
-/** Chip-hours with at most two decimals: "1 chip-hour", "0.25 chip-hours". */
+/**
+ * How many decimals a chip-hour figure needs: two, unless rounding to two
+ * would turn a fraction into a whole number (0.996 -> "1", 0.004 -> "0") or
+ * lift a figure under `below` up to it. Either would show spend that is
+ * still under a limit as having reached it, or real spend as none.
+ */
+function chipHourDigits(value: number, below?: number): number {
+  for (let digits = 2; digits < 6; digits += 1) {
+    const rounded = Math.round(value * 10 ** digits) / 10 ** digits;
+    const becomesWhole = Number.isInteger(rounded) && !Number.isInteger(value);
+    const reachesLimit = below !== undefined && value < below && rounded >= below;
+    if (!becomesWhole && !reachesLimit) return digits;
+  }
+  return 6;
+}
+
+/**
+ * Chip-hours, usually with at most two decimals: "1 chip-hour", "0.25 chip-hours".
+ * A figure nobody could compute is "unknown", never zero.
+ */
 export function formatChipHours(value: number, unit = true): string {
-  const rounded = Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
-  const text = rounded.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  return unit ? `${text} chip-hour${rounded === 1 ? "" : "s"}` : text;
+  if (typeof value !== "number" || !Number.isFinite(value)) return unit ? "unknown chip-hours" : "unknown";
+  const text = value.toLocaleString("en-US", { maximumFractionDigits: chipHourDigits(value) });
+  return unit ? `${text} chip-hour${text === "1" ? "" : "s"}` : text;
+}
+
+/** Spend and its limit as chip-hour figures, precise enough that spend under the limit never reads as equal to it. */
+export function formatChipHoursAgainst(spent: number, limit: number): [string, string] {
+  const limitText = formatChipHours(limit, false);
+  if (typeof spent !== "number" || !Number.isFinite(spent)) return ["unknown", limitText];
+  const digits = chipHourDigits(spent, Number.isFinite(limit) ? limit : undefined);
+  return [spent.toLocaleString("en-US", { maximumFractionDigits: digits }), limitText];
 }
 
 export function percent(value: number, total: number): number {
   if (total <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((value / total) * 100)));
+}
+
+/**
+ * The share of a limit used, rounded down so a figure under the limit never
+ * reads 100%; null (unknown) when either side is not a finite number.
+ */
+export function knownPercent(value: number, total: number): number | null {
+  if (typeof value !== "number" || typeof total !== "number") return null;
+  if (!Number.isFinite(value) || !Number.isFinite(total)) return null;
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.floor((value / total) * 100 + 1e-9)));
 }
 
 export function titleCase(value: string): string {

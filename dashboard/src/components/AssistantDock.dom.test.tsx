@@ -561,6 +561,29 @@ describe("AssistantDock", () => {
     expect(within(card).getByRole("button", { name: "Stop" })).toBeTruthy();
   });
 
+  it("says a saved plan card's reading failed and withholds Approve", async () => {
+    localStorage.setItem(ACTIVE_CONVERSATION_KEY, "conv_9");
+    const client = {
+      ...mockClient(),
+      getResearchPlan: vi.fn(async (): Promise<ResearchPlan> => {
+        throw new Error("Eyvan API request failed with 503");
+      }),
+    };
+    client.getAssistantConversation.mockResolvedValueOnce({
+      ...CONVERSATION,
+      messages: [
+        CONVERSATION.messages[0],
+        { ...CONVERSATION.messages[1], drafts: undefined, plans: [{ ...PLAN, state: "proposed" }] },
+      ],
+    });
+    renderDock(client, { currentSubject: "alice" });
+    const card = await screen.findByTestId("assistant-plan");
+    const note = await within(card).findByRole("status");
+    expect(note.textContent).toContain("Couldn't read this plan's current state; showing it as proposed at");
+    expect(within(card).queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(within(card).getByRole("button", { name: "Withdraw" })).toBeTruthy();
+  });
+
   it("tells an admin to set up a provider and everyone else to ask an admin", async () => {
     const onOpenSettings = vi.fn();
     renderDock(mockClient(answer("ok"), []), { canAdminister: true, onOpenSettings });

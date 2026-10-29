@@ -1083,6 +1083,7 @@ export class EyvanApiClient {
 
   /** Approve a proposed plan (its owner only); nothing ran before this. */
   async approveResearchPlan(planId: string): Promise<ResearchPlan> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no research plan to approve", 400);
     return this.attachmentRequest<ResearchPlan>(`/api/v1/research/plans/${encodeURIComponent(planId)}/approve`, {
       method: "POST",
     });
@@ -1090,6 +1091,7 @@ export class EyvanApiClient {
 
   /** Stop a plan (owner or fleet admin); the plane cancels its running workloads. */
   async stopResearchPlan(planId: string, reason = ""): Promise<ResearchPlan> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no research plan to stop", 400);
     return this.attachmentRequest<ResearchPlan>(`/api/v1/research/plans/${encodeURIComponent(planId)}/stop`, {
       method: "POST",
       body: JSON.stringify({ reason }),

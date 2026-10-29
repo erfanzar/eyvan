@@ -910,6 +910,59 @@ describe("App scope and authority race guards", () => {
     expect(calls.getSessionAuthority.mock.calls.length).toBeGreaterThanOrEqual(3);
   });
 
+  it.each(["approve", "stop"] as const)(
+    "re-resolves authority when the plane refuses to %s a research plan",
+    async (action) => {
+      window.location.hash = "#/research/rp_0123456789abcdef";
+      const operator = authority("project_operator");
+      const { client, calls } = fakeClient(operator);
+      const plan = {
+        id: "rp_0123456789abcdef",
+        title: "lr sweep",
+        subject: "alice",
+        org_id: "acme",
+        project_id: "research",
+        state: action === "approve" ? "proposed" : "running",
+        iterate: false,
+        provider_id: null,
+        model: null,
+        current_round: 0,
+        jobs_planned: 1,
+        budget: { max_jobs: 1, max_chip_hours: 1, max_wall_seconds: 600, max_rounds: null },
+        spent: { chip_hours: 0, jobs_submitted: 0, rounds: 0 },
+        stop_reason: null,
+        approved_at: null,
+        approved_by: null,
+        started_at: null,
+        finished_at: null,
+        created_at: "2026-10-28T10:00:00+00:00",
+        updated_at: "2026-10-28T10:00:00+00:00",
+        goal: "",
+        jobs: [],
+        workload_ids: [],
+        remaining: { jobs: 1, chip_hours: 1 },
+        notes: [],
+      };
+      const refused = vi.fn(async () => {
+        throw new ApiError("research permission revoked", 403);
+      });
+      Object.assign(client, {
+        listResearchPlans: vi.fn(async () => []),
+        getResearchPlan: vi.fn(async () => plan),
+        approveResearchPlan: action === "approve" ? refused : vi.fn(),
+        stopResearchPlan: action === "stop" ? refused : vi.fn(),
+      });
+      renderApp(client);
+
+      const label = action === "approve" ? "Approve" : "Stop";
+      fireEvent.click(await screen.findByRole("button", { name: label }));
+      const before = calls.getSessionAuthority.mock.calls.length;
+      fireEvent.click(screen.getByRole("button", { name: `Confirm ${action}` }));
+      await waitFor(() => expect(refused).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(calls.getSessionAuthority.mock.calls.length).toBeGreaterThan(before));
+    },
+  );
+
   it("keeps one scoped SSE subscription when refresh decodes fresh scope objects", async () => {
     const session = authority("project_viewer");
     const followEvents = vi.fn(

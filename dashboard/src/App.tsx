@@ -1019,8 +1019,16 @@ export default function App({ client = apiClient, identityProvider = currentIden
     (planId: string, signal: AbortSignal) => withAuthorityRefresh(() => client.getResearchPlan(planId, signal)),
     [client, withAuthorityRefresh],
   );
-  const approveResearchPlan = useCallback((planId: string) => client.approveResearchPlan(planId), [client]);
-  const stopResearchPlan = useCallback((planId: string) => client.stopResearchPlan(planId), [client]);
+  // Actions re-resolve authority on a 403 exactly like the loads, so a revoked
+  // grant cannot leave stale Approve/Stop controls on screen.
+  const approveResearchPlan = useCallback(
+    (planId: string) => withAuthorityRefresh(() => client.approveResearchPlan(planId)),
+    [client, withAuthorityRefresh],
+  );
+  const stopResearchPlan = useCallback(
+    (planId: string) => withAuthorityRefresh(() => client.stopResearchPlan(planId)),
+    [client, withAuthorityRefresh],
+  );
   const loadRun = useCallback(
     (id: string, signal: AbortSignal) => client.getRun(id, fleetScope, signal),
     [client, fleetScope.orgId, fleetScope.projectId],

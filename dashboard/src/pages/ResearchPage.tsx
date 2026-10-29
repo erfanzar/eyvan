@@ -4,18 +4,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ArrowLeft } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState, LoadingState } from "../components/PageState";
 import { ProgressBar } from "../components/ProgressBar";
-import { ACTIVE_PLAN_STATES, PlanActions, ResearchStateBadge, budgetSummary } from "../components/ResearchPlanCard";
-import { formatChipHours, formatDateTime, formatDurationSeconds, percent } from "../lib/format";
+import {
+  ACTIVE_PLAN_REFRESH_MS,
+  ACTIVE_PLAN_STATES,
+  PlanActions,
+  ResearchStateBadge,
+  budgetSummary,
+  isOlderReading,
+  plural,
+  stopReasonLabel,
+} from "../components/ResearchPlanCard";
+import {
+  formatChipHours,
+  formatChipHoursAgainst,
+  formatDateTime,
+  formatDurationSeconds,
+  knownPercent,
+} from "../lib/format";
 import { useVisibilityPolling } from "../lib/useVisibilityPolling";
-import type { ResearchPlan, ResearchPlanSummary } from "../types";
+import type { ResearchPlan, ResearchPlanNote, ResearchPlanSummary } from "../types";
 
 /** How often an open page re-reads a plan the plane is still acting on. */
-export const ACTIVE_PLAN_REFRESH_MS = 5_000;
+export { ACTIVE_PLAN_REFRESH_MS };
 
 export interface ResearchActions {
   approve: (planId: string) => Promise<ResearchPlan>;
@@ -64,7 +79,7 @@ export function ResearchPage({ loadPlans, onOpenPlan, refreshRevision = 0 }: Res
     <div className="page-stack">
       <div className="tracking-meta">
         <span>Research</span>
-        <span>{plans.length} plans</span>
+        <span>{plural(plans.length, "plan")}</span>
         <span>{anyActive ? `Refresh · ${ACTIVE_PLAN_REFRESH_MS / 1000}s while active` : "Refresh · on change"}</span>
       </div>
       {error && (
@@ -116,8 +131,7 @@ export function ResearchPage({ loadPlans, onOpenPlan, refreshRevision = 0 }: Res
                       {plan.spent.jobs_submitted} / {plan.budget.max_jobs}
                     </td>
                     <td className="numeric">
-                      {formatChipHours(plan.spent.chip_hours, false)} /{" "}
-                      {formatChipHours(plan.budget.max_chip_hours, false)}
+                      {formatChipHoursAgainst(plan.spent.chip_hours, plan.budget.max_chip_hours).join(" / ")}
                     </td>
                     <td className="numeric">{plan.current_round}</td>
                     <td className="nowrap">{when(plan.updated_at)}</td>
@@ -138,7 +152,10 @@ export function ResearchPage({ loadPlans, onOpenPlan, refreshRevision = 0 }: Res
 }
 
 function Meter({ label, used, limit, detail }: { label: string; used: number; limit: number; detail: string }) {
-  const value = percent(used, limit);
+  // Rounded down, and red only once the limit is actually reached: spend just
+  // under a limit must not look like a plan the plane has already stopped.
+  const value = knownPercent(used, limit);
+  const reached = value !== null && limit > 0 && used >= limit;
   return (
     <div className="research-meter">
       <div className="research-meter-head">
@@ -148,10 +165,23 @@ function Meter({ label, used, limit, detail }: { label: string; used: number; li
       <ProgressBar
         value={value}
         label={`${label} used`}
-        tone={value >= 100 ? "red" : value >= 80 ? "amber" : "accent"}
+        tone={reached ? "red" : value !== null && value >= 80 ? "amber" : "accent"}
       />
     </div>
   );
+}
+
+/** Notes newest first, keyed by content so a newer note never re-keys the older rows. */
+function keyedNotes(notes: ResearchPlanNote[]): Array<{ key: string; note: ResearchPlanNote }> {
+  const seen = new Map<string, number>();
+  return notes
+    .map((note) => {
+      const base = `${note.t ?? ""}|${note.kind}|${note.text}`;
+      const count = seen.get(base) ?? 0;
+      seen.set(base, count + 1);
+      return { key: count ? `${base}|${count}` : base, note };
+    })
+    .reverse();
 }
 
 function elapsedSeconds(plan: ResearchPlan): number {
@@ -180,24 +210,53 @@ export function ResearchPlanPage({
   canAdminister,
 }: ResearchPlanPageProps) {
   const [plan, setPlan] = useState<ResearchPlan | null>(null);
+  const planRef = useRef<ResearchPlan | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [revision, setRevision] = useState(0);
+  // Every read takes a ticket; an action takes a new one, so a read that was
+  // already in flight when the action answered can never put back the old state.
+  const generation = useRef(0);
+  const inFlight = useRef<AbortController | null>(null);
   const active = plan !== null && ACTIVE_PLAN_STATES.has(plan.state);
   useVisibilityPolling(() => setRevision((value) => value + 1), ACTIVE_PLAN_REFRESH_MS, active);
+
+  /** Show `next` unless it is an older reading than the one already shown. */
+  const show = useCallback((next: ResearchPlan) => {
+    if (planRef.current && isOlderReading(next, planRef.current)) return;
+    planRef.current = next;
+    setPlan(next);
+  }, []);
+
   useEffect(() => {
     const controller = new AbortController();
+    inFlight.current = controller;
+    const ticket = ++generation.current;
+    const stale = () => controller.signal.aborted || ticket !== generation.current;
     loadPlan(planId, controller.signal)
       .then((value) => {
-        if (controller.signal.aborted) return;
-        setPlan(value);
+        if (stale()) return;
+        show(value);
         setError(null);
       })
       .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setError(failure(reason, "Unable to load the research plan"));
+        if (!stale()) setError(failure(reason, "Unable to load the research plan"));
       });
     return () => controller.abort();
-  }, [loadPlan, planId, refreshRevision, revision]);
-  const updated = useCallback((next: ResearchPlan) => setPlan(next), []);
+  }, [loadPlan, planId, refreshRevision, revision, show]);
+
+  const invalidate = useCallback(() => {
+    generation.current += 1;
+    inFlight.current?.abort();
+    inFlight.current = null;
+  }, []);
+  const updated = useCallback(
+    (next: ResearchPlan) => {
+      show(next);
+      // The action's answer is a fresh reading; an earlier refresh failure no longer describes the page.
+      setError(null);
+    },
+    [show],
+  );
 
   if (error && !plan) return <ErrorState message={error.message} onRetry={() => setRevision((value) => value + 1)} />;
   if (!plan) return <LoadingState label="Loading research plan" />;
@@ -237,6 +296,7 @@ export function ResearchPlanPage({
               approve={approve}
               stop={stop}
               onUpdated={updated}
+              onActionStart={invalidate}
             />
           </div>
         </div>
@@ -258,7 +318,7 @@ export function ResearchPlanPage({
           </span>
           {plan.stop_reason && (
             <span>
-              Stop reason <strong>{plan.stop_reason}</strong>
+              {stopReasonLabel(plan.state)} <strong>{plan.stop_reason}</strong>
             </span>
           )}
         </div>
@@ -282,7 +342,7 @@ export function ResearchPlanPage({
             label="Chip-hours"
             used={plan.spent.chip_hours}
             limit={plan.budget.max_chip_hours}
-            detail={`${formatChipHours(plan.spent.chip_hours, false)} of ${formatChipHours(plan.budget.max_chip_hours)}`}
+            detail={`${formatChipHoursAgainst(plan.spent.chip_hours, plan.budget.max_chip_hours)[0]} of ${formatChipHours(plan.budget.max_chip_hours)}`}
           />
           <Meter
             label="Wall time"
@@ -365,8 +425,8 @@ export function ResearchPlanPage({
         </div>
         {plan.notes.length ? (
           <ol className="research-notes">
-            {[...plan.notes].reverse().map((note, index) => (
-              <li key={`${note.t}-${index}`}>
+            {keyedNotes(plan.notes).map(({ key, note }) => (
+              <li key={key}>
                 <span className="research-note-time">{when(note.t)}</span>
                 <span className="research-note-kind">{note.kind}</span>
                 <span>{note.text}</span>

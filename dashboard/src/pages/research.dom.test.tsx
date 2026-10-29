@@ -5,7 +5,8 @@
 
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EyvanApiClient } from "../api/client";
@@ -64,8 +65,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function renderDetail(overrides: Partial<Parameters<typeof ResearchPlanPage>[0]> = {}) {
-  const props = {
+type DetailProps = Parameters<typeof ResearchPlanPage>[0];
+
+function renderDetail(overrides: Partial<DetailProps> = {}) {
+  const props: DetailProps & { rerender?: (ui: ReactElement) => void } = {
     planId: DOCUMENT.id,
     loadPlan: vi.fn(async () => DOCUMENT),
     onBack: vi.fn(),
@@ -76,8 +79,26 @@ function renderDetail(overrides: Partial<Parameters<typeof ResearchPlanPage>[0]>
     canAdminister: false,
     ...overrides,
   };
-  render(<ResearchPlanPage {...props} />);
+  const view = render(<ResearchPlanPage {...props} />);
+  props.rerender = view.rerender;
   return props;
+}
+
+function rerenderDetail(props: ReturnType<typeof renderDetail>, overrides: Partial<DetailProps>) {
+  const { rerender, ...rest } = props;
+  rerender?.(<ResearchPlanPage {...rest} {...overrides} />);
+}
+
+const heading = () => document.querySelector(".research-heading [data-testid=research-state]")?.textContent;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("research routes", () => {
@@ -197,6 +218,107 @@ describe("ResearchPlanPage", () => {
     renderDetail({ loadPlan: async () => Promise.reject(new Error("Eyvan API request failed with 404")) });
     expect((await screen.findByRole("alert")).textContent).toContain("failed with 404");
   });
+
+  it("ignores a detail read that started before Stop and resolved after it", async () => {
+    const slow = deferred<ResearchPlan>();
+    const loadPlan = vi
+      .fn<(id: string, signal: AbortSignal) => Promise<ResearchPlan>>()
+      .mockResolvedValueOnce(DOCUMENT)
+      .mockImplementationOnce(() => slow.promise)
+      .mockResolvedValue(DOCUMENT);
+    const stop = vi.fn(async () => ({
+      ...DOCUMENT,
+      state: "stopping" as const,
+      updated_at: "2026-10-28T10:06:00+00:00",
+    }));
+    const props = renderDetail({ loadPlan, stop });
+    await screen.findAllByTestId("research-job");
+    // A live refresh starts a second read, which is still in flight when Stop answers.
+    rerenderDetail(props, { refreshRevision: 1 });
+    await waitFor(() => expect(loadPlan).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm stop" }));
+    await waitFor(() => expect(heading()).toBe("stopping"));
+    await act(async () => slow.resolve(DOCUMENT));
+    expect(heading()).toBe("stopping");
+    // A later read older than the shown one (not aborted) is ignored as well.
+    rerenderDetail(props, { refreshRevision: 2, loadPlan, stop });
+    await waitFor(() => expect(loadPlan).toHaveBeenCalledTimes(3));
+    await act(async () => undefined);
+    expect(heading()).toBe("stopping");
+  });
+
+  it("clears a stale refresh-failure banner after a successful action", async () => {
+    const loadPlan = vi
+      .fn<(id: string, signal: AbortSignal) => Promise<ResearchPlan>>()
+      .mockResolvedValueOnce(DOCUMENT)
+      .mockRejectedValue(new Error("Eyvan API request failed with 503"));
+    const props = renderDetail({ loadPlan });
+    await screen.findAllByTestId("research-job");
+    rerenderDetail(props, { refreshRevision: 1, loadPlan });
+    expect((await screen.findByRole("alert")).textContent).toContain("Refresh failed");
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm stop" }));
+    await waitFor(() => expect(heading()).toBe("stopping"));
+    expect(screen.queryByText(/Refresh failed/)).toBeNull();
+  });
+
+  it("keeps each note's row when a newer note arrives", async () => {
+    const newer: ResearchPlan = {
+      ...DOCUMENT,
+      updated_at: "2026-10-28T10:03:00+00:00",
+      notes: [...DOCUMENT.notes, { t: "2026-10-28T10:03:00+00:00", kind: "submitted", text: "submitted lr-b" }],
+    };
+    const loadPlan = vi
+      .fn<(id: string, signal: AbortSignal) => Promise<ResearchPlan>>()
+      .mockResolvedValueOnce(DOCUMENT)
+      .mockResolvedValue(newer);
+    const props = renderDetail({ loadPlan });
+    const before = (await screen.findByText("approved by alice")).closest("li");
+    rerenderDetail(props, { refreshRevision: 1, loadPlan });
+    await screen.findByText("submitted lr-b");
+    expect(screen.getByText("approved by alice").closest("li")).toBe(before);
+  });
+
+  it("shows spend just under the budget as under it, and an unreadable figure as unknown", async () => {
+    const spend = (plan: ResearchPlan) => {
+      cleanup();
+      renderDetail({ loadPlan: async () => plan });
+      return screen.findByRole("region", { name: "Spend against budget" });
+    };
+    let region = await spend({ ...DOCUMENT, spent: { ...DOCUMENT.spent, chip_hours: 0.996 } });
+    const chip = within(region).getByRole("progressbar", { name: "Chip-hours used" });
+    expect(region.textContent).not.toContain("1 of 1 chip-hour");
+    expect(region.textContent).toContain("0.996 of 1 chip-hour");
+    expect(chip.querySelector(".progress-red")).toBeNull();
+
+    region = await spend({ ...DOCUMENT, spent: { ...DOCUMENT.spent, chip_hours: 1 } });
+    expect(
+      within(region).getByRole("progressbar", { name: "Chip-hours used" }).querySelector(".progress-red"),
+    ).not.toBeNull();
+
+    region = await spend({ ...DOCUMENT, spent: { ...DOCUMENT.spent, chip_hours: Number.NaN } });
+    const unknown = within(region).getByRole("progressbar", { name: "Chip-hours used" });
+    expect(unknown.hasAttribute("aria-valuenow")).toBe(false);
+    expect(unknown.getAttribute("aria-valuetext")).toBe("unknown");
+    expect(region.textContent).toContain("unknown of 1 chip-hour");
+    expect(region.textContent).not.toContain("NaN");
+  });
+
+  it("labels a failed plan's reason as a failure", async () => {
+    renderDetail({ loadPlan: async () => ({ ...DOCUMENT, state: "failed" as const, stop_reason: "job lr-a failed" }) });
+    const reason = await screen.findByText("job lr-a failed");
+    expect(reason.parentElement?.textContent).toBe("Failed job lr-a failed");
+  });
+});
+
+describe("ResearchPage counts", () => {
+  it('does not say "1 plans"', async () => {
+    render(<ResearchPage loadPlans={async () => [SUMMARY]} onOpenPlan={() => undefined} />);
+    await screen.findByRole("button", { name: "lr sweep" });
+    expect(screen.getByText("1 plan")).toBeTruthy();
+    expect(screen.queryByText("1 plans")).toBeNull();
+  });
 });
 
 describe("research client methods", () => {
@@ -223,6 +345,14 @@ describe("research client methods", () => {
       [`/api/v1/research/plans/${DOCUMENT.id}/approve`, "POST", undefined],
       [`/api/v1/research/plans/${DOCUMENT.id}/stop`, "POST", JSON.stringify({ reason: "enough" })],
     ]);
+  });
+
+  it("never sends approve or stop in demo mode", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    const demo = new EyvanApiClient("/api/v1", true);
+    await expect(demo.approveResearchPlan("rp_x")).rejects.toMatchObject({ status: 400 });
+    await expect(demo.stopResearchPlan("rp_x")).rejects.toMatchObject({ status: 400 });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("surfaces the plane's refusal detail", async () => {

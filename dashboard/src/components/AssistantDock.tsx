@@ -119,7 +119,8 @@ export type ChatItem =
   | AssistantAnswer
   | { kind: "draft"; id: string; draft: AssistantDraft; status: DraftStatus; workloadId?: string; error?: string }
   | { kind: "request"; id: string; request: TeamRequest }
-  | { kind: "plan"; id: string; plan: ResearchPlanSummary };
+  /** `saved`: restored from a saved conversation, so `plan` is the proposal-time reading. */
+  | { kind: "plan"; id: string; plan: ResearchPlanSummary; saved?: boolean };
 
 type Selection = { provider_id: string; model: string };
 
@@ -178,7 +179,9 @@ export function itemsFromConversation(conversation: AssistantConversation): Chat
       ...(saved.requests ?? []).map(
         (request, index): ChatItem => ({ kind: "request", id: `${saved.id}-request-${index}`, request }),
       ),
-      ...(saved.plans ?? []).map((plan, index): ChatItem => ({ kind: "plan", id: `${saved.id}-plan-${index}`, plan })),
+      ...(saved.plans ?? []).map(
+        (plan, index): ChatItem => ({ kind: "plan", id: `${saved.id}-plan-${index}`, plan, saved: true }),
+      ),
     ];
   });
 }
@@ -1038,6 +1041,7 @@ export function AssistantDock({
                       approve={(planId) => client.approveResearchPlan(planId)}
                       stop={(planId) => client.stopResearchPlan(planId)}
                       refresh={refreshPlan}
+                      saved={item.saved}
                       onUpdated={(updated) =>
                         setItems((existing) =>
                           existing.map((entry) =>

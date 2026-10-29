@@ -5316,6 +5316,11 @@ body.dock-resizing {
   color: var(--accent-fg);
   font-size: var(--text-2xs);
 }
+.research-stale {
+  margin: 0;
+  color: var(--amber);
+  font-size: var(--text-2xs);
+}
 .research-card-link {
   align-self: flex-start;
   font-size: var(--text-2xs);
