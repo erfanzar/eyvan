@@ -29,6 +29,7 @@ import copy
 import difflib
 import functools
 import json
+import math
 import shlex
 from collections.abc import Mapping, Sequence
 from importlib import resources
@@ -484,6 +485,18 @@ def _kind(value: Any) -> str:
     return type(value).__name__
 
 
+def _has_nonfinite(value: Any) -> bool:
+    """Whether a value is, or contains, a NaN or infinite float."""
+
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, list | tuple):
+        return any(_has_nonfinite(item) for item in value)
+    if isinstance(value, Mapping):
+        return any(_has_nonfinite(item) for item in value.values())
+    return False
+
+
 def _choices_for(trainer_id: str, name: str, entry: Mapping[str, Any]) -> tuple[list[Any], bool] | None:
     if entry.get("choices"):
         return list(entry["choices"]), bool(entry.get("choices_allow_list"))
@@ -550,6 +563,13 @@ def validate_trainer_arguments(trainer_id: str, arguments: Mapping[str, Any]) ->
             continue
         entry = fields[key][0]
         kind = _kind(value)
+        if _has_nonfinite(value):
+            # YAML writes these as .nan/.inf and EasyDeL accepts them, so a NaN
+            # learning rate would otherwise become a "runnable" job that trains garbage.
+            type_warnings.append(
+                {"field": key, "value_type": "non-finite number", "expected": entry.get("type"), "accepts": ["finite"]}
+            )
+            continue
         accepts = entry.get("accepts")
         if accepts is not None and kind not in accepts:
             type_warnings.append({"field": key, "value_type": kind, "expected": entry["type"], "accepts": accepts})

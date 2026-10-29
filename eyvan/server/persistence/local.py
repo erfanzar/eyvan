@@ -1508,22 +1508,23 @@ class LocalJsonRepository(StateRepository):
         private copy nobody else mutates while the thread writes it.
         """
 
-        await asyncio.to_thread(self._persist, state)
+        try:
+            await asyncio.to_thread(self._persist, state)
+        except LocalControlPlaneAmbiguousCommitError:
+            # The rename returned successfully, so the pathname contains this
+            # exact snapshot even though the directory fsync did not confirm
+            # crash durability. Publish it in process (on the event loop, not
+            # from the worker thread) before poisoning future transactions, so
+            # event sequences can never be reused.
+            self._state = state
+            raise
 
     def _persist(self, state: ControlPlaneState) -> None:
         """Commit one transaction snapshot to the owner-only state document."""
 
         if not self._opened:
             raise LocalControlPlaneError("local Eyvan control-plane repository is not open")
-        try:
-            self.store.save(state)
-        except LocalControlPlaneAmbiguousCommitError:
-            # The rename returned successfully, so the pathname contains this
-            # exact snapshot even though the directory fsync did not confirm
-            # crash durability. Publish it in process before poisoning future
-            # transactions so event sequences can never be reused.
-            self._state = state
-            raise
+        self.store.save(state)
 
     def _recover_interrupted_outbox_claims(self) -> bool:
         """Make commands claimed by a terminated local server immediately eligible for fenced retry."""

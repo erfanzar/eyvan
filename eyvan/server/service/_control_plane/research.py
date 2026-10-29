@@ -99,6 +99,27 @@ def _note(now: datetime, kind: str, text: str) -> ResearchNote:
     return ResearchNote(t=now, kind=kind, text=text[:MAX_RESEARCH_NOTE_CHARS])
 
 
+#: How far back a repeated note is recognised and not written again.
+_NOTE_DEDUPE_WINDOW = 20
+
+
+def _fresh_notes(existing: tp.Sequence[ResearchNote], notes: tp.Sequence[ResearchNote]) -> list[ResearchNote]:
+    """Drop notes that repeat a recent one (same kind and text).
+
+    A step that keeps retrying (a deferred cancel, an unavailable store) would
+    otherwise add the same line every tick, rewrite the whole local document
+    each time and push the plan's real history out of its bounded note window.
+    """
+
+    recent = {(item.kind, item.text) for item in existing[-_NOTE_DEDUPE_WINDOW:]}
+    fresh: list[ResearchNote] = []
+    for item in notes:
+        if (item.kind, item.text) not in recent:
+            recent.add((item.kind, item.text))
+            fresh.append(item)
+    return fresh
+
+
 def _brief(exc: BaseException) -> str:
     """A short, input-free description of a validation or service error."""
 
@@ -128,8 +149,19 @@ def _event(
     )
 
 
-def research_job(raw: object, *, round_index: int) -> ResearchJob:
-    """Validate one ``{name, spec}`` whose spec is a workload the submit route accepts."""
+def research_job(
+    raw: object,
+    *,
+    round_index: int,
+    allowed_secret_mounts: tp.Mapping[str, str] | None = None,
+) -> ResearchJob:
+    """Validate one ``{name, spec}`` whose spec is a workload the submit route accepts.
+
+    A research job may not submit children: their leases would sit outside the
+    plan's chip-hour accounting, so the budget could never stop them. When
+    ``allowed_secret_mounts`` is given (a later, model-planned round), the job
+    may only mount secrets the human-approved round already mounted.
+    """
 
     if not isinstance(raw, dict):
         raise InputError("each research job must be an object with a name and a spec")
@@ -141,6 +173,21 @@ def research_job(raw: object, *, round_index: int) -> ResearchJob:
         definition = WorkloadDefinition.model_validate(spec)
     except ValueError as exc:
         raise InputError(f"research job {label!r} has an invalid workload spec: {_brief(exc)}") from None
+    if definition.can_submit_children:
+        raise InputError(
+            f"research job {label!r} may not submit child workloads: their usage would escape the plan's budget"
+        )
+    if allowed_secret_mounts is not None:
+        extra = {
+            name: reference
+            for name, reference in definition.secret_mounts.items()
+            if allowed_secret_mounts.get(name) != reference
+        }
+        if extra:
+            raise InputError(
+                f"research job {label!r} mounts secrets the approved plan did not ({', '.join(sorted(extra))}); "
+                "a later round may only reuse the approved round's secret mounts"
+            )
     try:
         return ResearchJob(name=str(raw.get("name") or definition.name).strip()[:200], spec=spec, round=round_index)
     except ValueError as exc:
@@ -313,16 +360,29 @@ class ResearchPlansMixin:
             )
         return plan
 
-    async def approve_research_plan(self, principal: Principal, plan_id: str) -> ResearchPlanRecord:
+    async def approve_research_plan(
+        self,
+        principal: Principal,
+        plan_id: str,
+        *,
+        credential_grants: tp.Sequence[RoleGrant] | None = None,
+    ) -> ResearchPlanRecord:
         """Approve a proposed plan (its owner only); the runner starts it on its next step.
 
         The approver must be able to submit *and* operate in the plan's project,
         because the plane must be able to stop what it starts. Authority the
         approving credential carried (rather than the plane's durable grants,
         which are re-read on every step) is recorded narrowed to that project.
+
+        ``credential_grants`` are the grants the authenticated credential itself
+        carried, before durable grants were merged in; the API passes them. Only
+        a direct service caller falls back to inferring them by subtracting a
+        fresh durable read, which can misclassify a grant revoked in between.
         """
 
-        durable = await self.active_grants_for(principal.subject)  # type: ignore[attr-defined]
+        durable = (
+            None if credential_grants is not None else await self.active_grants_for(principal.subject)  # type: ignore[attr-defined]
+        )
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             plan = self._visible_research_plan(principal, await tx.get_research_plan(plan_id), plan_id)
             if plan.subject != principal.subject:
@@ -331,9 +391,13 @@ class ResearchPlansMixin:
                 raise ConflictError(f"research plan {plan_id} is already {plan.state}")
             for permission in (Permission.SUBMIT, Permission.OPERATE):
                 self.authorizer.require(principal, permission, org_id=plan.org_id, project_id=plan.project_id)  # type: ignore[attr-defined]
-            credential = Principal(
-                subject=principal.subject, grants=tuple(grant for grant in principal.grants if grant not in durable)
-            )
+            if credential_grants is not None:
+                credential = Principal(subject=principal.subject, grants=tuple(credential_grants))
+            else:
+                credential = Principal(
+                    subject=principal.subject,
+                    grants=tuple(grant for grant in principal.grants if grant not in (durable or ())),
+                )
             now = utcnow()
             approved = plan.model_copy(
                 update={
@@ -386,23 +450,37 @@ class ResearchPlansMixin:
                     )
                 )
         if updated.state == "stopping":
-            driven = await self._drive_research_stop(plan_id, utcnow())
+            # The caller's own authority is the fallback: an admin stopping a
+            # disabled owner's plan must actually cancel its jobs.
+            driven = await self._drive_research_stop(plan_id, utcnow(), actor=principal)
             return driven or updated
         return updated
 
     # ------------------------------------------------------------- runner
 
-    async def step_research_plans(self, now: datetime | None = None, *, iterate: ResearchIterator | None = None) -> int:
+    async def step_research_plans(
+        self,
+        now: datetime | None = None,
+        *,
+        iterate: ResearchIterator | None = None,
+        still_leading: tp.Callable[[], tp.Awaitable[bool]] | None = None,
+    ) -> int:
         """Advance every approved, running or stopping plan once; return how many were looked at.
 
         One indexed read when nothing is active. A plan whose step fails is
         logged and retried on the next step; it never stops the others.
+        ``still_leading`` is re-checked before each plan, so a replica that lost
+        leadership mid-tick (a slow iteration call) stops stepping plans. With
+        no fixed ``now`` each plan is measured against the current time, so one
+        slow plan never makes the next plan's spend look smaller.
         """
 
-        moment = _aware(now or utcnow())
         async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             plans = await tx.list_research_plans(states=RESEARCH_PLAN_ACTIVE_STATES)
         for plan in plans:
+            if still_leading is not None and not await still_leading():
+                break
+            moment = _aware(now or utcnow())
             try:
                 if plan.state == "stopping":
                     await self._drive_research_stop(plan.id, moment)
@@ -448,8 +526,17 @@ class ResearchPlansMixin:
         observed = await self._observe_research(plan, now)
         chip_hours = max(plan.spent.chip_hours, sum(item.chip_hours for item in observed.values()))
         stop = self._research_budget_breach(plan, chip_hours, now, started_at)
-        if stop is None and not principal.grants:
-            stop = ("failed", f"{plan.subject} is no longer allowed to submit to {plan.org_id}/{plan.project_id}")
+        allows = self.authorizer.allows  # type: ignore[attr-defined]
+        if stop is None and not all(
+            allows(principal, permission, org_id=plan.org_id, project_id=plan.project_id)
+            for permission in (Permission.SUBMIT, Permission.OPERATE)
+        ):
+            # OPERATE too: the plane must be able to cancel what it submits, or
+            # the budget could not be enforced on those jobs.
+            stop = (
+                "failed",
+                f"{plan.subject} is no longer allowed to submit and operate in {plan.org_id}/{plan.project_id}",
+            )
         if stop is None:
             stop = await self._submit_research_jobs(plan, principal, now, submissions, notes, observed)
         update: dict[str, tp.Any] = {"started_at": started_at, "state": "running"}
@@ -463,6 +550,7 @@ class ResearchPlansMixin:
                     plan, principal, now, submissions, observed, chip_hours, notes, iterate
                 )
             )
+        notes = _fresh_notes(plan.notes, notes)
         if (
             not submissions
             and not notes
@@ -597,6 +685,13 @@ class ResearchPlansMixin:
         if not plan.iterate:
             notes.append(_note(now, "finished", f"all {len(plan.jobs)} job(s) reached a final state"))
             return finish
+        approved_mounts: dict[str, str] = {}
+        for job in plan.jobs:
+            if job.round == 0:
+                try:
+                    approved_mounts.update(WorkloadDefinition.model_validate(job.spec).secret_mounts)
+                except ValueError:
+                    continue  # a stored spec that no longer validates approves nothing
         limit = plan.budget.max_rounds or MAX_RESEARCH_ROUNDS
         room = min(plan.budget.max_jobs, MAX_RESEARCH_JOBS) - len(plan.jobs)
         if plan.current_round + 1 >= limit or room <= 0:
@@ -633,7 +728,7 @@ class ResearchPlansMixin:
                 dropped += 1
                 continue
             try:
-                accepted.append(research_job(raw, round_index=round_number))
+                accepted.append(research_job(raw, round_index=round_number, allowed_secret_mounts=approved_mounts))
             except InputError as exc:
                 notes.append(_note(now, "rejected", f"proposed job rejected: {exc}"))
         if dropped:
@@ -676,12 +771,15 @@ class ResearchPlansMixin:
             current = await tx.get_research_plan(seen.id)
             if current is None:
                 return None
-            raced = current.state != seen.state
+            # Compare-and-set on the last write, not only the state: a second
+            # replica (or a stop) that wrote meanwhile wins the lifecycle fields,
+            # so two steps can never both plan a round over each other.
+            raced = current.state != seen.state or current.updated_at != seen.updated_at
             known = {item.job_index for item in current.submitted}
             submitted = (*current.submitted, *(item for item in submissions if item.job_index not in known))
             fields: dict[str, tp.Any] = {
                 "submitted": submitted,
-                "notes": (*current.notes, *notes)[-MAX_RESEARCH_NOTES:],
+                "notes": (*current.notes, *_fresh_notes(current.notes, notes))[-MAX_RESEARCH_NOTES:],
                 "updated_at": now,
             }
             if not raced:
@@ -730,9 +828,31 @@ class ResearchPlansMixin:
             async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
                 late = {workload_id: await tx.get_workload(workload_id) for workload_id in new_ids}
             principal = await self._research_principal(updated, now)
-            late_notes, _ = await self._cancel_research_workloads(updated, principal, late, now)
+            late_notes, retry, stuck = await self._cancel_research_workloads(updated, principal, late, now)
             for note in late_notes:
                 logger.warning("research plan %s: %s", updated.id, note.text)
+            if retry or stuck:
+                # A terminal plan is never stepped again, so a deferred cancel
+                # would orphan the workload: reopen the stop instead.
+                async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+                    current = await tx.get_research_plan(updated.id)
+                    if current is not None and current.state in RESEARCH_PLAN_TERMINAL_STATES:
+                        reopened = current.model_copy(
+                            update={
+                                "state": "stopping",
+                                "stop_target": current.state,
+                                "finished_at": None,
+                                "notes": (*current.notes, *_fresh_notes(current.notes, late_notes))[
+                                    -MAX_RESEARCH_NOTES:
+                                ],
+                                "updated_at": now,
+                            }
+                        )
+                        await tx.put_research_plan(reopened)
+                        await tx.append_event(
+                            _event(updated.subject, reopened, "research_plan.stopping", previous=current.state)
+                        )
+                        updated = reopened
         return updated
 
     async def _cancel_research_workloads(
@@ -741,34 +861,64 @@ class ResearchPlansMixin:
         principal: Principal,
         workloads: dict[str, WorkloadRecord | None],
         now: datetime,
-    ) -> tuple[list[ResearchNote], bool]:
-        """Cancel every unfinished workload as the owner; return notes and whether to retry."""
+        *,
+        fallback: Principal | None = None,
+    ) -> tuple[list[ResearchNote], bool, bool]:
+        """Cancel every unfinished workload; return notes, whether to retry, and whether any is stuck.
+
+        The owner's own authority is tried first. When the owner can no longer
+        operate (a disabled account, a revoked grant) ``fallback`` -- the person
+        who asked for the stop, e.g. a fleet admin -- is tried next. A workload
+        nobody could cancel is reported as stuck, so the plan is never settled
+        as stopped while its jobs still run.
+        """
 
         notes: list[ResearchNote] = []
         retry = False
+        stuck = False
         for workload_id, workload in workloads.items():
             if workload is None or workload.state in TERMINAL_WORKLOAD_STATES:
                 continue
             if workload.state is WorkloadState.CANCELLING:
                 continue
-            try:
-                await self.cancel_workload(  # type: ignore[attr-defined]
-                    principal, workload_id, idempotency_key=f"research-stop:{plan.id}:{workload_id}"
-                )
-            except (ConflictError, UnavailableError) as exc:
-                # A preemption in flight, or a store hiccup: try again next step.
-                retry = True
-                notes.append(_note(now, "retry", f"cancel of {workload_id} deferred: {_brief(exc)}"))
-            except EyvanServiceError as exc:
-                notes.append(
-                    _note(now, "cancel_failed", f"could not cancel {workload_id} as {plan.subject}: {_brief(exc)}")
-                )
-            else:
-                notes.append(_note(now, "cancelled", f"cancelled {workload_id}"))
-        return notes, retry
+            actors = [principal] + ([fallback] if fallback is not None and fallback != principal else [])
+            for position, actor in enumerate(actors):
+                try:
+                    await self.cancel_workload(  # type: ignore[attr-defined]
+                        actor, workload_id, idempotency_key=f"research-stop:{plan.id}:{workload_id}"
+                    )
+                except (ConflictError, UnavailableError) as exc:
+                    # A preemption in flight, or a store hiccup: try again next step.
+                    retry = True
+                    notes.append(_note(now, "retry", f"cancel of {workload_id} deferred: {_brief(exc)}"))
+                    break
+                except EyvanServiceError as exc:
+                    if position + 1 < len(actors):
+                        continue
+                    stuck = True
+                    notes.append(
+                        _note(
+                            now,
+                            "cancel_failed",
+                            f"could not cancel {workload_id} as {actor.subject}: {_brief(exc)}; "
+                            "it is still running -- a project operator or fleet admin must stop it",
+                        )
+                    )
+                    break
+                else:
+                    by = "" if actor is principal else f" as {actor.subject}"
+                    notes.append(_note(now, "cancelled", f"cancelled {workload_id}{by}"))
+                    break
+        return notes, retry, stuck
 
-    async def _drive_research_stop(self, plan_id: str, now: datetime) -> ResearchPlanRecord | None:
-        """Cancel a stopping plan's workloads as its owner, then settle it in its stop target."""
+    async def _drive_research_stop(
+        self, plan_id: str, now: datetime, *, actor: Principal | None = None
+    ) -> ResearchPlanRecord | None:
+        """Cancel a stopping plan's workloads as its owner, then settle it in its stop target.
+
+        The plan stays ``stopping`` -- never reported stopped -- while any of its
+        workloads could not be cancelled; each later step retries.
+        """
 
         async with _read_view(self.repository) as tx:  # type: ignore[attr-defined]
             plan = await tx.get_research_plan(plan_id)
@@ -780,15 +930,19 @@ class ResearchPlansMixin:
                 if item.workload_id is not None
             }
         principal = await self._research_principal(plan, now)
-        notes, retry = await self._cancel_research_workloads(plan, principal, workloads, now)
+        notes, retry, stuck = await self._cancel_research_workloads(plan, principal, workloads, now, fallback=actor)
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             current = await tx.get_research_plan(plan_id)
             if current is None or current.state != "stopping":
                 return tp.cast(ResearchPlanRecord | None, current)
             if any(item.workload_id is not None and item.workload_id not in workloads for item in current.submitted):
                 retry = True  # a step submitted more while this one cancelled
-            fields: dict[str, tp.Any] = {"notes": (*current.notes, *notes)[-MAX_RESEARCH_NOTES:], "updated_at": now}
-            if not retry:
+            fresh = _fresh_notes(current.notes, notes)
+            fields: dict[str, tp.Any] = {"notes": (*current.notes, *fresh)[-MAX_RESEARCH_NOTES:], "updated_at": now}
+            if not fresh and (retry or stuck):
+                # Nothing new to say and still waiting: skip the whole-document write.
+                return tp.cast(ResearchPlanRecord, current)
+            if not retry and not stuck:
                 fields.update(state=current.stop_target or "stopped", finished_at=now)
             updated = current.model_copy(update=fields)
             await tx.put_research_plan(updated)

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan.config import EyvanSettings
@@ -161,10 +161,12 @@ def register_research_routes(app: FastAPI, *, settings: EyvanSettings, service: 
         return plan_document(plan, workloads)
 
     @app.post("/api/v1/research/plans/{plan_id}/approve", tags=["research"])
-    async def approve_research_plan(plan_id: str, principal: _Principal) -> dict[str, tp.Any]:
+    async def approve_research_plan(plan_id: str, request: Request, principal: _Principal) -> dict[str, tp.Any]:
         """Approve a proposed plan (owner only); the plane then submits and iterates it as you."""
 
-        await service.approve_research_plan(principal, plan_id)
+        await service.approve_research_plan(
+            principal, plan_id, credential_grants=getattr(request.state, "credential_grants", None)
+        )
         plan, workloads = await service.describe_research_plan(principal, plan_id)
         return plan_document(plan, workloads)
 

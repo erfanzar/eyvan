@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 #: How often the runner steps active plans. A stop request does not wait for
 #: this: the stop route cancels the plan's workloads itself.
 DEFAULT_RESEARCH_INTERVAL_S = 15.0
+#: Wall-clock bound on one iteration call; a timeout counts as one failed iteration.
+DEFAULT_ITERATION_TIMEOUT_S = 180.0
 #: Provider rounds one iteration may take (bounded again by the provider's own max_steps).
 MAX_ITERATION_STEPS = 4
 #: Upper bound on the summary sent to the model.
@@ -160,9 +162,13 @@ class ResearchRunner:
         leader: _Leader | None = None,
         interval_s: float = DEFAULT_RESEARCH_INTERVAL_S,
         clock: tp.Callable[[], datetime] = utcnow,
+        iteration_timeout_s: float = DEFAULT_ITERATION_TIMEOUT_S,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("the research runner interval must be positive")
+        if iteration_timeout_s <= 0:
+            raise ValueError("the iteration timeout must be positive")
+        self.iteration_timeout_s = iteration_timeout_s
         self.service = service
         self.app = app
         self.leader = leader
@@ -172,7 +178,16 @@ class ResearchRunner:
     async def tick(self, now: datetime | None = None) -> int:
         """Step every active plan once; return how many were looked at."""
 
-        return await self.service.step_research_plans(now or self.clock(), iterate=self.iterate)
+        leader = self.leader
+        if now is None and self.clock is not utcnow:
+            now = self.clock()  # an injected clock (tests) pins the whole tick
+        return await self.service.step_research_plans(
+            now,
+            iterate=self.iterate,
+            # Re-checked before every plan, so a replica that lost leadership
+            # during a slow iteration call stops stepping plans at once.
+            still_leading=leader.acquire if leader is not None else None,
+        )
 
     async def run(self, stop: asyncio.Event) -> None:
         """Tick until ``stop`` is set; a failing tick is logged and the loop goes on."""
@@ -212,7 +227,12 @@ class ResearchRunner:
             tool_specs=list(ITERATION_TOOL_SPECS),
             max_steps=min(record.max_steps, MAX_ITERATION_STEPS),
         )
-        turn = await collect_turn(events)
+        try:
+            # Bounded: plans are stepped one after another, so an unbounded
+            # provider call would delay every other plan's budget checks.
+            turn = await asyncio.wait_for(collect_turn(events), timeout=self.iteration_timeout_s)
+        except TimeoutError:
+            raise TimeoutError(f"the iteration model did not answer within {self.iteration_timeout_s:g}s") from None
         if tools.outcome is None:
             reply = str(turn.get("reply") or "").strip()[:500]
             return {"finish": f"the model made no decision ({reply or 'no answer'})"}
@@ -220,6 +240,7 @@ class ResearchRunner:
 
 
 __all__ = (
+    "DEFAULT_ITERATION_TIMEOUT_S",
     "DEFAULT_RESEARCH_INTERVAL_S",
     "ITERATION_SYSTEM_PROMPT",
     "ITERATION_TOOL_SPECS",

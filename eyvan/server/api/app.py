@@ -273,6 +273,8 @@ _AUDIT_STREAM_DEDUPE_LIMIT = 4096
 #: so a shorter window would buy no accuracy and would let one dashboard turn a
 #: page refresh into a burst of `gcloud` calls. Every response carries the age
 #: of its reading, so reuse is stated rather than hidden.
+#: How long shutdown waits for in-flight assistant turn saves before closing the store.
+ASSISTANT_SAVE_DRAIN_S = 30.0
 TPU_QUOTA_CACHE_TTL_S = 120.0
 
 #: How long a request waits for a provider read before answering without it.
@@ -778,6 +780,14 @@ def create_app(
                 await research_task
             if task is not None:
                 await task
+            # Assistant turns save in background tasks; let them land before the
+            # store closes, so a turn is never dropped and no save outlives the
+            # store's ownership lease (a successor process may already own it).
+            pending = set(getattr(_app.state, "assistant_pending_saves", ()) or ())
+            if pending:
+                _done, unfinished = await asyncio.wait(pending, timeout=ASSISTANT_SAVE_DRAIN_S)
+                if unfinished:
+                    logger.warning("%d assistant save(s) did not finish before shutdown", len(unfinished))
             await controller.close()
             await repository.close()
             if engine is not None:

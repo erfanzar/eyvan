@@ -1060,6 +1060,32 @@ class StateRepository:
 
         self._persist(state)
 
+    async def _commit_uncancellable(self, working: ControlPlaneState) -> None:
+        """Persist ``working`` and publish it, even if the awaiting task is cancelled meanwhile.
+
+        A threaded save keeps running after its awaiting task is cancelled. If
+        the cancellation were allowed to release the transaction lock, the next
+        transaction would copy the stale published state and race a second save
+        against the first: disk and memory disagree, and an acknowledged commit
+        vanishes on restart. So the write is shielded and awaited to the end,
+        the lock stays held, the result is published, and only then is the
+        cancellation delivered.
+        """
+
+        task = asyncio.ensure_future(self._persist_async(working))
+        interrupted = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                interrupted = True
+            except BaseException:
+                break
+        task.result()  # a failed save propagates and publishes nothing
+        self._state = working
+        if interrupted:
+            raise asyncio.CancelledError
+
     @asynccontextmanager
     async def transaction(self) -> tp.AsyncIterator[StateSession]:
         """Yield one serializable copy-on-write transaction."""
@@ -1087,8 +1113,7 @@ class StateRepository:
                 raise RecordMutatedInPlaceError(_IN_PLACE_MUTATION)
             if working != self._state:
                 working.revision += 1
-                await self._persist_async(working)
-                self._state = working
+                await self._commit_uncancellable(working)
                 committed_any = True
                 committed_events = working.next_event_sequence > start_sequence
         if committed_any:

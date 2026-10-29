@@ -133,6 +133,14 @@ def test_validate_types_lists_and_a_clean_draft() -> None:
         "save_steps": 200,
         "max_training_steps": 2000,
     }
+    # A NaN or infinite number is never a valid argument: YAML writes it as .nan and
+    # EasyDeL accepts it, so it must block the draft here.
+    for value in (float("nan"), float("inf"), [1.0, float("-inf")]):
+        flagged = ak.validate_trainer_arguments("dpo", {"learning_rate": value})
+        assert [item["field"] for item in flagged["type_warnings"]] == ["learning_rate"], value
+    blocked = ak.render_launch("sft", {"learning_rate": float("nan")}, model="m", dataset="d")
+    assert blocked["runnable"] is False and any("learning_rate" in reason for reason in blocked["blocking"])
+
     result = ak.validate_trainer_arguments("dpo", clean)
     assert result["ok"] is True, result
     assert any(item["input"] == "reference_model" for item in result["launch_inputs_to_confirm"])

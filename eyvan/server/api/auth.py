@@ -408,6 +408,10 @@ async def authenticated_principal(request: Request) -> Principal:
                     "authentication_audit_write_failed exception_type=%s", type(audit_error).__name__
                 )
         raise
+    # What the credential itself carried, before durable grants are merged in.
+    # Recorded so a caller that must tell the two apart (research-plan approval
+    # freezes only credential authority) never infers it by a second, later read.
+    request.state.credential_grants = tuple(principal.grants)
     resolver = getattr(request.app.state, "grant_resolver", None)
     if resolver is None:
         return principal

@@ -132,6 +132,8 @@ class McpScope:
     candidates: tuple[tuple[str, str], ...] = ()
     settings: EyvanSettings | None = None
     app: FastAPI | None = None
+    #: Grants the credential itself carried, before durable grants were merged in.
+    credential_grants: tuple[tp.Any, ...] | None = None
 
     def require(self) -> tuple[str, str]:
         """Return the scope, or explain how to name one when it is ambiguous."""
@@ -557,7 +559,7 @@ async def _approve_research_plan(
 ) -> tp.Any:
     plan_id = _string(args, "plan_id", required=True)
     assert plan_id is not None
-    await service.approve_research_plan(principal, plan_id)
+    await service.approve_research_plan(principal, plan_id, credential_grants=scope.credential_grants)
     plan, workloads = await service.describe_research_plan(principal, plan_id)
     return plan_document(plan, workloads)
 
@@ -950,6 +952,7 @@ def register_mcp_routes(app: FastAPI, *, settings: EyvanSettings, service: Contr
             candidates=candidates,
             settings=settings,
             app=request.app,
+            credential_grants=getattr(request.state, "credential_grants", None),
         )
         result = await call_tool(tool, arguments, service=service, principal=principal, scope=scope)
         return JSONResponse(_rpc_result(message_id, result))
