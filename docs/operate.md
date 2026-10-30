@@ -159,6 +159,42 @@ committed database migration. If the candidate fails after migration, keep
 writers stopped and repair forward; restore a backup only as a deliberate
 disaster-recovery action. Never use an Alembic downgrade as release rollback.
 
+### Build skew after an upgrade
+
+A cell is "on the plane's build" only when its agent and every worker report
+the exact `source_digest` the plane computes: one sha256 over every file in the
+`eyvan` package. There is no version window, so any Eyvan commit -- a dashboard
+string included -- leaves every running cell stale until it is upgraded.
+`eyvan capacity builds` (or `GET /api/v1/capacity/builds`) names both digests.
+
+The plane checks this in the idle build sweep (every
+`EYVAN_CELL_RECONCILE_INTERVAL_S`) and again at dispatch, and answers a stale
+cell according to `EYVAN_BUILD_SKEW_POLICY`:
+
+| Policy | Stale cell | Dispatch onto it |
+|---|---|---|
+| `recycle` | Drained; the autoscaler deletes it and provisions a replacement from the wheel staged now | Refused; the workload requeues for the replacement |
+| `refuse` | Kept and **held**: `build_skew` is set on the cell, a `cell.build_skew_held` event is written, and nothing new is placed on it | Refused without draining; the workload requeues (`workload.stale_build_held`) |
+| `warn` | Logged once per mismatch; nothing moves | Allowed, with a warning |
+| `auto` (default) | `refuse` for operator-owned backends (`manual`, `onprem-ssh`, `gcp-attach`), `recycle` for every other backend | As resolved |
+
+`auto` keeps the earlier behaviour for capacity Eyvan provisions -- a
+replacement there is a new machine on the new build -- and stops it where it
+cannot converge: a recycled `manual` or `onprem-ssh` cell comes back on the same
+host, still on the old build, under a new cell id and token.
+
+A held cell returns to service by itself. Upgrade the agent and the worker on
+the host in place from the plane's wheel (re-run the rendered installer, or
+your own install step); the next sweep sees every digest match, clears
+`build_skew`, writes `cell.build_skew_cleared`, and the scheduler places on the
+cell again -- same cell id, same token. Leased cells are not judged by the sweep
+until their lease ends, and an unreadable agent leaves a hold as it is.
+
+Use `warn` only when you know the builds are compatible (for example a
+plane-only change) and would rather run on stale workers than wait. Use
+`recycle` on an operator-owned fleet only if something outside Eyvan reinstalls
+the host whenever its cell is replaced.
+
 ## Post-deployment checks
 
 - `kubectl rollout status` succeeds for the control-plane and (if enabled) the

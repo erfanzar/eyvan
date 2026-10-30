@@ -2418,6 +2418,18 @@
             ],
             "title": "Billing Ticked At"
           },
+          "build_skew": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Build Skew"
+          },
           "capacity": {
             "$ref": "#/components/schemas/ResourceLimits"
           },

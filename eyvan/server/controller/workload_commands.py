@@ -20,6 +20,7 @@ from eyvan._internal.plane_tls import CONTROL_PLANE_CA_B64_ENV, control_plane_ca
 from eyvan.capacity import (
     READY_CAPACITY_STATUSES,
 )
+from eyvan.capacity.build_skew import BuildSkewPolicy
 from eyvan.records import (
     MAX_ATTEMPT_RANK_COUNT,
     AuditEvent,
@@ -40,6 +41,7 @@ from eyvan.records import (
 from eyvan.secrets import redact_secret_material
 from eyvan.server.controller._support import (
     StaleOutboxCommand,
+    logger,
 )
 from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
@@ -281,13 +283,29 @@ class StaleBuildDispatchRefusal(PermanentDispatchRefusal):
     from the wheel staged now -- so a retry after the drain is not the same
     dispatch and can succeed.
 
+    Under the ``refuse`` build-skew policy the plane removes the cause the
+    other way: it cannot replace an operator-owned host, so it holds the cell
+    out of scheduling instead, and the retry meets a different cell or waits
+    for the held one to be upgraded in place.
+
     Carries the offending cells so the handler does not have to re-derive
     them from a message string.
     """
 
-    def __init__(self, message: str, cells: tp.Sequence[CellRecord]):
+    def __init__(
+        self,
+        message: str,
+        cells: tp.Sequence[CellRecord],
+        *,
+        reports: tp.Sequence[str] = (),
+        plane_digest: str = "",
+    ):
         super().__init__(message)
         self.cells = tuple(cells)
+        #: What each of ``cells`` runs instead, in the same order, so a cell held
+        #: rather than recycled can record the mismatch it is held for.
+        self.reports = tuple(reports)
+        self.plane_digest = plane_digest
 
 
 class GangRendezvousCollision(PermanentDispatchRefusal):
@@ -1619,14 +1637,37 @@ class _ControllerWorkloadCommands:
         if not head.source_digest:
             return  # a source tree with no identity cannot judge anyone
         stale = await self._stale_build_report(cells, head.source_digest)
-        if not stale:
+        refused: list[tuple[CellRecord, str]] = []
+        for cell, parts in stale:
+            if self._build_skew_policy(cell) is BuildSkewPolicy.WARN:
+                # Accepted on purpose: the operator declared the builds
+                # compatible. Said at dispatch, where the work actually lands.
+                logger.warning(
+                    "dispatching onto cell %s although it runs %s and this plane stages %s (build_skew_policy=warn)",
+                    cell.id,
+                    parts,
+                    head.source_digest[:12],
+                )
+                continue
+            refused.append((cell, parts))
+        if not refused:
             return
-        cell, parts = stale[0]
+        cell, parts = refused[0]
+        if self._build_skew_policy(cell) is BuildSkewPolicy.REFUSE:
+            remediation = (
+                f"upgrade the agent and workers on cell {cell.id!r} in place to this build; "
+                "the cell returns to service once every digest matches"
+            )
+        else:
+            remediation = (
+                f"recycle it with 'eyvan cell-drain {cell.id}' then "
+                f"'eyvan cell-delete {cell.id}', or redeploy the cell's runtime before dispatching"
+            )
         raise StaleBuildDispatchRefusal(
-            f"cell {cell.id!r} runs {parts} but this plane stages "
-            f"{head.source_digest[:12]}; recycle it with 'eyvan cell-drain {cell.id}' then "
-            f"'eyvan cell-delete {cell.id}', or redeploy the cell's runtime before dispatching",
-            cells=[offending for offending, _ in stale],
+            f"cell {cell.id!r} runs {parts} but this plane stages {head.source_digest[:12]}; {remediation}",
+            cells=[offending for offending, _ in refused],
+            reports=[report for _, report in refused],
+            plane_digest=head.source_digest,
         )
 
     async def _recycle_stale_builds_and_requeue(
@@ -1653,10 +1694,29 @@ class _ControllerWorkloadCommands:
         wrong digest -- finite causes, finite recycles -- and a deployment
         whose replacements keep arriving stale is a broken staging path that
         no amount of retrying hides.
+
+        A cell under the ``refuse`` build-skew policy is held rather than
+        drained (see ``_hold_stale_build_cell``): its host is operator-owned, so
+        there is no replacement to wait for, only an in-place upgrade. The hold
+        is what keeps this bound honest there -- a held cell attracts no new
+        lease, so the requeued workload cannot meet it again and spend its
+        attempts on one stale host.
         """
 
         self._require_no_prior_dispatch_admission(command)
-        for cell in refusal.cells:
+        held: list[str] = []
+        drained: list[str] = []
+        for index, cell in enumerate(refusal.cells):
+            if self._build_skew_policy(cell) is BuildSkewPolicy.REFUSE:
+                # Operator-owned: a drain would delete the cell and re-join the
+                # same stale host under a new id. Holding it is just as durable --
+                # it is written before the requeue -- and keeps the scheduler from
+                # leasing the cell straight back to this workload.
+                report = refusal.reports[index] if index < len(refusal.reports) else "another build"
+                await self._hold_stale_build_cell(cell, report, refusal.plane_digest or "unknown")
+                held.append(cell.id)
+                continue
+            drained.append(cell.id)
             try:
                 await self.drain_cell(
                     self._principal,
@@ -1674,14 +1734,22 @@ class _ControllerWorkloadCommands:
         if workload.attempt >= _STALE_BUILD_REQUEUE_ATTEMPT_LIMIT:
             await self._settle_unlaunchable_attempt(command, tuple(lease_ids), refusal)
             return
+        if drained:
+            scheduling_reason = (
+                f"cell {' '.join(drained)} ran a stale build and was drained; waiting for replacement capacity"
+            )
+            action = "workload.stale_build_recycled"
+        else:
+            scheduling_reason = (
+                f"cell {' '.join(held)} ran a stale build and is held until it is upgraded in place; "
+                "waiting for capacity on this plane's build"
+            )
+            action = "workload.stale_build_held"
         await self.service.settle_preempted_workload(
             self._principal,
             workload.id,
-            scheduling_reason=(
-                f"cell {' '.join(cell.id for cell in refusal.cells)} ran a stale build and was "
-                "drained; waiting for replacement capacity"
-            ),
-            action="workload.stale_build_recycled",
+            scheduling_reason=scheduling_reason,
+            action=action,
             expected_generation=workload.generation,
             expected_lease_id=workload.lease_id,
             expected_state=workload.state,

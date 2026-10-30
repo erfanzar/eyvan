@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from eyvan._internal.client_version import validate_minimum_client_version
 from eyvan._internal.compat import StrEnum
+from eyvan.capacity.build_skew import BuildSkewPolicy
 from eyvan.capacity.providers.gcp.runtime.profile import (
     DEFAULT_GCP_NATIVE_FLEET_STATE_PATH,
     GcpNativeRuntimeProfile,
@@ -153,6 +154,19 @@ class EyvanSettings:
     Each consecutive connection failure doubles the wait from
     ``cell_reconcile_interval_s`` up to this ceiling; any answer resets it.
     ``0`` asks every interval, the behaviour before this setting existed.
+    """
+    build_skew_policy: str = "auto"
+    """What the plane does with a cell whose agent or workers run another build.
+
+    ``recycle`` drains the cell so the autoscaler replaces it from the wheel
+    staged now; ``refuse`` keeps the cell, holds it out of scheduling and
+    refuses dispatch to it until an in-place upgrade makes its digests match,
+    then returns it to service; ``warn`` reports the skew and dispatches
+    anyway. ``auto``, the default, refuses on backends whose cells are
+    operator-owned hardware (``manual``, ``onprem-ssh``, ``gcp-attach``) --
+    where a replacement lands on the same stale host -- and recycles everywhere
+    else, the behaviour before this setting existed. See
+    :mod:`eyvan.capacity.build_skew`.
     """
     lease_ttl_s: int = 120
     indeterminate_execution_grace_s: int = 900
@@ -592,6 +606,9 @@ class EyvanSettings:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.cell_reconcile_concurrency <= 0:
             raise ValueError("cell_reconcile_concurrency must be positive")
+        if self.build_skew_policy not in {policy.value for policy in BuildSkewPolicy}:
+            choices = ", ".join(policy.value for policy in BuildSkewPolicy)
+            raise ValueError(f"build_skew_policy must be one of: {choices}")
         if self.gang_init_deadline_s <= 0:
             raise ValueError("gang_init_deadline_s must be positive")
         if self.host_replacement_window_s <= 0:
@@ -775,6 +792,7 @@ class EyvanSettings:
             cell_agent_backoff_max_s=float(
                 os.getenv("EYVAN_CELL_AGENT_BACKOFF_MAX_S", defaults.cell_agent_backoff_max_s)
             ),
+            build_skew_policy=os.getenv("EYVAN_BUILD_SKEW_POLICY", defaults.build_skew_policy).strip().lower(),
             lease_ttl_s=int(os.getenv("EYVAN_LEASE_TTL_S", defaults.lease_ttl_s)),
             checkpoint_grace_s=int(os.getenv("EYVAN_CHECKPOINT_GRACE_S", defaults.checkpoint_grace_s)),
             preemption_stop_grace_s=int(os.getenv("EYVAN_PREEMPTION_STOP_GRACE_S", defaults.preemption_stop_grace_s)),

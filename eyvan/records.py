@@ -2141,6 +2141,16 @@ class CellRecord(EyvanModel):
     #: provider error has many; collapsing them all to one code means an operator
     #: has to reconstruct the cause from an agent's storage document by hand.
     unavailable_detail: str | None = Field(default=None, max_length=2048)
+    #: Set while the cell is held under the ``refuse`` build-skew policy: what
+    #: its agent and workers run instead of the plane's build, for example
+    #: ``"worker 4f0c2a9e81d3"``. A held cell keeps its state, its generation and
+    #: its machine -- the host is operator-owned, so deleting the cell would only
+    #: hand the same stale build a new cell id and a new token -- and attracts no
+    #: new placement until the build sweep sees every digest match again and
+    #: clears this. Separate from ``unavailable_reason`` on purpose: observation
+    #: owns that field and rewrites it on every heartbeat, and an answering agent
+    #: on the wrong build is reachable, not unavailable.
+    build_skew: str | None = Field(default=None, max_length=512)
     availability: CapacityBeliefState = Field(default_factory=CapacityBeliefState)
     #: Copied from the pool at creation, like the runtime and the labels. Held on
     #: the cell so an observation needs nothing but the cell it is about -- and

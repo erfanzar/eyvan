@@ -50,7 +50,8 @@ same durable state but have independent phase failure and cadence policies.
 The schedule is declared by `_leader_phases()` in
 `server/controller/loops.py`. In order, its phases are:
 
-1. unmanaged-capacity recovery and stale-build recycling;
+1. unmanaged-capacity recovery and the stale-build sweep (recycle, hold, or
+   warn per `EYVAN_BUILD_SKEW_POLICY`; see below);
 2. capacity-pool reconciliation;
 3. cell observation, expired-lease quarantine, workload observation, and
    orphan/coordinator settlement;
@@ -78,6 +79,20 @@ release, and scheduling phases require fresh `observe-cells` and
 `observe-workloads`); if a required observation failed in this cycle, the
 dependent phase is skipped instead of committing against stale inventory.
 
+**Build skew.** The stale-build sweep (`recycle_stale_build_cells_once` in
+`server/controller/fleets.py`) and the dispatch guard (`_refuse_stale_cell_builds`
+in `workload_commands.py`) compare the plane's `source_digest` with the agent's
+and with each worker's (`build.source_digest` in the agent's `worker_builds`
+answer). A mismatch is answered per cell by `eyvan.capacity.build_skew`:
+`recycle` drains the cell for replacement; `refuse` sets `CellRecord.build_skew`,
+which disables the cell for scheduling (and counts it as returning supply for
+the autoscaler) without changing its state or generation, and is cleared by the
+first sweep that sees every digest match; `warn` logs and dispatches. The
+setting is `EYVAN_BUILD_SKEW_POLICY`; its default `auto` resolves to `refuse`
+for backends declared `existing_hardware` and `recycle` otherwise. Audit actions:
+`cell.build_skew_held`, `cell.build_skew_cleared`, `workload.stale_build_recycled`,
+`workload.stale_build_held`.
+
 `PostgresAdvisoryLeader` (`server/persistence/leader.py`) holds a
 session-scoped PostgreSQL advisory lock on a dedicated autocommit connection.
 Renewal checks `pg_locks` for ownership, not merely connection health; loss or
@@ -103,7 +118,7 @@ verified by this document.
 | `_ControllerScheduling` | Commit placement and preemption plans returned by the scheduling service. |
 | `_ControllerOutbox` | Claim, heartbeat, ordered-per-aggregate, concurrent-across-aggregate delivery and recovery of durable commands. |
 | `_ControllerCapacityCommands` | Provider apply, drain, and release operations, including superseded-apply recovery. |
-| `_ControllerWorkloadCommands` | Render and dispatch workload attempts (including gang membership), cancellation, checkpoint, fencing, and stale-build refusal. |
+| `_ControllerWorkloadCommands` | Render and dispatch workload attempts (including gang membership), cancellation, checkpoint, fencing, and stale-build refusal (agent and every worker digest). |
 | `_ControllerPreemption` | Durable checkpoint/stop/finalize/rollback workflow for preemption victims. |
 | `_ControllerSettlement` | Terminal release, orphan cleanup, billing, retention, service reconciliation, metrics, and artifact/grant housekeeping. |
 | `_ControllerServices` | Health probes, fenced unhealthy-replica retirement, and bounded autoscaling decisions. |

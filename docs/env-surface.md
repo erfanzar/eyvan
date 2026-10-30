@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-223 variables are currently referenced. Names set on workload
+224 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -103,6 +103,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_AWS_REGION` | `eyvan/config` |
 | `EYVAN_AWS_SECRET_ACCESS_KEY` | `eyvan/config` |
 | `EYVAN_AWS_SESSION_TOKEN` | `eyvan/config` |
+| `EYVAN_BUILD_SKEW_POLICY` | `eyvan/config` |
 | `EYVAN_CAPACITY_BACKEND` | `eyvan/config` |
 | `EYVAN_CAPACITY_RACE_WIDTH` | `eyvan/config` |
 | `EYVAN_CAPACITY_SUPPORTS_EXEC` | `eyvan/config` |

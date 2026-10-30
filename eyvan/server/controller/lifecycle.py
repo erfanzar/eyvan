@@ -143,6 +143,9 @@ class _ControllerLifecycle:
         # The acquisition-backoff streak last announced per pool. A cache of the
         # audit ledger, which is the durable answer a new leader reads instead.
         self._acquisition_backoff_announcements: dict[str, str | None] = {}
+        # The mismatch last logged per cell under ``build_skew_policy=warn``, so
+        # a cell left stale on purpose is announced once rather than every pass.
+        self._build_skew_warnings: dict[str, str] = {}
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:
         """Time one reconciliation operation when metrics are collected.

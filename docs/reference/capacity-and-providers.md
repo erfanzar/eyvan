@@ -91,12 +91,16 @@ unknown/inconclusive, not absent.
 * **Manual.** Existing hosts and native-worker endpoints are adopted by
   declaration; Eyvan does not start, stop, or delete them. The driver reports
   operator-declared shape and provides native-worker fencing/cgroups where the
-  host runtime does so. Spot is deliberately not advertised.
+  host runtime does so. Spot is deliberately not advertised. A cell on another
+  Eyvan build is held rather than recycled under the default
+  `EYVAN_BUILD_SKEW_POLICY=auto` (see [Operating Eyvan](../operate.md#build-skew-after-an-upgrade)).
 * **On-prem SSH.** Hosts are claimed with a POSIX marker containing cell,
   management UID, provider generation, and fence. A foreign/old marker yields
   `NEEDS_RECREATE`; an unreachable host is `UNOBSERVED`, not gone. Eyvan owns
   the claim and marker, while the operator owns software installation and
-  normally worker startup.
+  normally worker startup. Because Eyvan cannot reinstall the host, a cell on
+  another Eyvan build is held out of scheduling until it is upgraded in place,
+  not drained and replaced (`EYVAN_BUILD_SKEW_POLICY=auto`).
 
 ## 4. Provider clients
 
