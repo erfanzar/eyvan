@@ -117,6 +117,10 @@ that 0.0.1 will contain.
 
 #### Packaging and deployment
 
+- `--gpu-devices` (or `EYVAN_NATIVE_WORKER_GPU_DEVICES`) on the native worker
+  slices one host's GPUs between cells: a container gets only those devices, a
+  native unit is denied every other GPU, and a job cannot select outside the
+  slice.
 - Five console entry points: `eyvan`, `eyvan-server`, `eyvan-agent`,
   `eyvan-native-worker`, `eyvan-migrate`.
 - Helm chart (`deploy/helm/eyvan`) with a pre-install migration hook, hardened

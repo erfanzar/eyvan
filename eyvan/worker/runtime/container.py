@@ -259,6 +259,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         workload_directory: str | os.PathLike[str] = _DEFAULT_WORKLOAD_DIRECTORY,
         multihost_directory: str | os.PathLike[str] = _DEFAULT_MULTIHOST_DIRECTORY,
         base_environment: tp.Mapping[str, str] | None = None,
+        gpu_devices: tp.Sequence[int] | None = None,
         command_runner: SystemdCommandRunner | None = None,
         boot_id_reader: tp.Callable[[], str | None] | None = None,
         cgroup_processes_reader: tp.Callable[[str], bool | None] | None = None,
@@ -297,6 +298,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             workload_group=None,
             workload_directory=None,
             base_environment=base_environment,
+            gpu_devices=gpu_devices,
             command_timeout_s=command_timeout_s,
             _defer_startup_recovery=True,
         )
@@ -410,10 +412,34 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         launch_environment = {
             name: value for name, value in self._base_environment.items() if name not in _HOST_ONLY_BASE_ENVIRONMENT
         }
+        launch_environment.update(self._gpu_device_environment())
         launch_environment.update(environment)
+        if self._gpu_devices is not None:
+            # The device request below is the only authority over which host
+            # GPUs this container gets. The NVIDIA hook also reads this name
+            # from the container's environment, where a value -- a gang plan's
+            # cell-local indices -- would read as host indices; Docker appends
+            # its own after it today, and that ordering is not this cell's to
+            # rely on.
+            launch_environment.pop("NVIDIA_VISIBLE_DEVICES", None)
         launch_environment["HOME"] = self._container_workload_directory
         launch_environment["EYVAN_CONTAINER_RUNTIME"] = "1"
         return launch_environment
+
+    def _gpu_request(self) -> str:
+        """Return the ``docker run --gpus`` value for this cell.
+
+        ``all`` for an unsliced cell, as before. A sliced cell names its
+        devices, and the value has to survive Docker's own parser: ``--gpus``
+        is read as CSV, so ``device=4,5`` unquoted is the field ``device=4``
+        followed by a stray ``5``, which Docker refuses. Docker's documented
+        spelling is the shell argument ``'"device=4,5"'``; with no shell in
+        between, that is one argv element with the double quotes in it.
+        """
+
+        if self._gpu_devices is None:
+            return "all"
+        return '"device=' + ",".join(str(device) for device in self._gpu_devices) + '"'
 
     @staticmethod
     def _mount_argument(mount: _ContainerMount) -> str:
@@ -592,7 +618,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             # in this unit; the container is the daemon's child and inherits
             # dockerd's limit. CUDA pins host memory for every async copy and
             # NCCL registers its buffers, so a GPU container states its own.
-            *(("--gpus", "all", "--ulimit", "memlock=-1:-1") if gpu_requested else ()),
+            *(("--gpus", self._gpu_request(), "--ulimit", "memlock=-1:-1") if gpu_requested else ()),
             *(("--privileged",) if self._runtime.privileged else ()),
             "--entrypoint",
             "/bin/sh",

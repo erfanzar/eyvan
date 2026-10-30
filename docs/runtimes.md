@@ -139,6 +139,50 @@ Two container fields change the IPC choice:
 | `ipc` | `host`, `private`, unset | Unset: host IPC for GPU workloads with no `shm_size`, Docker's default for everything else. Set: passed as `--ipc` for every workload. |
 | `shm_size` | positive integer with optional `b`/`k`/`m`/`g`, e.g. `16g` | A private `/dev/shm` of that size; a GPU workload then stays in a private namespace. Refused beside `ipc: host`, which ignores it. |
 
+### Slicing one host's GPUs between cells
+
+One machine can carry several cells: run one native worker per slice, each with
+its own port (`worker_port`) and `--state-dir`, and give each the host GPUs it
+owns with `--gpu-devices` (default: `EYVAN_NATIVE_WORKER_GPU_DEVICES`; empty or
+unset means unsliced). An eight-GPU host cut 1/1/2/4:
+
+```bash
+eyvan-native-worker --systemd-transient --port 8101 --state-dir /var/lib/eyvan/cell-a --gpu-devices 0
+eyvan-native-worker --systemd-transient --port 8102 --state-dir /var/lib/eyvan/cell-b --gpu-devices 1
+eyvan-native-worker --systemd-transient --port 8103 --state-dir /var/lib/eyvan/cell-c --gpu-devices 2,3
+eyvan-native-worker --systemd-transient --port 8104 --state-dir /var/lib/eyvan/cell-d --gpu-devices 4,5,6,7
+```
+
+(Other flags as usual.) Indices are the `N` of `/dev/nvidiaN`, which equals
+`nvidia-smi`'s index wherever the driver probed in PCI bus order;
+`nvidia-smi -q` prints each GPU's `Minor Number` if in doubt. The list is
+sorted and must be non-empty, non-negative and duplicate-free. Nothing checks
+that two workers on one host name disjoint lists; that is the operator's
+layout.
+
+What the list does:
+
+- **Container cells** run GPU workloads with `--gpus '"device=4,5,6,7"'`
+  instead of `--gpus all`, and drop `NVIDIA_VISIBLE_DEVICES` from the
+  container environment so the device request is the only authority.
+- **Native cells** run every unit with `DevicePolicy=closed` and `DeviceAllow`
+  for `/dev/nvidiactl`, `/dev/nvidia-modeset`, `char-nvidia-uvm` and the listed
+  `/dev/nvidiaN`. `closed` still permits the standard pseudo devices
+  (`/dev/null`, `/dev/zero`, `/dev/random`, …) but denies everything else,
+  including FUSE and InfiniBand verbs; a sliced cell that needs RDMA is not
+  supported yet. Diagnostic `exec` units beside a workload are confined the
+  same way.
+- **Both** number the slice `0..n-1` for the workload and set
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES=0,…,n-1` below the
+  job's environment. A job (or a GPU-coordinated gang rank) may narrow that to
+  a subset of `0..n-1`; any other `CUDA_VISIBLE_DEVICES` or
+  `NVIDIA_VISIBLE_DEVICES` — host indices, `all`, a UUID — is refused at
+  submission, and so is either name in `--runtime-env-file` beside a list.
+- **GPU-coordinated gangs** need no translation: `plan_gpu_devices` already
+  numbers a cell's GPUs `0..n-1`, so its split is the slice's split, provided
+  the catalog counts the slice's GPUs rather than the machine's (a plan for
+  more GPUs than the slice has is refused).
+
 ### Attached TPUs (existing hardware)
 
 A TPU Eyvan did not create gets its image at attach time:
