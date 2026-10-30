@@ -44,7 +44,7 @@ uv run python examples/spot_priority_demo.py \
   --artifact-prefix gs://your-bucket/spot-priority-demo
 ```
 
-Repeat the same command with `--execute --receipt-dir .pytest_cache/spot-demo`
+Repeat the same command with `--execute --receipt-dir ./spot-demo-results`
 only after reviewing the plan and accepting paid Spot allocation. Every
 invocation generates a new run/fleet identity; a dry-run identity is not reused.
 Existing fleets are refused, not overwritten. The default workflow deadline is
@@ -71,8 +71,7 @@ The run performs these steps:
 
 This is **same-host scheduler priority preemption**, not natural Spot reclamation
 or replacement-host recovery. It contains no provider VM-deletion command or
-fault-injection option. Historical separately authorized hardware experiments
-are described in [status](../status.md); they are not automatic qualification
+fault-injection option. Earlier hardware runs are not automatic qualification
 of a later example revision.
 
 ## Receipts, failures and cleanup

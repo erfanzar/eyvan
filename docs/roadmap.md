@@ -278,7 +278,7 @@ reviews).
   cross-origin logout cannot emit a deletion cookie even without a request
   cookie. The shipped Playwright browser harness passed login/logout,
   provider denial and an actual cross-site cookieless logout attack against a
-  disposable HTTPS plane and fake IdP (see `docs/status.md`). A blocking CI
+  disposable HTTPS plane and fake IdP. A blocking CI
   step retains its JSON receipt. Hosted execution and verification of the
   deployed IdP, certificates and multi-replica routing remain open.
 - **[done]** Remove the static default database password: the settings,
@@ -297,8 +297,6 @@ reviews).
 ## Documentation (9 → 10)
 - **[done]** `docs/provider-gcp-iam.md`: the exact permission inventory and
   the one grant that bites, written from a real multi-hour IAM outage.
-- **[done]** `docs/status.md`: measured operational numbers with an explicit
-  no-restatement-of-goals rule.
 - **[done]** `eyvan demo` runs a disposable loopback API/agent/fleet and a
   real callable in a separate local process. It ignores saved contexts and
   creates no cloud resources. CLI success, failure and timeout cleanup have
@@ -334,9 +332,9 @@ reviews).
 - **[done]** The native fleet example explicitly declares Python 3.11 and
   preserves node-level interpreter overrides. Three red/green regressions and
   the 6,767-pass required-PostgreSQL checkpoint cover the configuration fix.
-  The Spot attempt exposed an unsupported image interpreter; its
-  explicit-version retry hit provider stockout before execution. Allocation
-  and cleanup evidence in `docs/status.md` are not successful workload proof.
+  A live Spot attempt exposed an unsupported image interpreter; its
+  explicit-version retry hit provider stockout before execution, so it is not
+  successful workload proof.
 - **[done]** The IAM preflight above is the biggest DevEx fix: a 3-hour
   debugging session becomes a 30-second error message.
 - **[done]** `eyvan doctor` local preflight suite
@@ -434,26 +432,24 @@ reviews).
   four-chip Spot TPU: the batch trainer checkpointed at step 20,
   yielded to an interactive TPU job, and resumed on attempt 2 through step 40,
   matching an uninterrupted control. Both jobs succeeded and provider-side
-  VM cleanup was verified (`docs/status.md`, campaign `priority-3ee7d85be890`).
+  VM cleanup was verified.
   The checkpoint and restore used the same VM; this is not provider reclamation.
 - **[done]** Bounded replacement-host recovery after user-authorized deletion
-  of one owned Spot TPU VM: campaign `capacity-loss-a1c2f24faa77` resumed on a
-  different Spot instance at attempt 3, restored step 20, completed step 40 and
-  matched uninterrupted training. One capacity-loss event, zero failure/provider
-  preemption events; teardown independently verified. The raw harness exit 1
-  was a final log-field parser error; corrected verification of the unchanged
-  receipt passed, including negative controls (`docs/status.md`). This was
-  injected physical capacity loss, not natural provider reclamation.
+  of one owned Spot TPU VM: the workload resumed on a different Spot instance
+  at attempt 3, restored step 20, completed step 40 and matched uninterrupted
+  training. One capacity-loss event, zero failure/provider preemption events;
+  teardown independently verified. This was injected physical capacity loss,
+  not natural provider reclamation.
 - **[done]** Reusable dry-run-first `examples/spot_priority_demo.py` and portable
   training payload, documented in [tutorial 17](tutorial/17-spot-priority-demo.md).
-  Campaign `8a7612f7f4974c36a456609f15ee16ca` ran the shipped example through
-  Eyvan on four-chip Spot capacity: checkpoint 20, interactive yield,
+  A live run of the shipped example through Eyvan on four-chip Spot capacity:
+  checkpoint 20, interactive yield,
   same-host batch attempt 2 restoration to step 40 matching uninterrupted control.
   Owned teardown had no reported errors; independent provider listing was empty.
   The example contains no destructive loss injection or private runtime profile.
 - **[next]** Natural Spot reclamation and longer-running training qualification.
   The reusable example proves same-host priority restoration; the separately
-  authorized private campaign above proves injected replacement-host recovery,
+  authorized run above proves injected replacement-host recovery,
   not natural provider reclamation.
 
 ## Maturity (6 → 10)
@@ -463,5 +459,4 @@ reviews).
   migration and verifies PostgreSQL data survives. This passed locally and
   runs in CI. There are no release tags yet; it is not presented as a
   published-tag N to N+1 qualification.
-- **[next]** 4–6 week production pilot on the Spot fleet with published SLOs;
-  `docs/status.md` is the template this entry started.
+- **[next]** 4–6 week production pilot on the Spot fleet with published SLOs.
