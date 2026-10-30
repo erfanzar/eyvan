@@ -124,6 +124,34 @@ The complete worked shape is
 5. `bootstrap_egress: public-internet` for the docker install and pull, or
    a prebaked engine plus wheelhouse with `private-google-access`.
 
+### Attached TPUs (existing hardware)
+
+A TPU Eyvan did not create gets its image at attach time:
+
+```bash
+eyvan gcp connect --ssh you@HOST --python 3.13 \
+  --container-image us-east5-docker.pkg.dev/PROJECT/REPO/runtime@sha256:... \
+  --init-command "gcloud auth configure-docker us-east5-docker.pkg.dev --quiet"
+```
+
+The attach path states the same container block a generated fleet does
+(`privileged: true`, `pull_policy: if-not-present`,
+`working_dir: /var/lib/eyvan/workload`); without `privileged` every TPU job
+would be refused at launch. Docker must already run on every host (Cloud TPU
+VM images ship it). To change the image later, re-run `connect`; the
+dashboard's fleet init-script editor refuses attached TPUs because Eyvan never
+creates their hosts.
+
+### Per-job packages and workspaces inside an image
+
+`eyvan run --with PKG` and `--workspace DIR` also work in a container whose
+image has no Eyvan installed. Their wrappers are staged, standard-library
+only, into the read-only bridge mount
+(`/opt/eyvan-native/oci-callable-runner`) beside the callable runner, and the
+container executor rewrites `python -m eyvan.worker.runtime.<wrapper>` to
+those files. The image still needs a Python 3.11+ on `PATH` as `python`, and
+`--with` needs `pip` (or `uv`) in that interpreter.
+
 ## Per-job additions
 
 `TpuConfig(dependencies=("flax",))` installs packages on the cell before
