@@ -2373,15 +2373,10 @@ class CapacityPoolRecord(EyvanModel):
     initial_cells: int | None = Field(default=None, ge=0)
     max_cells: int = Field(default=1, ge=0, le=10_000)
     #: Seconds a cell holds capacity after its last lease leaves, so the next job
-    #: reuses the slice instead of re-queuing for one. Sized against what
-    #: reacquisition actually costs rather than against tidiness: a real TPU cell
-    #: recorded 1427.8s to reach READY, and a contended zone can leave a request
-    #: in WAITING_FOR_RESOURCES for days. Releasing a slice to save a few idle
-    #: minutes and then paying twenty-four to get it back is a bad trade, and on
-    #: granted spot capacity the idle minutes are the cheaper half. An hour is
-    #: deliberately well past that break-even: it spans the gap between one job
-    #: and the next attempt in an interactive session, which is the case the
-    #: window exists for, and holding longer costs nothing where the capacity is
+    #: reuses the slice instead of re-queuing for one. Reacquisition can take
+    #: longer than the idle gap, especially in a contended zone. An hour spans
+    #: the gap between jobs in an interactive session and avoids repeated cold
+    #: starts. Holding longer costs nothing where the capacity is
     #: granted rather than billed. Set zero to release on the first sweep where
     #: holding a scarce slice costs someone else more than re-queuing costs you.
     idle_timeout_s: float = Field(default=3600, ge=0)

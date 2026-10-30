@@ -373,10 +373,8 @@ class LocalAgentSupervisor:
 
         Reuse requires the running agent to be *the runtime's build*: a
         compatible agent compiled from other code is replaced (when this
-        process owns it) rather than silently reused. Code fixes that never
-        reach a long-lived daemon have marooned cells before -- a supervisor
-        that re-verifies only profile and secret would have kept reusing the
-        very agent an operator just fixed (observed 2026-08-22).
+        process owns it) rather than silently reused. Checking only profile and
+        secret would keep reusing a long-lived daemon after its code changes.
 
         ``reference_digest`` is that build: the one the serving control plane
         was launched from, which is also the build it stages for workers.

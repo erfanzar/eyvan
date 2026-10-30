@@ -391,17 +391,14 @@ class CellAgentService:
     def inventory(self) -> list[dict[str, str | int | None]]:
         """Return every cell this agent holds durable state for.
 
-        Every other route is keyed by ``cell_id``, so an agent's inventory was
-        unenumerable: the only way to see what it believed it owned was to read
-        its state document out of object storage by hand.
+        Other routes are keyed by ``cell_id``. This enumerates the inventory
+        without requiring direct access to the agent's state document.
 
         That matters because the document outlives the control plane that wrote
         it. A control plane whose database is replaced leaves its cells behind
         with ``desired_state: up``, and the agent faithfully keeps re-ensuring
         them -- capacity nobody asked for, recreated indefinitely, invisible to
-        the control plane that would otherwise own it. Found on 2026-08-01: a
-        v5p-128 queued resource being resurrected from a fleet deleted days
-        earlier.
+        the control plane that would otherwise own it.
 
         Read-only and deliberately narrow: identity, lifecycle and intent, so an
         operator can diff it against a control plane. Nothing here can mutate.

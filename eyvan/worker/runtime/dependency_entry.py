@@ -119,9 +119,8 @@ def _working_uv() -> str | None:
     Found is not the same as runnable. A host whose only ``uv`` is a snap
     (``/snap/bin/uv``) resolves it on PATH, but snap-confine refuses to start
     inside the workload's sandboxed systemd unit ("snap-confine is packaged
-    without necessary permissions"), so every job declaring dependencies on
-    that host failed before its command ran -- seen live 2026-10-25 on an
-    attached v5p-8. One ``--version`` call decides; any failure falls back to
+    without necessary permissions"). One ``--version`` call decides whether it
+    is usable; any failure falls back to
     the interpreter's own ``venv`` and ``pip``, which need nothing from PATH.
     """
 
@@ -174,9 +173,8 @@ def _inherit_running_environment(environment: Path) -> None:
 
     ``--system-site-packages`` exposes the *base* interpreter's site-packages.
     On a native cell the worker runs from ``/opt/eyvan-native/venv`` -- itself a
-    virtual environment -- so Eyvan, JAX and libtpu were all invisible to the job
-    environment, and on 2026-09-24 every Spot TPU job declaring
-    ``dependencies`` died at dispatch with ``No module named 'eyvan'``.
+    virtual environment -- so the base paths alone do not expose the worker's
+    Eyvan, JAX, and libtpu packages to jobs declaring dependencies.
 
     A ``.pth`` file appends the running environment's site directories after
     the job environment's own, so a package the job pins still wins and

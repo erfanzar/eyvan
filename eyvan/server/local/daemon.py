@@ -551,10 +551,9 @@ def serving_source_digest(
     """Return the build a live, Eyvan-owned loopback plane was launched from.
 
     The plane stages the worker wheel, so it -- not the CLI that happens to be
-    running -- is the build its cell agent must match. Judged against the CLI,
-    an ``eyvan up`` from an edited tree replaced the agent alone; the plane and
-    the staged wheel stayed on the old build, and the plane recycled every new
-    cell as stale, including a freshly granted Spot v6e-16 (2026-09-24).
+    running -- is the build its cell agent must match. Comparing with an edited
+    CLI tree could replace only the agent while the plane and staged wheel keep
+    the old build, causing new cells to be rejected as stale.
     ``None`` for a plane that predates the record field, or none at all.
     """
 

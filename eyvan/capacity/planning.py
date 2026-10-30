@@ -120,11 +120,8 @@ def _pool_workload_eligible(
 def _candidate_pool_ids(workload: WorkloadRecord) -> tuple[str, ...]:
     """Return the pools this workload accepts, best-known choice first.
 
-    A workload used to name exactly one pool, and a fleet is scoped to one zone,
-    so a job could only ever wait on the zone it was submitted against. That is
-    the opposite of how spot capacity is actually won: on 2026-08-15 us-east5-b
-    granted a 2x v6e-8 allocation and reclaimed it before boot, twice, while
-    us-central2-b held one long enough to finish.
+    Cross-zone alternates let a workload use pools with different Spot
+    availability rather than wait only on its first choice.
     """
 
     primary = workload.spec.required_labels.get("eyvan_pool") or ""
@@ -264,11 +261,9 @@ def _recent_failed_acquisition_streak(cells: list[CellRecord], now: datetime) ->
     """Count a pool's newest incarnations that failed without ever delivering.
 
     A failing cell is replaced by a *new* cell, whose belief starts clean, and
-    the failed one is deleted -- and deleted cells were excluded from the bound
-    so that one frozen tombstone could not park a pool forever. Together that
-    meant the bound could never trip on a replacement loop: on 2026-09-24 a Spot
-    v5litepod-8 pool in us-west4-a, whose every queued resource GCP failed with
-    "tenant project creation", minted fifteen cells in thirty minutes.
+    the failed one is deleted. Excluding all deleted cells would prevent the
+    bound from ever tripping on a replacement loop; counting them forever would
+    let old tombstones park a pool indefinitely.
 
     So the streak is read across outcomes, newest first, and it ends at the
     first cell that delivered capacity (one success ends a run of failures).
@@ -360,8 +355,7 @@ def pool_cell_epoch(pool: CapacityPoolRecord) -> str:
     tombstones a previous control plane left on the same agent. Every apply is
     rejected with "generation 1 is not newer than fenced cell ... generation 2",
     the cell is marked lost, the autoscaler mints the next id, and the fleet
-    churns forever without ever provisioning. Observed live on 2026-08-01: cells
-    0001..0006, twelve consecutive fence conflicts, no capacity.
+    churns forever without ever provisioning.
 
     Derived from ``created_at`` specifically, not ``generation`` or
     ``initialized_at``. It is the only field that is *stable for the life of the
@@ -397,13 +391,6 @@ def next_pool_cell_index(pool: CapacityPoolRecord, cells: tp.Iterable[CellRecord
     walks the counter *backwards* whenever one is deleted, so a pool that has
     churned hands the same id out twice -- and the second holder inherits
     whatever the first left behind at the provider under that name.
-
-    Live on 2026-08-02: two cells shared index 0007, and the newer one found a
-    ``v5p-128`` queued resource created hours earlier wearing the name it had
-    just been given. Eyvan correctly refused to adopt a resource of the wrong
-    shape, then drained and retried -- forever, against an ACTIVE and billing
-    TPU it could never accept. The earlier ``research-*`` v5p-128 orphan was the
-    same mechanism in a different fleet.
 
     Callers must pass *every* cell of the pool including deleted ones: a deleted
     record is precisely the evidence that its index is spent.
@@ -522,9 +509,7 @@ def cell_provides_pool_supply(cell: CellRecord, pool: CapacityPoolRecord, now: d
         # started, and the cost is not one wasted cell but an unbounded loop --
         # the reaped cell's queued apply is discarded as stale, a replacement is
         # launched, its apply goes to the back of the same queue, and the next
-        # timeout repeats it. Observed on 2026-08-21: cells living 1805s against
-        # a 1800s budget, every one with ``provider_phase`` still None and
-        # nothing in the zone, for as long as the outbox stayed behind.
+        # timeout repeats it for as long as the outbox stays behind.
         #
         # A slow outbox is a reason to wait for the apply, never a reason to
         # destroy the cell it belongs to. Provisioning is timed from when
@@ -716,9 +701,8 @@ class CapacitySimulation:
             )
         # A queue-admission denial is the provider saying this project may not
         # ask for this shape in this zone. It is not a stockout to wait out: a
-        # denied cell went on counting as the workload's supply until the
-        # provisioning timeout, and the zone was then asked again, so a
-        # cross-zone workload never reached its other zones (2026-09-24). Each
+        # denied cell must not count as supply until the provisioning timeout or
+        # prevent a cross-zone workload from reaching its other zones. Each
         # workload stops considering the pools that denied *it*.
         queue_denied_pools: dict[str, set[str]] = {}
         owned_pools: dict[str, set[str]] = {}
@@ -747,9 +731,8 @@ class CapacitySimulation:
                 # A request the provider has already refused (a Compute stockout
                 # answers at once) still counts as supply until its timeout, so
                 # the pool does not launch a duplicate; but it is not racing.
-                # Counted as racing, twenty stocked-out v5e zones held all twenty
-                # race slots for the whole provisioning window while six zones
-                # were never asked (2026-09-25).
+                # Counting failed requests as racing would occupy race slots
+                # until timeout and prevent trying other zones.
                 failed_request = cell.state is CellState.UNAVAILABLE and cell.provider_failure_code is not None
                 target = stalled_pools if failed_request else owned_pools
                 target.setdefault(cell.autoscale_request_workload_id, set()).add(pool.id)
@@ -766,10 +749,8 @@ class CapacitySimulation:
                 # capacity. Dropping a leased cell therefore does not skip one
                 # cell, it raises out of a leader phase that has no failure
                 # isolation, so nothing later in the cycle runs: no observation,
-                # no settlement, no release. Seen on a live fleet, where
-                # `eyvan down` disabled a pool whose v5p-16 multislice still held
-                # a lease and the plane then spent every two seconds raising
-                # while the accelerator went on billing.
+                # no settlement, no release. Disabling a pool must not prevent
+                # its remaining leases from being observed and settled.
                 #
                 # DRAINING rather than the cell's own state because that is what
                 # it now is: it carries work and must attract none. ``to_core_cell``
@@ -896,10 +877,8 @@ class CapacitySimulation:
             exhausted = _acquisition_exhausted(pool, pool_acquisition_failures)
             for workload in generic_workloads:
                 if exhausted or pool.id in queue_denied_pools.get(workload.id, set()):
-                    # The same two bounds the named branch applies. Without them a
-                    # workload that names no pool -- a raw CLI submission -- was
-                    # offered every pool on every pass, and asked us-south1-c four
-                    # times after it had denied queue admission (2026-09-24).
+                    # Apply the named branch's bounds here too, so generic
+                    # submissions do not repeatedly request exhausted or denied pools.
                     continue
                 worker_count = workload.spec.worker_count
                 if worker_count > 1 and not pool.hosts_multi_worker_cells:
@@ -1029,9 +1008,8 @@ class CapacitySimulation:
                     real_ids[pool_id].add(lease.cell_id)
                     if lease.cell_id in self.acquiring_cell_ids:
                         # Placed on a request the provider has not granted yet:
-                        # still a race. Without this, the first zone to accept
-                        # a *request* ended the race, even when it then sat in
-                        # WAITING_FOR_RESOURCES for hours (2026-09-24).
+                        # still a race. Accepting a *request* does not grant
+                        # capacity; it may remain in WAITING_FOR_RESOURCES.
                         race_seeds.append((pool_id, lease.workload_id, self.acquiring_cell_ids[lease.cell_id]))
                 else:
                     virtual_counts[pool_id].append(worker_count)
@@ -1386,8 +1364,8 @@ class CapacityPlanner:
             available_units -= 1
         # The one gate on *new* capacity for a pool whose acquisitions keep
         # failing. Per-cell belief backs off observation of a failed cell, but a
-        # failed cell is replaced and its replacement started clean, so demand
-        # and warm floors alike minted cell after cell (2026-10-25: past 0439).
+        # failed cell is replaced and its replacement starts clean. Demand and
+        # warm floors must both respect the pool-level gate to bound replacement loops.
         backoff = self._acquisition_backoffs.get(pool.id)
         withheld: tuple[int, ...] = ()
         if backoff is not None and backoff.active(self._now):

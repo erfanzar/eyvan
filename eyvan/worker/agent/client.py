@@ -149,10 +149,6 @@ class CellAgentUnavailableError(RuntimeError):
     belief -- retiring capacity for a timeout the provider never caused and
     biasing future placement against a zone that did nothing wrong.
 
-    Observed live on 2026-08-01: one transient DNS failure on the control plane's
-    own host, while the agent was reading its fleet state, discarded a v5p-16 Spot
-    Multislice that Google had just granted after a 100-minute queue wait.
-
     A structured 502 (:class:`CellAgentCapacityProviderError`) is the opposite
     case and keeps its own handling -- there the agent successfully reported that
     the *provider* failed.
@@ -245,9 +241,8 @@ class CellAgentClient:
         `CapacityStatus.PROVIDER_ERROR`.
 
         That is the same misclassification :class:`CellAgentUnavailableError`
-        exists to prevent, arriving by a different door. Observed live on
-        2026-08-01: restarting the agent recorded "Server disconnected without
-        sending a response" as a provider error against a healthy queued cell.
+        exists to prevent: agent transport failure says nothing about provider
+        capacity.
 
         Routing every call through here keeps the taxonomy in one place instead
         of twelve `except` clauses that will drift.

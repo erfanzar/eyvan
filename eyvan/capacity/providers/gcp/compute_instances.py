@@ -758,9 +758,8 @@ class GcloudNativeWorkerArtifactAccessStore:
     )
 
     #: Bucket IAM is a read-modify-write guarded by an etag: two grants racing on
-    #: one bucket make the loser fail ``HTTPError 412``. Seen live on 2026-09-24
-    #: when three cells were provisioned in parallel -- and reported as a missing
-    #: *permission*, because the error discarded gcloud's own words.
+    #: one bucket make the loser fail ``HTTPError 412``. Retry these conflicts
+    #: rather than misclassifying them as missing permissions.
     _PRECONDITION_ATTEMPTS: tp.ClassVar[int] = 6
     _PRECONDITION_BACKOFF_S: tp.ClassVar[float] = 0.5
     _BUCKET_LOCKS: tp.ClassVar[dict[str, threading.Lock]] = {}
@@ -927,10 +926,9 @@ class GcloudComputeProvider:
         A Spot VM is created with ``instanceTerminationAction=DELETE``, so both a
         reclamation and an insert that failed after the create call returned
         (the waiter interrupted, or GCE giving up after ``PROVISIONING``) leave
-        the same evidence behind: no instance. Reported as "Compute instance is
-        absent", a Spot stockout on 2026-09-24 reached the user as
-        ``hard_constraint`` with the provider's sentence nowhere in sight. The
-        zone's operation log still holds that sentence, so read it.
+        the same evidence behind: no instance. The zone's operation log can
+        distinguish the causes and preserve the provider's diagnostic instead
+        of reducing both to a generic absence.
 
         Best effort by design: any failure to read the log answers ``None`` and
         the caller keeps its generic observation. Diagnosis must never be the

@@ -11,13 +11,9 @@ variables like ``PYTHONPATH``, a naive ``subprocess.run`` passes them straight
 through, and the CLI's interpreter then resolves imports through paths chosen
 for an entirely different program.
 
-This was a live outage, not a hypothetical: on 2026-08-22 a client process set
-a checkout-relative ``PYTHONPATH`` to run from a source tree, the cell agent
-inherited it, and every ``gcloud`` it spawned crashed at import time with
-``PermissionError: Operation not permitted`` -- macOS TCC refused the CLI's
-embedded Python a directory listing inside ``~/Documents`` that the invoking
-terminal was allowed to read. The fleet-state write path fell over, cells that
-were ACTIVE and billing could never reach READY, and nothing ran for hours.
+An inherited checkout-relative ``PYTHONPATH`` can make ``gcloud`` fail during
+imports. On macOS, TCC may deny the CLI's embedded Python access to directories
+that the invoking terminal can read, blocking provider and fleet-state operations.
 
 Provider CLIs must start with none of the caller's interpreter steering. These
 variables are the whole set that changes where a Python process looks for code

@@ -117,9 +117,8 @@ TERMINAL_NODE_STATES = frozenset(
 #:
 #: ``PREEMPTED`` is the honest signal, but it is transient: GCP deletes the node
 #: it reclaimed, so whether Eyvan ever sees ``PREEMPTED`` is a race between the
-#: reclamation and the reconcile interval. Both cells of the 2026-08-13 P5 run
-#: were reclaimed the same way and only the first was observed in ``PREEMPTED``;
-#: the second was already ``DELETING``, and the workload was killed for it.
+#: reclamation and the reconcile interval. ``DELETING`` can be the first state
+#: observed after Spot reclamation and must follow the same recovery path.
 SPOT_RECLAMATION_NODE_STATES = frozenset(
     {
         GcpTpuNodeState.PREEMPTED,
@@ -387,9 +386,8 @@ class QueuedResourceSpec:
 def _queued_resource_failure(raw: JsonObject) -> str | None:
     """Return the provider's own words for a FAILED queued resource, if it gave any.
 
-    GCP records why in ``state.failedData.error`` -- on 2026-09-24 a Spot
-    v5litepod-8 in us-west4-a failed with "Failed to perform tenant project
-    creation" -- and Eyvan reported only "queued resource is terminal".
+    GCP records the cause in ``state.failedData.error``. Preserve that diagnostic
+    rather than reporting only that the queued resource is terminal.
     """
 
     state = raw.get("state")
@@ -658,9 +656,8 @@ class GcloudTpuProvider:
         normalized = " ".join(diagnostic.casefold().split())
         # "Queueing is not supported" is the same answer from the other side: the
         # zone has no queue for this accelerator type at all, so a retry can never
-        # be admitted either. Left as a generic provider error, a 20-zone v5e-8
-        # race asked asia-northeast1-b and europe-west3-c again after each
-        # refusal had been cleaned up (2026-09-24).
+        # be admitted either. Classify it explicitly to avoid retrying a zone
+        # that cannot accept the request.
         return (
             "does not have permission to submit requests into this queue" in normalized
             or "queueing is not supported for accelerator type" in normalized
@@ -674,7 +671,7 @@ class GcloudTpuProvider:
         ``queued-resources describe`` or ``tpu-vm describe`` for a provisioned
         queued resource: the node comes back with ``labels: null`` and
         ``metadata: {}`` even though the startup script from that same metadata
-        demonstrably ran. Verified against a live ACTIVE v5p-16 on 2026-08-02.
+        ran.
 
         So "no ownership fields at all" is not evidence of a foreign resource --
         it is the provider declining to answer, and it is the normal case here.

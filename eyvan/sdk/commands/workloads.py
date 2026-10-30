@@ -997,9 +997,8 @@ def exec_in_workload(
     failed = _failed_exec_ranks(response)
     if failed:
         # The document above is complete either way; the exit status is what a
-        # script branches on. It was 0 while every rank answered "this fleet
-        # does not permit exec" (2026-09-24), so a caller could not tell a
-        # refused diagnostic from a successful one without parsing the body.
+        # script branches on. A refused diagnostic must exit non-zero so callers
+        # can distinguish it from success without parsing the body.
         click.echo(f"exec failed on rank(s) {', '.join(str(index) for index in failed)}", err=True)
         raise SystemExit(1)
 

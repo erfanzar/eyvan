@@ -57,11 +57,9 @@ class EyvanMetrics:
             registry=registry,
         )
         #: Violations of each durability invariant, one series per invariant and
-        #: always all of them. The plane could already detect these -- I3 names a
-        #: stuck outbox command, I9 a lease pointing at a cell that is gone --
-        #: but only when a human ran `eyvan capacity invariants`. Both were true
-        #: of a live fleet for twenty minutes on 2026-08-12 while four TPU VMs
-        #: billed, and nothing said so.
+        #: always all of them. I3 names a stuck outbox command, I9 a lease pointing
+        #: at a cell that is gone. Export them so detection does not depend on an
+        #: operator running `eyvan capacity invariants`.
         #:
         #: Zero is published for the satisfied ones deliberately. A gauge that
         #: only appears when something is wrong cannot be alerted on before it

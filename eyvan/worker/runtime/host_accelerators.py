@@ -10,32 +10,22 @@ hardware catalog says what a shape carries, ``CellAccelerator`` reports what the
 catalog said, and ``GpuRankLayout`` hands a rank a ``CUDA_VISIBLE_DEVICES`` built
 from that description. None of it looks at the machine.
 
-That gap has a shape, observed on two real cells on 2026-08-13. An
-``nvidia-tesla-p100`` cell came up with the GPU attached, booted the accelerator
-image, ran an Eyvan callable to completion and reported success -- while
-``nvidia-smi`` could not reach the driver, because the image pins NVIDIA 580 and
-that branch dropped Pascal. The host had ``/dev/nvidiactl`` and no ``/dev/nvidia0``.
-A ``nvidia-tesla-t4`` cell on the same image had six loaded modules and a real
-``/dev/nvidia0``. The declaration was identical for both; only the machine
-differed, and only the machine could say so.
+An attached GPU is not necessarily usable. An incompatible driver can create
+``/dev/nvidiactl`` without binding a GPU or creating ``/dev/nvidia0``, while a
+callable still reports success. Only host-side probing distinguishes that case
+from a usable accelerator.
 
 Stdlib only, and no subprocess: this runs on the worker path, and shelling out to
 ``nvidia-smi`` would make the answer depend on a binary the failing case is
 precisely the one that cannot run.
 
-**Nothing calls this yet, deliberately.** It is a correct probe with no consumer,
-which is the shape of defect this package has shipped before -- a working
-feature no client can ask for -- so it declares itself here rather than reading
-as protection that is in force. Wiring it belongs in
-``_with_execution_readiness`` in ``eyvan.worker.agent.service``, which already
-downgrades a cell to ``EXECUTION_CONNECTING`` when a readiness probe refuses.
+**Nothing calls this yet.** Wiring it belongs in ``_with_execution_readiness``
+in ``eyvan.worker.agent.service``, which already downgrades a cell to
+``EXECUTION_CONNECTING`` when a readiness probe refuses.
 
-Two things gate that. It cannot be qualified without a GPU cell, and the
-readiness path it would join is the one every TPU cell depends on, so a
-mis-scoped branch would break capacity that works today in order to guard
-capacity nobody is currently running. When a GPU is in scope again, gate
-strictly on a GPU accelerator kind and qualify against both cases above -- the
-P100 is the one that reported success while its driver could not open the GPU.
+Integration must gate strictly on the GPU accelerator kind because the readiness
+path also serves TPU cells. Qualify it against both usable and incompatible-driver
+GPU hosts before treating this probe as an enforced readiness check.
 """
 
 from __future__ import annotations

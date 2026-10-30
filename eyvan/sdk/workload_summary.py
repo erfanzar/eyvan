@@ -168,9 +168,8 @@ def summarize(record: JsonObject) -> tuple[str, ...]:
     where = ", ".join(value for value in zones if isinstance(value, str)) if isinstance(zones, list) else ""
     if alternates:
         # A cross-zone job may run in any of its candidates, so the first choice
-        # is a request, not a placement, and its region binds nothing. Printed as
-        # "placed on", it named europe-west4-b for a Spot v5p-8 that was running
-        # in us-central1-a (2026-09-24).
+        # is a request, not a placement, and its region binds nothing. Do not
+        # present the requested pool as the workload's actual location.
         row("requested", f"{pool or 'unknown'} or {len(alternates)} alternate pool(s)")
         row("region", where or None)
     else:

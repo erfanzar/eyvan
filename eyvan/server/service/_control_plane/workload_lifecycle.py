@@ -399,13 +399,10 @@ class WorkloadLifecycleMixin:
     ) -> tuple[WorkloadRecord, bool]:
         """Settle a workload whose stop the worker will never confirm.
 
-        The escape from a deadlock observed on hardware: a native worker answered
-        500 to every ``/stop``, the agent retried indefinitely, and the workload
-        stayed in CANCELLING. Its lease therefore stayed active, so the cell
-        could not be deleted -- ``cell-delete`` refuses while leases are held --
-        so it never left DRAINING and ``eyvan down`` never completed. Nothing in
-        the CLI resolved it; ``force_finalize_preemption`` attests *preemption*
-        victims and does not apply to an ordinary cancel.
+        A worker that never confirms ``/stop`` can leave a workload CANCELLING
+        with an active lease. That lease blocks cell deletion, so fleet teardown
+        cannot complete. ``force_finalize_preemption`` attests preemption victims
+        and does not resolve an ordinary cancel; this is the explicit escape path.
 
         **This declares a process dead that nobody confirmed stopping.** That is
         why a cell is drained rather than returned to service: the workload may

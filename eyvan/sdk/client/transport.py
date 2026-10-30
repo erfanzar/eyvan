@@ -322,8 +322,8 @@ class SyncApiTransport:
 
         A read is retried on the statuses a mutation is: the server answers a
         PostgreSQL serialization conflict with 503 and ``Retry-After``, and a
-        read loses nothing by asking again. Unretried, one such conflict ended a
-        client's ``wait()`` on a live Spot job whose plane was fine (2026-09-24).
+        read loses nothing by asking again. A transient conflict must not end
+        a client's ``wait()`` while its workload is still running.
         """
 
         if method.upper() not in _SAFE_METHODS:

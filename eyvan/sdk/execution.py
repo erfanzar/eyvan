@@ -635,29 +635,15 @@ def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorC
 def _refuse_unplaceable_config(config: AcceleratorConfig) -> None:
     """Refuse a config whose GPU the job would not actually be able to use.
 
-    The reason changed on 2026-08-13 and is worth stating exactly, because the
-    original one is now false. Placement *works*: a ``GpuConfig`` callable was
-    serialized, uploaded, placed on a real ``nvidia-tesla-p100`` spot cell, run,
-    and returned its result, and the control plane now has a GPU pool gate beside
-    the CPU and TPU ones.
+    Placement supports GPU callables, but ``_DEFAULT_GPU_IMAGE`` pins
+    ``...with-nvidia-580``, and that driver branch dropped Pascal and Volta.
+    A P100 or V100 cell can therefore boot, register, and report job success
+    even though no process can open its GPU.
 
-    What it returned is the problem. ``nvidia-smi`` on that cell reported it
-    could not talk to the driver, and the kernel said why::
-
-        NVRM: The NVIDIA GPU 0000:00:04.0 (PCI ID: 10de:15f8)
-        NVRM: nvidia.ko because it does not include the required GPU
-        NVRM: None of the NVIDIA devices were initialized.
-
-    ``_DEFAULT_GPU_IMAGE`` pins ``...with-nvidia-580``, and the 580 branch
-    dropped Pascal and Volta. So a fleet declaring a P100 or a V100 gets a cell
-    that boots, registers, accepts work and runs it on a GPU no process can open.
-
-    The job *succeeded*, which is the hazard: nothing in the run said the
-    accelerator was missing, and a training job would simply have been slow, or
-    crashed somewhere far from the cause. A refusal a caller can read beats a
-    success they cannot trust. Lifting this needs either a driver the pool's
-    accelerator supports -- ``vm_image`` is settable per pool -- or a cell-side
-    check that refuses to register a GPU cell whose driver cannot see its GPU.
+    Refuse rather than allow silent CPU fallback or a failure far from the
+    cause. Lifting this needs either a driver the accelerator supports --
+    ``vm_image`` is settable per pool -- or a cell-side check that refuses to
+    register a GPU cell whose driver cannot see its GPU.
     """
 
     if isinstance(config, GpuConfig):

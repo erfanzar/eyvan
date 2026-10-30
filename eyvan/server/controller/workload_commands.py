@@ -97,10 +97,9 @@ _SHELL_ONLY_FIRST_WORDS = frozenset(
 
 #: Isolated mode for the wrapper interpreters (dependency and workspace entries).
 #: They run on the job's environment, whose ``PYTHONPATH`` carries Eyvan's
-#: multi-host ``sitecustomize``. Without ``-I`` that hook ran in the *wrapper*:
-#: it consumed ``EYVAN_JAX_MULTIHOST``, failed on ``import jax`` (the worker venv
-#: has none) and the job exec'd afterwards never joined its gang -- seen on every
-#: dependency-declaring job on a v5p-32 on 2026-10-29. ``-I`` only changes how
+#: multi-host ``sitecustomize``. Without ``-I`` the hook would run in the wrapper,
+#: consume ``EYVAN_JAX_MULTIHOST``, and try importing JAX in the worker venv,
+#: preventing the eventual job from joining its gang. ``-I`` only changes how
 #: the wrapper itself starts; the environment it execs the job with is untouched.
 _WRAPPER_INTERPRETER_FLAGS = ("-I",)
 
@@ -154,12 +153,10 @@ def _exec_argument(command: str) -> str:
     """Return ``command`` in the form a wrapper's ``-- COMMAND`` tail must take.
 
     The wrappers ``exec`` what follows their ``--``, and the whole entrypoint
-    reaches the host as ``/bin/sh -c``. Appending shell syntax unquoted handed
-    only its first simple command to the wrapper: seen live on a v5p-32 on
-    2026-10-29, a rendered EasyDeL launch script ran ``set -e`` (which execvp
-    cannot find) inside the dependency wrapper and every later line on the bare
-    worker Python, where ``easydel`` did not exist. Such a command now travels
-    as one ``/bin/sh -c`` argument, so all of it runs inside the wrapper. A
+    reaches the host as ``/bin/sh -c``. Appending shell syntax unquoted would
+    hand only its first simple command to the wrapper and run later commands
+    outside the dependency environment. Shell syntax therefore travels as one
+    ``/bin/sh -c`` argument, so all of it runs inside the wrapper. A
     plain program and its arguments is still appended verbatim; it is exec'd
     directly and keeps the PID its supervisor started.
     """
@@ -211,11 +208,9 @@ class UnreachableCallbackRefusal(PermanentDispatchRefusal):
     """A job needs to call the plane back, and the plane gives it no address it can reach.
 
     Secret mounts, in-job submission and progress reporting are all redeemed by
-    the worker at ``EYVAN_PUBLIC_URL``. Raised as a bare ``RuntimeError`` this was
-    retried with backoff forever while the lease held a Spot TPU -- and, for a
-    secret-bearing workload, its own sentence was replaced by "output suppressed
-    for secret-bearing execution", so nobody could see why (2026-09-24, a v6e-4
-    in asia-northeast1-b against a loopback plane). The message is Eyvan's own,
+    the worker at ``EYVAN_PUBLIC_URL``. Retrying cannot fix an unreachable callback
+    address, so settle instead of holding the lease through repeated dispatches.
+    The message is Eyvan's own,
     raised before any cell is contacted, and carries no secret material.
     """
 
@@ -224,16 +219,9 @@ class InsecureManagedArtifactTransport(PermanentDispatchRefusal):
     """A managed-artifact workload would carry its capability token over plain HTTP.
 
     Retrying cannot change the scheme of ``EYVAN_PUBLIC_URL``, so this belongs in
-    the family that settles instead of the family that retries. It was raised as
-    a bare ``RuntimeError``, which is the exact shape this class exists to
-    prevent: the outbox retried it forever with a capped backoff while the lease
-    held its accelerator, and the accelerator billed the whole time. Observed on
-    a live v5p-16 and a live v6e-8 -- ten attempts over twenty-one minutes, the
-    workload stuck ``leased``, the TPU held, and no diagnostic on any surface.
-
-    Every head built by ``eyvan head up`` hits this, because that command writes
-    an ``http://`` public URL and terminates no TLS, so it refused every callable
-    it was otherwise configured to accept.
+    the family that settles instead of the family that retries. Raising a bare
+    ``RuntimeError`` would keep retrying while holding the workload's accelerator
+    without any possibility of a secure dispatch.
     """
 
 
@@ -277,11 +265,9 @@ class GangRendezvousCollision(PermanentDispatchRefusal):
     silently exchanging tensors, which fails as a wrong answer rather than as an
     error.
 
-    Refused here rather than dodged by moving a port. ``worker/runtime/registry.py``
-    records what a port no firewall permits costs: every rank of every ``pods=1``
-    run died in ``RegisterTask`` with DEADLINE_EXCEEDED on 2026-08-02. A port
-    that moves per workload has that failure mode in every deployment whose rules
-    name these two numbers.
+    Refused here rather than dodged by moving a port. A port that moves per
+    workload can cause rendezvous timeouts in deployments whose firewall rules
+    permit only the two fixed ports.
 
     Permanent in the sense that matters: the placement that produced it is one
     the scheduler is configured never to make (see ``exclusive_workloads``), so a

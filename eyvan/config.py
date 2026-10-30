@@ -233,11 +233,9 @@ class EyvanSettings:
     log_archive_concurrency: int = 8
     #: How many of a workload's candidate zones may be asked for capacity at
     #: once. One is a serial search: ask the best zone, and if it will not grant
-    #: try the next one a reconcile interval later. Higher races them, which is
-    #: how spot capacity is actually won -- on 2026-08-15 us-east5-b granted and
-    #: reclaimed a 2x v6e-8 twice while us-central2-b held one long enough to
-    #: finish, and a serial search would have spent both of those attempts
-    #: before reaching the zone that worked.
+    #: try the next one a reconcile interval later. Higher races them to reach
+    #: zones with available Spot capacity without waiting for each earlier
+    #: request to fail.
     #:
     #: One by default, because every extra request is a machine somebody is
     #: billed for until the race resolves. Bounded by the workload's own
@@ -669,12 +667,8 @@ class EyvanSettings:
             raise TypeError("GCP native runtime settings require a GcpNativeRuntimeProfile")
         # Every other setting is the operator's, read from the environment
         # exactly as ``from_env`` reads it; the profile overrides only what it
-        # owns. Built from bare defaults instead, each operator setting went
-        # inert on this path one at a time -- the callable allow-list
-        # (2026-08-01), then EYVAN_CAPACITY_RACE_WIDTH and
-        # EYVAN_CAPACITY_SUPPORTS_EXEC (2026-09-24): a twenty-zone Spot fleet
-        # asked one zone per reconcile while the variable said twenty, and exec
-        # was refused on a fleet that had enabled it.
+        # owns. Building from bare defaults would silently ignore operator
+        # settings such as the callable allow-list, race width, and exec policy.
         return replace(
             cls.from_env(),
             agent_shared_secret=profile.agent_shared_secret,
@@ -682,8 +676,8 @@ class EyvanSettings:
             # The profile's agent runs on this machine beside its control plane,
             # so fleet state defaults to a local file: the document is a cache
             # of provider-owned facts plus Eyvan's fences, and a bucket write on
-            # that cache's critical path once left ACTIVE TPUs unusable while
-            # they billed (2026-08-22). An explicit EYVAN_FLEET_STATE_URI --
+            # that cache's critical path could block use of already-active
+            # capacity. An explicit EYVAN_FLEET_STATE_URI --
             # which is how a remote head shares one document across agents --
             # still wins.
             fleet_state_uri=os.getenv("EYVAN_FLEET_STATE_URI") or str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH),

@@ -9,11 +9,9 @@ Availability belief is stored per cell. ``CapacityBelief.observe`` doubles a
 cell's cooldown on every consecutive failure and caps it at the pool's
 ``max_backoff_s`` -- but that cooldown only gates *observing* the cell. A cell
 whose capacity request failed is retired and *replaced*, the replacement starts
-from a clean belief, and nothing gated the planner from minting it. So the
-doubling never outlived one incarnation: a pool whose every request failed with
-the same configuration error (2026-10-25, a Spot v5p-16 pool whose gcloud
-account could not bind native-worker secrets) created cell after cell -- past
-number 0439 -- on the scheduling loop every other fleet shares.
+from a clean belief. Without a pool-level gate, a repeated configuration error
+could therefore create an unbounded replacement loop on the scheduling loop
+shared by every fleet.
 
 This module reads the streak across incarnations: the pool's cells that failed
 without ever delivering capacity, newer than the last one that did. The curve
@@ -133,7 +131,7 @@ def pool_acquisition_backoffs(
 
     Deliberately not reset by a template change: a fleet re-applied with a new
     template on every pass would otherwise re-arm the very loop this bounds, and
-    the failure that motivated it (an IAM grant) is not in the template at all.
+    external configuration failures such as IAM grants are not in the template.
     The cap bounds how long a fixed pool waits.
 
     A streak is a chain: it ends at a gap longer than the pool's ceiling plus

@@ -113,9 +113,8 @@ class CapacityLifecycleLogger:
         if previous.state is CellState.READY and current.state is CellState.REGISTERING:
             # The provider still reporting healthy capacity means the machine
             # was not taken: Eyvan's own runtime probe failed, which is what a
-            # cell agent restart looks like. Calling that a preemption put two
-            # false "preempted" warnings on live v6e-4 cells whose VMs never
-            # stopped (2026-09-24).
+            # cell agent restart looks like. Do not classify a runtime probe
+            # failure as provider preemption while capacity remains healthy.
             if current.provider_phase in READY_CAPACITY_STATUSES:
                 return CapacityLifecycleEvent.UNHEALTHY
             return CapacityLifecycleEvent.PREEMPTED

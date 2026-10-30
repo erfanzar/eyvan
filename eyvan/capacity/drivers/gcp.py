@@ -334,10 +334,8 @@ class GcpTpuCapacityDriver:
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
-            # they are willing to have diagnostics run on. The turning-on is what
-            # was missing -- this was a literal False, so the sentence above
-            # described a control nobody had and `eyvan workload exec` was
-            # refused on every GCP fleet while the native runtime implemented it.
+            # they are willing to have diagnostics run on. Advertise that policy
+            # rather than silently disabling the runtime's exec capability.
             supports_exec=self.supports_exec,
             resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
         )
@@ -346,15 +344,11 @@ class GcpTpuCapacityDriver:
     def _cell_mutation(self, cell_id: str) -> tp.Iterator[None]:
         """Serialize mutations of *one* cell without serializing the fleet.
 
-        ``apply_capacity`` and ``reconcile`` used to hold ``_mutation_lock`` and
-        the fleet-state lease across ``provider.ensure`` -- a ``gcloud ... create``
-        that waits minutes on a Spot insert. Every other cell on the document
-        queued behind it: on 2026-09-24 one v5p-8 Compute create stalled the
-        v5p-16, v5litepod-8 and v6e-4 requests of three unrelated fleets in three
-        other zones for its whole duration. ``release`` had been fixed for the
-        same reason on 2026-08-19; the other half of the lifecycle had not.
+        Holding ``_mutation_lock`` or the fleet-state lease across
+        ``provider.ensure`` would queue unrelated cells behind a provider call
+        that can take minutes on a Spot insert.
 
-        The fleet lock now covers only record claims and persists, each a
+        The fleet lock covers only record claims and persists, each a
         fenced compare-and-swap. What still must not overlap is two mutations
         of the *same* cell -- two creates racing one resource id. This lock,
         always taken before the fleet lock, excludes threads in this process;
@@ -1041,11 +1035,8 @@ class GcpTpuCapacityDriver:
 
         The provider generation alone is not enough. The staged worker wheel is
         baked into the startup script at bootstrap time, and re-staging a wheel
-        does not change the generation -- so ``eyvan runtime init`` published new
-        code that reached no existing cell, and there was no way to tell from
-        the outside. Live on 2026-08-01 that meant TPU hosts ran a three-day-old
-        wheel for an entire day, and a "fix" that had been verified in the
-        package was simply not on the machine.
+        does not change the generation. Artifact identity must participate so
+        re-staged code reaches existing cells.
 
         The identity includes both artifact URIs, their verified content hashes,
         and any GCS generation pins. Changing any supplied byte source rewrites
@@ -1053,8 +1044,7 @@ class GcpTpuCapacityDriver:
 
         The script's own behavior revision is pinned for the same reason:
         identical artifacts with a fixed script still means a new bootstrap,
-        otherwise a bootstrap bug fix would never reach the cells it marooned
-        (the 2026-08-22 interpreter-home failure).
+        otherwise a bootstrap bug fix would never reach existing cells.
         """
 
         from eyvan.worker.runtime.native_bootstrap import NATIVE_WORKER_BOOTSTRAP_REVISION
@@ -1370,16 +1360,10 @@ class GcpTpuCapacityDriver:
     def _release_claimed(self, cell_id: str, context: MutationContext) -> CellObservation:
         """Release one cell's provider capacity, holding the fleet lock only to claim it.
 
-        Releasing used to hold ``_mutation_lock`` and the durable fleet-state
-        lease across the provider deletes. Every cell sharing a fleet-state
-        document therefore released strictly one at a time, and each mutation is
-        a compare-and-swap against object storage, so draining a fleet queued
-        every release behind every earlier one. The tail exceeded the cell
-        agent's 700-second client timeout, the control plane recorded "the cell
-        agent could not be reached" for work the agent had in fact completed,
-        and retried -- adding load to the queue it was waiting on. Cells sat in
-        ``deleting`` for hours. Observed on 2026-08-19 across three zones whose
-        provider capacity was already gone.
+        Holding ``_mutation_lock`` and the durable fleet-state lease across
+        provider deletes would serialize all releases sharing a document. The
+        resulting queue can exceed client timeouts, causing retries that add
+        load even after provider capacity is gone.
 
         The lock exists to make the *record* transition safe, not to serialise
         Google. So claim under it, delete outside it, and tombstone under it
@@ -1566,8 +1550,7 @@ class GcpTpuCapacityDriver:
         """Delete native-worker secrets left behind by interrupted releases.
 
         A release deletes the cell's secret *before* it tombstones the record,
-        so a crash between those two steps leaked the secret forever -- ten
-        accumulated live in one project before 2026-08-22. Releases now stamp
+        so a crash between those two steps can leak the secret. Releases stamp
         the cell's management UID into its tombstone, and every later release
         re-checks those uids: a secret whose uid this document released but
         which still exists is swept here. Uids this runtime never released are
@@ -1630,9 +1613,8 @@ class GcpTpuCapacityDriver:
                 if other.metadata.get("capacity_kind") == "attach":
                     # An attached TPU reaches its worker through this same
                     # profile rule (``eyvan gcp connect`` adds the tag), but its
-                    # record never carries execution_backend, so it was
-                    # invisible here: releasing the last provisioned cell
-                    # deleted the rule out from under it (seen live 2026-10-25).
+                    # record never carries execution_backend. Releasing the last
+                    # provisioned cell must not delete the attached TPU's rule.
                     # Its VPC is not persisted, so a public, API-reached attach
                     # claim in this project keeps the rule -- the safe direction.
                     if other.metadata.get(OPTION_ENDPOINT_MODE) == "public" and not other.metadata.get(OPTION_SSH_ENTRY):
@@ -2125,10 +2107,8 @@ class GcpCapacityDriver:
             supports_callables=True,
             max_gang_replicas=1 if self.execution_backend in {"native-local", "eyvan-native"} else None,
             # Stated rather than defaulted: an operator turns this on for a fleet
-            # they are willing to have diagnostics run on. The turning-on is what
-            # was missing -- this was a literal False, so the sentence above
-            # described a control nobody had and `eyvan workload exec` was
-            # refused on every GCP fleet while the native runtime implemented it.
+            # they are willing to have diagnostics run on. Advertise that policy
+            # rather than silently disabling the runtime's exec capability.
             supports_exec=self.supports_exec,
             resource_enforcement="none" if self.execution_backend in {"native-local", "eyvan-native"} else "backend",
         )

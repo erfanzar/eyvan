@@ -534,8 +534,7 @@ class DoctorCommandService:
         if not drift:
             # "Every priced cell agrees" is vacuously true on a fleet where no
             # cell is priced, and that fleet reports $0 accrued and $0 idle
-            # forever. Found on hardware: 32 live cells, 42,298 billed seconds,
-            # and a billing report an operator would read as "this is free".
+            # forever. Missing prices must not be mistaken for free capacity.
             #
             # Warn rather than fail. A fleet may be deliberately unpriced --
             # reserved capacity already paid for, or a test fleet -- and the

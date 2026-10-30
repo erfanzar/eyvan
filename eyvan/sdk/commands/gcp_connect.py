@@ -106,8 +106,8 @@ class _FleetRefused(AttachError):
     """The plane or agent definitively refused the fleet; waiting longer cannot help."""
 
 
-#: Cells the plane may replace before connect stops waiting. A refused attach cell
-#: is replaced every few seconds forever (2026-10-24: 12 cells in five minutes).
+#: Cells the plane may replace before connect stops waiting. Bound the wait so a
+#: repeatedly refused attachment cannot keep the connector waiting indefinitely.
 _MAX_REPLACED_CELLS = 3
 
 #: Provider failure codes that are worth waiting through; anything else is final.
@@ -136,7 +136,7 @@ def _runtime_needs_deploy(endpoint: ControlPlaneEndpoint, *, require_current: bo
 
     The cell agent is kept at the build the local plane was launched from, so an
     agent from before ``gcp-attach`` existed rejects every attached cell with
-    HTTP 400 and the plane replaces the cell forever (2026-10-24). Ask the agent
+    HTTP 400 and the plane repeatedly replaces the cell. Ask the agent
     directly; when it cannot be asked, fall back to comparing build identities.
     """
 
@@ -803,8 +803,8 @@ class GcpConnector:
                 self._wait_worker(endpoint, token, timeout)
         self._step("fleet_write", lambda: self._write_fleet(plan))
         # Cells a previous attempt left behind are history, not evidence about this
-        # run: counting them declared a fresh apply refused before its first cell
-        # existed (2026-10-24: 14 dead cells from an earlier run).
+        # run: counting them could declare a fresh apply refused before its first
+        # cell exists.
         stale_cells = self._dead_cell_ids(plan.fleet)
         with self.progress(f"Applying fleet {plan.fleet}"):
             self._step("fleet_apply", lambda: service.ensure_local_runtime(config))
@@ -891,8 +891,8 @@ class GcpConnector:
         access: HostAccess = plan.access
         runner = self.runner if self.runner is not None else _run_gcloud
         # Prove every host accepts this machine's SSH login before anything is
-        # changed: a refused key used to surface only at wheel_scp, after the
-        # firewall rule and the TPU tag had already been modified (2026-10-27).
+        # changed, so a refused key cannot leave firewall or TPU tag changes
+        # behind before worker installation begins.
         self._check_ssh_login(node.name, access)
         if plan.endpoint_mode == "public" and plan.ssh_entry is None:
             with self.progress(f"Opening worker port {self.port} to this machine"):
@@ -1024,8 +1024,8 @@ class GcpConnector:
 
         A command fed a credential on stdin may have it echoed back by the remote
         side, so its output stays withheld. A command that received no stdin
-        carries nothing private, and hiding the tool's own error there only made
-        failures undiagnosable (2026-10-24: "No fields would change").
+        carries nothing private; preserve the tool's error to make failures
+        diagnosable.
         """
 
         timeout = self.ssh_options.command_timeout_s

@@ -298,9 +298,8 @@ class ReportingMixin:
             reserved = sorted(supplying, key=lambda cell: cell.state is not CellState.READY)[: max(floor, 0)]
             # The planner counts an in-flight request as supply so it does not
             # launch twice, and that is right for planning. It is not warmth: a
-            # Spot request still in the queue serves no one at 09:00. Counting it
-            # reported a v6e-4 floor as held fifteen seconds after the window
-            # opened, while the request had not reached GCP (2026-09-24).
+            # Spot request still in the queue cannot serve a workload when its
+            # warm window opens. Only ready capacity fulfills the warm promise.
             warm = [cell for cell in reserved if cell.state is CellState.READY]
             warmth.append(
                 PoolWarmth(

@@ -64,9 +64,8 @@ def _exception_origin(exc: BaseException) -> str:
     """Name an exception's class and the innermost Eyvan frame that raised it.
 
     Both are code identifiers, never data, so they are safe to keep when a
-    secret-bearing workload's message must be suppressed. Without them a
-    dispatch that failed eight times recorded eight identical "output
-    suppressed" lines and nothing that located the fault (2026-09-24).
+    secret-bearing workload's message must be suppressed. They locate the fault
+    without exposing the suppressed exception message.
     """
 
     location = ""

@@ -1194,8 +1194,8 @@ class SystemdTransientServiceExecutor:
         if not lines:
             return None
         # A job that dies on a missing module names it mid-line, and systemd's
-        # "Failed with result 'exit-code'" follows it. Reporting that last line
-        # told a Spot v6e-4 user nothing on 2026-09-24; the reason was one line up.
+        # "Failed with result 'exit-code'" follows it. Prefer the exception line
+        # over lifecycle noise so the excerpt retains the actual cause.
         excerpt = next(
             (line for line in reversed(lines) if _FAILURE_EXCEPTION_LINE.match(line)),
             next((line for line in reversed(lines) if _FAILURE_EXCEPTION_ANYWHERE.search(line)), lines[-1]),
@@ -1618,10 +1618,8 @@ class SystemdTransientServiceExecutor:
                         return remote_id
                     # A retired record is one Eyvan stopped on purpose -- a gang
                     # rolling back a partial launch -- so a submit naming it again
-                    # asks for a run, not a replay. Returned as a replay, the
-                    # dispatch retry on a Spot v6e-16 "launched" onto the two units
-                    # the rollback had just stopped, and the gang was declared lost
-                    # ten seconds later (2026-09-24). Falls through and replaces it.
+                    # asks for a run, not a replay. Replaying would return units
+                    # already stopped by rollback. Fall through and replace them.
                 now = _utcnow()
                 try:
                     boot_id = self._boot_id_reader()

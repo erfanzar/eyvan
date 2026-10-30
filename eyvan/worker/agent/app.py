@@ -155,13 +155,8 @@ def create_agent_app(
         The capacity drivers validate provider options by raising ``ValueError``
         with a message that names the exact contradiction -- for example
         "internal-only eyvan-native Compute capacity cannot use
-        bootstrap_egress=public-internet". Without a handler that message went
-        nowhere: FastAPI returned its default 500 body, the control plane stored
-        ``last_error: "Internal Server Error"``, and the cell recorded
-        ``unavailable_detail: None``.
-
-        Diagnosing a one-line YAML mistake then meant reading the agent's
-        traceback by hand. Observed 2026-08-01; it cost more time than the fix.
+        bootstrap_egress=public-internet". Preserve that diagnostic rather than
+        replacing it with FastAPI's generic 500 body.
 
         A 400 because the request is well-formed but the *configuration* it names
         is not, so retrying it unchanged can never succeed -- which also lets the

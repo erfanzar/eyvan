@@ -138,12 +138,9 @@ def _pool_kind_from_resources(value: tp.Mapping[str, JsonValue]) -> str | None:
 def _pool_accelerator_type(pool: JsonObject, *, name: str) -> str:
     """Return the accelerator shape a pool runs, which need not be its name.
 
-    A pool is keyed by its accelerator type by default, which reads well and is
-    what almost every fleet wants. It also means one fleet cannot hold two pools
-    of the same shape -- and a fleet is scoped to a single zone, so a workload
-    could only ever wait on the zone it was submitted against. Racing several
-    zones is what actually wins spot capacity; on 2026-08-15 us-east5-b granted
-    and reclaimed twice while us-central2-b held.
+    A pool is keyed by its accelerator type by default. Allowing a separate name
+    lets a fleet hold multiple pools of the same shape, so workloads can race
+    zones with different Spot availability.
 
     So a pool may state ``accelerator_type`` explicitly and take a free-form
     name, letting ``v6e-8-us-east5-b`` and ``v6e-8-us-central2-b`` coexist.
@@ -186,12 +183,9 @@ def _apply_catalog_shape(pool: JsonObject, *, accelerator_type: str) -> None:
 def _expand_pool_zones(name: str, value: JsonValue) -> list[tuple[str, JsonValue]]:
     """Split one pool declaring several zones into one pool per zone.
 
-    Racing zones is what actually wins spot capacity -- on 2026-08-15 us-east5-b
-    granted and reclaimed twice while us-central2-b held -- and the scheduler
-    already knows how to treat interchangeable pools of one shape as cross-zone
-    alternates. What was missing was a way to *say* it: declaring the same eight
-    lines three times, once per zone, with three different names and an explicit
-    ``accelerator_type`` on each, is a transcription exercise nobody should do.
+    Racing zones improves the chance of obtaining Spot capacity. The scheduler
+    treats interchangeable pools of one shape as cross-zone alternates; expansion
+    avoids repeating the same declaration with a different name for each zone.
 
     The expansion is mechanical and visible: ``v6e-8`` with three zones becomes
     ``v6e-8-us-east5-a`` and its siblings, each pinned to one zone and each

@@ -939,12 +939,9 @@ def _structural_copy(state: ControlPlaneState) -> ControlPlaneState:
     is copied, nested ones included. A rolled-back session therefore leaves the
     committed state untouched, exactly as a deep copy did.
 
-    A deep copy of every record, on every transaction, was the idle cost of
-    this store: a loopback plane with no fleets spent a steady ~16% of a core
-    re-copying some 150 cells, 3,000 events and their outbox history about 30
-    times per leader cycle (2026-09-25). Sharing the records also makes the
-    commit check cheap, since comparing a record with itself is an identity
-    test.
+    Sharing frozen records avoids copying the entire history on every
+    transaction. It also makes the commit check cheap, since comparing a record
+    with itself is an identity test.
     """
 
     return ControlPlaneState(**{item.name: _copy_containers(getattr(state, item.name)) for item in fields(state)})

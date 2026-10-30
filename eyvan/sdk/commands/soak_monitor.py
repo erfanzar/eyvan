@@ -357,9 +357,8 @@ def read_spend_reconciled(client: tp.Any) -> bool | None:
     * invariant ``I5`` -- a budget's spend equals what its settled leases cost
       -- is not being violated; and
     * no cell is contributing zero cost because its pool declares no unit
-      prices. The terminated P8 run accrued "$3.68" with 42 of its 46 cells
-      unpriced, which is a floor and not a total. Calling that reconciled would
-      be the invented evidence this whole monitor exists to avoid.
+      prices. A ledger with unpriced cells records only a cost floor, not a
+      reconciled total.
 
     Args:
         client: An object with the SDK client's ``request`` method.

@@ -42,13 +42,8 @@ DocumentToken: tp.TypeAlias = int | None
 
 #: One identity per *process*, not per store instance. The persisted lease
 #: exists to exclude other processes; two stores inside one agent are not rival
-#: writers, and giving them separate identities made an agent deadlock against
-#: its own lease -- every capacity mutation 409ing for the full TTL while the
-#: holder shown in the document was the very process being refused.
-#:
-#: Observed live on 2026-08-01: a cell sat in `deleting` for twenty minutes with
-#: `capacity.release` retrying into "Eyvan fleet mutation lease is busy", and the
-#: holder was the live agent's own PID.
+#: writers. Separate identities would make an agent contend against its own
+#: lease, refusing capacity mutations for the full TTL.
 _PROCESS_OWNER = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
 
 #: One lock per process owner *and durable document*. Stores sharing both are
@@ -291,16 +286,14 @@ class GcsBackend:
         self._runner = runner
         # The fast path. Every mutation here is a compare-and-swap, and the
         # subprocess form spends three interpreter startups on it -- describe,
-        # cat, conditional copy -- which is most of the cost of draining a fleet,
-        # because releases serialise on this document. Measured on a real
-        # fleet-state object: 5.42s of gcloud per read against 1.87s over the
-        # API. ``None`` builds the default reader; pass ``False`` to force the
+        # cat, conditional copy. Avoiding that overhead matters because releases
+        # serialize on this document. ``None`` builds the default reader; pass
+        # ``False`` to force the
         # subprocess path.
         # Only when this backend is using the real gcloud transport. A caller
         # that injects a runner is saying "drive the object through this", and
-        # silently preferring an API path would bypass it -- which is what made
-        # tests that supply a fake runner reach the network, mint a real token,
-        # and fail or pass depending on suite order.
+        # silently preferring an API path would bypass it and let tests using
+        # fake runners reach the network or mint real tokens.
         default_rest = GcsRestObject(uri) if runner is _gcloud else None
         self._rest: GcsRestObject | None = default_rest if rest is None else (rest or None)
 
@@ -335,9 +328,8 @@ class GcsBackend:
         except ValueError as exc:
             raise RuntimeError(f"GCS metadata for {self.uri} has an invalid generation") from exc
         # A read that fails on a flaky link is retried before it is believed.
-        # `describe` has just proven the object exists, so a failure here is
-        # transient far more often than not: measured from one laptop, ~10-20%
-        # of `gcloud storage cat` calls against a live object fail outright.
+        # `describe` has just proven the object exists, so a failed body read
+        # may be transient rather than evidence that the object is absent.
         #
         # Refusing to treat that as an empty fleet (below) is necessary but not
         # sufficient -- without a retry, one blip still takes out every route
@@ -360,11 +352,6 @@ class GcsBackend:
         # the controller records a fence conflict, and the autoscaler drains live
         # capacity. One flaky `gcloud storage cat` destroys the whole fleet's
         # worth of cells and the next one destroys their replacements.
-        #
-        # Found on 2026-08-01 after it burned six consecutive v5p-16 Spot
-        # requests: "cell ... no longer belongs to this generation before native
-        # worker bootstrap could be persisted", moments after that same record
-        # had been written successfully.
         if self._missing(body) or body.returncode != 0:
             raise FleetStateUnavailableError(
                 body.stderr.strip() or f"could not read {self.uri} at generation {generation}"
@@ -454,11 +441,9 @@ class GcsBackend:
                 body, generation = self._rest.read()
             except GcsRestError:
                 # Not disabled. One failure is a token that aged out or a blip;
-                # turning the fast path off for the life of the process meant a
-                # single blip pinned every later mutation onto the subprocess --
-                # and on 2026-08-21 that subprocess was a `gcloud` that could not
-                # start, so every reconcile 500'd and no cell could reach ready
-                # while its TPU sat ACTIVE. Fall back for this call only.
+                # turning the fast path off for the life of the process would
+                # pin every later mutation onto the subprocess, which may itself
+                # be unavailable. Fall back for this call only.
                 pass
             else:
                 if body is None:

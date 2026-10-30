@@ -297,10 +297,9 @@ class _ControllerLoops:
     def _start_background_phase(self, phase: LeaderPhase) -> None:
         """Start ``phase`` off the cycle unless its previous pass is still running.
 
-        Seen live on a 16-host slice: the live-log archive spent up to 39 s
-        uploading chunks to object storage, and every phase after it -- and the
-        next cycle's observation, which is what notices a job has finished --
-        waited for it.
+        Object-store uploads in live-log archival can be slow. Running eligible
+        phases in the background keeps them from delaying later phases and the
+        next cycle's workload observations.
         """
 
         running = self._background_phases.get(phase.name)
@@ -321,12 +320,8 @@ class _ControllerLoops:
             try:
                 await phase.run()
             except Exception:
-                # Contained, always. A failure used to propagate out of the
-                # whole cycle, and because the phases that release capacity
-                # and settle billing sit in the middle of this list, one
-                # failure upstream of them left an accelerator running that
-                # nobody was going to stop paying for. Observed on a live
-                # v5p-16 multislice.
+                # Contain failures so an unrelated phase cannot prevent later
+                # capacity release or billing settlement.
                 #
                 # What the old behaviour protected is kept by ``requires``:
                 # a phase that commits work against the plane's view is

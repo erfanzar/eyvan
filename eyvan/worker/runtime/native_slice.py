@@ -1424,8 +1424,7 @@ class NativeSliceExecutor:
         An unreachable host is reported in place, exactly as ``process_status``
         and the structured-log fan-out report one. A probe that returned only the
         hosts it could reach would show a complete-looking answer for a
-        half-dead slice, which is the failure P2 exists to prevent and the one it
-        qualified against on 2026-08-13.
+        half-dead slice.
         """
 
         if runtime_rank is not None and (

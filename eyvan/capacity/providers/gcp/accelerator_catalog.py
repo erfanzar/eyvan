@@ -5,27 +5,13 @@
 
 """Which accelerator types a project can see, per zone, quickly.
 
-Quota discovery has to ask that question of every zone, and it asked by running
-``gcloud compute tpus accelerator-types list --zone Z`` once per zone. Each of
-those boots a fresh Python interpreter -- about 1.4 seconds of process startup
-before a single byte crosses the network -- so on a project seeing 122 zones the
-work was CPU-bound on spawning gcloud, not on talking to Google. It ran past the
-25-second deadline, and the quota page timed out on every cold read while the
-Cloud console answered the same question instantly.
+Quota discovery asks every zone. Running ``gcloud compute tpus accelerator-types
+list --zone Z`` per zone starts a fresh Python interpreter for each request;
+that overhead can dominate discovery latency.
 
-The console is not doing anything Eyvan cannot: it calls the API. So does this.
-One ``gcloud auth print-access-token`` for a credential -- inheriting whatever
-login the operator already has, no service-account file and no new credential
-path -- and then plain HTTPS, which parallelises at no cost because there is no
-process to start.
-
-Measured against 122 zones of a real project:
-
-===========================  ========
-gcloud subprocess, 8 at once  past 25s
-REST, 24 at once                  9.1s
-REST, 48 at once                  4.6s
-===========================  ========
+Use one ``gcloud auth print-access-token`` for a credential -- inheriting the
+operator's login without a service-account file or a new credential path -- then
+parallel HTTPS requests without per-zone process startup.
 
 **The subprocess path stays.** It works where a raw HTTPS call may not -- a
 proxy that only gcloud is configured for, an environment where the token cannot
@@ -43,9 +29,8 @@ from dataclasses import dataclass, field
 
 from eyvan._internal.subprocess_env import provider_cli_env
 
-#: How many zones are read at once. Chosen from measurement rather than taste:
-#: 24 leaves the run network-bound at ~9s, 48 halves it, and 96 buys only
-#: another half second while opening twice the sockets for it.
+#: How many zones are read at once. Bound socket use while overlapping network
+#: latency across zones.
 DEFAULT_CONCURRENCY = 48
 
 #: Bound on one zone's read. Generous because a slow zone must not fail a whole

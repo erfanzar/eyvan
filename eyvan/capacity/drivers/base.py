@@ -500,12 +500,9 @@ class CellAccelerator:
     zero would reach a rank as an empty ``CUDA_VISIBLE_DEVICES``, which is how a
     process ends up on the CPU while its peers wait for it at a collective.
 
-    Nothing here is hardware-qualified, and the distinction stopped being
-    academic on 2026-08-13. A GPU cell has now executed an Eyvan workload -- a
-    callable ran to completion on an ``nvidia-tesla-p100`` and reported success
-    on a host whose driver could not open the GPU at all, because the image pins
-    NVIDIA 580 and that branch dropped Pascal. This is a description of a host,
-    and the run proved it is not evidence that a run on it works.
+    Nothing here is hardware-qualified. A callable can report success even when
+    the host's driver cannot open its GPU. This describes catalog hardware, not
+    evidence that a workload can use it.
 
     ``eyvan.worker.runtime.host_accelerators`` is the counterpart that looks at
     the machine instead of the catalog.

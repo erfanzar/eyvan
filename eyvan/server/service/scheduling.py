@@ -140,12 +140,9 @@ def _pool_choices(
 
     Submission records a cross-zone workload as ``eyvan_pool`` (the first
     choice), ``eyvan_pool_template`` (that pool's template) and the alternates
-    as a comma list -- and all three used to reach the scheduler as *required*
-    labels, matched by equality. No cell carries the alternates list, so such a
-    workload could not be placed anywhere, not even in its first-choice zone; and
-    an alternate's cells, whose template names another zone, could never have
-    matched the first choice's pin either. Found live on 2026-09-24: a four-zone
-    Spot v6e-4 fleet launched nothing at all.
+    as a comma list. These cannot all be required equality labels: no cell
+    carries the alternates list, and an alternate's template differs from the
+    first choice's template.
 
     The pool pin becomes "any candidate pool", with correlated pool/template
     combinations -- never the Cartesian product of two independent label sets.
@@ -188,9 +185,8 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
     pool_choices, pool_combinations = _pool_choices(required_labels)
     if pool_choices:
         # The candidate pools are named outright, and each carries its own
-        # region. Keeping the first choice's region as a required label
-        # refused every alternate in another region -- a europe-west4 first
-        # choice could never race us-east1 (seen live, 2026-09-24).
+        # region. Keeping the first choice's region as a required label would
+        # reject every alternate in another region.
         required_labels.pop("region", None)
     if spec.placement is PlacementMode.ELASTIC:
         # The exact-shape pin, dropped: elastic workloads pack cells of any

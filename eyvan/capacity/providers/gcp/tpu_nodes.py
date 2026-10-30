@@ -55,8 +55,7 @@ _TPU_NODES = "https://tpu.googleapis.com/v2/projects/{project}/locations/{zone}/
 _TPU_NODE = "https://tpu.googleapis.com/v2/projects/{project}/locations/{zone}/nodes/{name}"
 _PROJECTS = "https://cloudresourcemanager.googleapis.com/v1/projects"
 
-#: Real Cloud TPU node names include underscores (``lab_spot_m`` in
-#: example-research-project, 2026-10-24), so the API's names are accepted as it returns them.
+#: Cloud TPU node names can include underscores, so accept the API's names as returned.
 _NAME = re.compile(r"^[a-z]([-_a-z0-9]*[a-z0-9])?$")
 _FLEET_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _FLEET_NAME_MAX = 63

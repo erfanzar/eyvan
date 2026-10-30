@@ -6,7 +6,7 @@
 """Read a Cloud TPU VM node through SSH to one of its own hosts.
 
 An operator can often SSH into a TPU in a project their own credential cannot
-list (2026-10-24: a v5p-128 in a collaborator's project). The host itself still
+list. The host itself still
 knows everything Eyvan needs: the metadata server names the node, its zone and
 project, and the host's ``gcloud`` -- running as the TPU's own service account --
 returns the same node document the TPU API returns to its owner. Parsing that

@@ -22,7 +22,7 @@ class DocumentedTpuZoneExclusion:
 
 
 # Source: https://cloud.google.com/tpu/docs/regions-zones
-# Verified 2026-07-14. The TPU locations table lists TPU7x for
+# The TPU locations table lists TPU7x for
 # us-central1-c and v6e for us-central1-b, but does not list v6e in
 # us-central1-c. Do not add positive availability assertions here; dynamic
 # provider discovery remains the primary source for eligible types.

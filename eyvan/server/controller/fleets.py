@@ -852,17 +852,12 @@ class _ControllerFleets:
                 # "Never delivered capacity" is the question, and `state` answers a
                 # different one -- what the cell is *now*. A reclaimed spot cell is
                 # draining or NEEDS_RECREATE by the time it reaches here, so a cell
-                # that served a workload for twenty minutes and was then preempted
-                # passed this guard and had a STOCKOUT written against a zone that
-                # had just proven it had capacity. P5 caught it on a real
-                # reclamation on 2026-08-13: the same cell carried both
-                # `interruptions=1.9` from the correct classification and
-                # `consecutive_failures=1` with a cooldown from this path.
+                # that delivered and was later preempted must not be scored as a
+                # STOCKOUT against a zone that supplied capacity.
                 #
                 # `provision_latencies_s` is appended only on the SUCCESS
                 # transition into READY, so a non-empty list is the durable record
-                # that this cell once delivered. The preempted cell read
-                # `[1427.8]`; a cell that timed out in WAITING reads `[]`.
+                # that this cell once delivered.
                 never_delivered = not cell.availability.provision_latencies_s
                 if not replayed and cell.state is not CellState.READY and never_delivered:
                     # This cell is being reclaimed without ever having delivered
@@ -1104,10 +1099,6 @@ class _ControllerFleets:
         agent -- and any left ``desired_state: up`` are re-ensured forever, so
         the agent keeps provisioning capacity nobody asked for, invisible to the
         control plane that would otherwise own it.
-
-        Found on 2026-08-01: a ``v5p-128`` queued resource being recreated days
-        after its fleet was deleted, discoverable only by reading the agent's
-        state document out of object storage by hand.
 
         Read-only, and deliberately not automatic. One agent can legitimately be
         shared by more than one control plane, so a record this control plane

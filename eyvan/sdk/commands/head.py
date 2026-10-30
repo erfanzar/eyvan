@@ -113,9 +113,8 @@ HEAD_BOOTSTRAP_PATH = "/opt/eyvan/head-bootstrap.sh"
 #: written under its own name in a directory the installer globs.
 HEAD_WHEEL_DIR = "/opt/eyvan/wheels"
 #: Superseded wheels, newest first, so a bad deploy has somewhere to go back to.
-#: Staging used to ``rm -rf`` the wheel directory, which meant a head only ever
-#: held the build it was running: three hand-installed wheels during one P5 run
-#: had no way back except rebuilding the old one from source.
+#: Preserve prior wheels during staging so rollback does not require rebuilding
+#: an older distribution from source.
 HEAD_PREVIOUS_WHEEL_DIR = f"{HEAD_WHEEL_DIR}/previous"
 #: How many superseded wheels to keep. Two is enough to undo a bad deploy and
 #: still have the one before it, without letting a long-lived head accumulate
@@ -686,14 +685,12 @@ class HeadSecrets:
             # Read by both units this file feeds. The cell agent refuses to start
             # without it whenever the executor is eyvan-native, and the GCP
             # capacity driver refuses to provision a TPU or Compute cell without
-            # it -- so a head that omitted it crash-looped its own agent and could
-            # never have created a cell. The Kubernetes manifests have always set
-            # it; only this one-command path did not.
+            # it. Both head units need the same root secret for provisioning and
+            # worker authentication.
             "EYVAN_NATIVE_WORKER_ROOT_SECRET": self.native_worker_root_secret,
             # HTTPS on the private address, under the head's own CA. A network
-            # bind refuses plaintext since 300bba5, and `head up` set neither TLS
-            # nor the opt-out, so every head it built crash-looped at start
-            # (2026-09-24). The bootstrap script issues the certificate.
+            # bind refuses plaintext without an explicit opt-out, so configure
+            # TLS here. The bootstrap script issues the certificate.
             "EYVAN_PUBLIC_URL": f"https://{address}:{spec.port}",
             "EYVAN_TLS_CERT_FILE": HEAD_TLS_CERT_PATH,
             "EYVAN_TLS_KEY_FILE": HEAD_TLS_KEY_PATH,
@@ -708,8 +705,7 @@ class HeadSecrets:
             # Left unset, each agent keeps a private local copy, so the capacity
             # driver's writes and the control plane's reads never meet: a cell
             # reaches `ready` publishing no worker endpoints, and dispatch waits
-            # forever for an address nobody wrote down. Observed on a live v5p-16
-            # whose worker was up and serving the whole time.
+            # forever for an address nobody wrote down, even when the worker is up.
             environment["EYVAN_FLEET_STATE_URI"] = fleet_state_uri(spec.artifact_store_uri, spec.fleet)
             # Read by the GCP capacity factory to grant each worker's service
             # account read access to the bucket holding its own wheel. Unset, the
@@ -2328,13 +2324,10 @@ class HeadProvisioner:
     def _service_start_action(self) -> HeadAction:
         """Build the enable-and-restart that survives ssh exit, reboot, and a re-run.
 
-        ``enable --now`` alone is a no-op against an already-active unit, which
-        made every re-run of this command a lie: the wheel was replaced on disk
-        and the environment file rewritten, and the server went on serving the
-        code and the credentials it started with. Observed on a real head --
-        `--rotate-secrets` wrote new credentials at 17:17 while the server kept
-        running with 16:39's, so the token an operator read out of
-        ``head.env`` was rejected by the process that file describes.
+        ``enable --now`` alone is a no-op against an already-active unit. After
+        replacing a wheel or rewriting the environment, restart the server so it
+        uses the installed code and current credentials rather than its startup
+        state.
 
         ``restart`` is what makes an adopting run mean anything, and it is
         idempotent on a unit that was not running.
@@ -2360,10 +2353,9 @@ class HeadProvisioner:
         """Build the check that both units are active *and stay up*.
 
         ``systemctl is-active`` answers "active" in the seconds between two
-        crashes of a ``Restart=always`` unit. That reported a head as running on
-        2026-09-24 while ``eyvan-server`` exited at every start, refusing a
-        plaintext network bind. So the restart counters are read, the check waits
-        out several restart intervals, and a unit that restarted in between, or is
+        crashes of a ``Restart=always`` unit. Read the restart counters and wait
+        out several restart intervals so a crash-looping service cannot pass.
+        A unit that restarted in between, or is
         not active at the end, fails with its state and how often it restarted.
         """
 

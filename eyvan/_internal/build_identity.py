@@ -245,10 +245,9 @@ def build_identity() -> BuildIdentity:
 
     The tree *can* change under a running process: an editable install is the
     working tree. The plane and the cell agent therefore call this while they are
-    built, so each hashes the tree it started from. Computed on first use
-    instead, the agent hashed at startup and the plane at its first stale-build
-    check, a reformat landed in between, and the plane drained two healthy Spot
-    cells -- one mid-dispatch -- as running stale code (2026-09-24).
+    built, so each hashes the tree it started from. Computing on first use
+    instead could hash different versions of the same tree and falsely mark
+    healthy cells as running stale code.
     """
 
     return compute_build_identity(_package_root())

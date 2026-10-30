@@ -493,21 +493,15 @@ class _CallableProgressRenderer:
             )
         if phase is WorkloadProgressPhase.PROVIDER_FAILURE:
             # A rejected capacity attempt on a pending workload is not the
-            # job's death. This branch once rendered FAILED -- the same
-            # receipt a dead job gets -- so a shape the provider kept
-            # refusing printed one death notice per attempt while the
-            # workload sat pending and the plane kept working, and an
-            # operator reading those notices cancelled a job that was still
-            # being fought for. BLOCKED carries the truth: capacity is
-            # refused for now, the plane is trying again, and the attempt is
-            # counted. When the acquisition budget runs out the workload
+            # job's death. BLOCKED distinguishes a retryable capacity refusal
+            # from the terminal FAILED receipt: the plane is still trying and
+            # the attempt is counted. When the acquisition budget runs out the workload
             # settles on its own terminal verdict, and that is the receipt
             # that means it.
             if is_acquisition_backoff_reason(progress.scheduling_reason):
                 # The pool's last requests were all refused and it is waiting
-                # before the next one. The reason names the error and the time;
-                # "the plane is retrying (attempt 1)" hid that it had been
-                # refused hundreds of times on fresh cells (2026-10-25).
+                # before the next one. Show the pool-level error and retry time;
+                # the workload attempt count alone hides failures across fresh cells.
                 return JobLifecycleUpdate(
                     JobLifecycleState.BLOCKED,
                     scope,

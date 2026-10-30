@@ -43,10 +43,8 @@ def _scrub_gce_topology_overrides(environment: tp.MutableMapping[str, str]) -> N
 #: *after* initialization on a real ML host: this module runs from
 #: ``sitecustomize``, so JAX is initialized at interpreter startup and the user's
 #: code then downloads weights, converts them, and compiles -- none of which
-#: heartbeats. On 2026-08-01 an eSurge inference job on a two-host v5p-16 died
-#: with "DEADLINE_EXCEEDED: the JAX distributed service detected fatal errors"
-#: while one host was still loading a 0.6B model. Both ranks were killed, and
-#: the surviving message named neither the cause nor the host.
+#: heartbeats. The timeout must accommodate this work to avoid killing busy
+#: ranks during model loading or compilation.
 #:
 #: Eyvan makes this call on the workload's behalf, so the default is Eyvan's to
 #: choose. Fifteen minutes accommodates a cold model pull and a first compile;
@@ -329,10 +327,8 @@ terminate_rank: tp.Callable[[int], tp.NoReturn] = os._exit
 
 #: ``jax.distributed.initialize`` tuning arguments that not every JAX release
 #: accepts. The gang-identity arguments are required and always passed; these
-#: are passed only when the installed JAX names them. On 2026-09-24 a two-slice
-#: Spot v6e-4 job on JAX 0.6.2 died on both ranks with ``initialize() got an
-#: unexpected keyword argument 'heartbeat_timeout_seconds'`` before any user
-#: code ran.
+#: are passed only when the installed JAX names them, so unsupported tuning
+#: keywords cannot fail initialization before user code runs.
 _OPTIONAL_INITIALIZE_ARGUMENTS = frozenset({"heartbeat_timeout_seconds", "initialization_timeout"})
 
 
@@ -492,10 +488,8 @@ def initialize_from_environment() -> None:
         raise RuntimeError("Eyvan multi-host JAX process configuration must be integers") from exc
     if num_processes == 1 and rank == 0:
         # An elastic job is one hardware world per cell, and a single-host
-        # cell's world is one process: there is nothing to join. Treating it as
-        # invalid printed "Error in sitecustomize ... process configuration is
-        # invalid" on every rank of every elastic multi-worker job (2026-09-24,
-        # Spot v6e-4 x 2 in asia-northeast1-b) while the job itself ran fine.
+        # cell's world is one process: there is nothing to join. This is valid
+        # even when the elastic workload spans several such cells.
         return
     if num_processes < 1 or rank < 0 or rank >= num_processes:
         raise RuntimeError("Eyvan multi-host JAX process configuration is invalid")

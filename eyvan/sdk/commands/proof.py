@@ -925,8 +925,7 @@ class _ProofRun:
         *after* the verdict is decided, and the non-zero exit that escapes is
         indistinguishable from a failing proof -- so a mistyped ``--evidence``
         path reports that the build failed a criterion it actually passed. That
-        is the one thing a refusal exit code exists to prevent, and it happened
-        on the P5 run of 2026-08-13.
+        is the ambiguity a refusal exit code exists to prevent.
         """
 
         if self.receipt is not None and self.evidence is not None:

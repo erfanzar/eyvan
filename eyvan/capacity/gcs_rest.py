@@ -6,14 +6,9 @@
 """Reading and conditionally writing one GCS object without spawning gcloud.
 
 Every fleet-state mutation is a compare-and-swap against a GCS object, and the
-existing backend does it with three ``gcloud`` invocations -- describe, cat,
-then a conditional copy. Each is about 1.4 seconds of Python interpreter startup
-before a byte crosses the network, so a mutation costs several seconds of CPU
-and almost no I/O.
-
-That is the dominant cost in draining a fleet: releases serialise on this
-document, and a hundred cells release one CAS at a time. Cells sat in
-``deleting`` for hours on 2026-08-20 with the provider already empty.
+subprocess backend does it with three ``gcloud`` invocations -- describe, cat,
+then a conditional copy. Interpreter startup adds CPU and latency to every
+mutation, which accumulates as releases serialize on the document.
 
 Same conditional semantics, over the JSON API: a media download reports the
 object's generation in ``x-goog-generation``, and an upload takes
@@ -105,8 +100,6 @@ class GcsRestObject:
         access token lasts about an hour; caching one for the life of the
         process means every call after that hour is a 401, which this reports as
         a plain read failure -- and the caller then falls back to a subprocess.
-        On 2026-08-21 that subprocess was a broken ``gcloud``, so an aged-out
-        token became "no cell can reach ready while its TPU sits ACTIVE".
         """
 
         if refresh or self._token is None:

@@ -2051,10 +2051,7 @@ class SqlAlchemyRepository:
         # aggregate advisory locks plus a fresh eligibility query protect
         # siblings across replicas. Rows/aggregates another claimer holds are
         # skipped. Layering SERIALIZABLE on top adds spurious 40001s that
-        # scale with replica count -- measured against PostgreSQL 17, four
-        # concurrent claimers failed on the first try. Active-active delivery is
-        # the entire point of the claim, so making it fail more often the more
-        # replicas you run is exactly backwards.
+        # scale with replica count and undermine active-active delivery.
         self._claim_sessions = async_sessionmaker(
             engine.execution_options(isolation_level="READ COMMITTED"),
             expire_on_commit=False,

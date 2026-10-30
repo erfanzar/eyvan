@@ -8,8 +8,8 @@
 Two ways exist today and the connector does not care which it holds:
 ``gcloud compute tpus tpu-vm ssh/scp`` for nodes the operator's own credential can
 see (defined beside the connector, which owns the gcloud runner), and plain
-OpenSSH for nodes the operator can only log into (2026-10-24: a v5p-128 in a
-collaborator's project). Plain SSH reaches the entry host directly and every
+OpenSSH for nodes the operator can only log into. Plain SSH reaches the entry
+host directly and every
 other host of the slice through it, over the slice's internal network, so only
 the one SSH login the operator already has is required.
 """

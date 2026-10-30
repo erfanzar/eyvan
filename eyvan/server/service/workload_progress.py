@@ -97,9 +97,8 @@ class WorkloadProgressResolver:
                     if _matches_workload_capacity(cell, workload, pool_id)
                 )
             # Name the zone that is actually building this workload's capacity.
-            # A raced workload's first choice may have refused it outright, and
-            # "provisioning | europe-west4-a" beside capacity in us-south1-a
-            # sent the reader to the wrong zone (2026-09-24).
+            # A raced workload's first choice may have refused it outright;
+            # presenting that zone would direct diagnostics to the wrong place.
             leading = _leading_pool_id(matching_cells, pool_id)
             if leading is not None and leading != pool_id:
                 pool = await transaction.get_capacity_pool(leading) or pool
@@ -371,10 +370,8 @@ def _with_lost_cell_diagnostic(
 
     A capacity apply can *succeed* and the cell still be lost minutes later --
     a Spot insert that fails after the create call returned, a reclamation. The
-    command then holds no error, so a blocked workload narrated "capacity request
-    rejected" with ``hard_constraint`` or nothing beneath it, while the cell's
-    record held the provider's sentence (2026-09-24, a Spot stockout in
-    us-central1-a). Only fills a gap: a command's own diagnostic wins, and no
+    command then holds no error, but the cell's record can still explain why
+    capacity was lost. Only fills a gap: a command's own diagnostic wins, and no
     retry record is invented where no command exists.
     """
 
@@ -425,9 +422,8 @@ def _phase(
     if workload.state is WorkloadState.DISPATCHING:
         return WorkloadProgressPhase.DISPATCHING
     # One zone's denial does not describe a cross-zone workload that another zone
-    # is now acquiring for. Checked first, it went on narrating "GCP denied
-    # queue admission" for us-east1-b while us-south1-a was provisioning the
-    # job's capacity (2026-09-24).
+    # is now acquiring for. Active acquisition elsewhere takes precedence over
+    # a previous candidate's denial.
     acquiring_elsewhere = bool(
         capacity.requesting_workers
         or capacity.waiting_workers
@@ -447,10 +443,8 @@ def _phase(
     if workload.autoscale_block_reason is AutoscaleBlockReason.SHARED_TPU_QUOTA:
         return WorkloadProgressPhase.QUOTA_BLOCKED
     if workload.autoscale_block_reason is AutoscaleBlockReason.CAPACITY_ACQUISITION_EXHAUSTED:
-        # The planner has stopped asking every zone this workload accepts. Left
-        # to the capacity branches below it read "requesting one elastic cell"
-        # -- the opposite of what the plane was doing (2026-09-24, a v5e pool
-        # GCP failed sixteen times). An existing phase rather than a new one: a
+        # The planner has stopped asking every zone this workload accepts, so
+        # do not describe it as requesting capacity. Use an existing phase: a
         # new wire value would break every older SDK mid-wait.
         return WorkloadProgressPhase.PROVIDER_FAILURE
     if workload.state is WorkloadState.ADMITTED:
@@ -469,9 +463,8 @@ def _phase(
     ):
         # Every pool this workload accepts has refused its last requests. A
         # fresh request in flight, or none at all while the pool waits out its
-        # backoff, is still that story: narrated as "requesting one elastic
-        # cell" it hid hundreds of identical failures (2026-10-25). An existing
-        # phase, so older SDKs keep decoding it; the scheduling_reason carries
+        # backoff, must not hide the repeated failures as ordinary acquisition.
+        # Use an existing phase so older SDKs keep decoding it; scheduling_reason carries
         # the last error and when the next attempt happens.
         return WorkloadProgressPhase.PROVIDER_FAILURE
     if capacity.requesting_workers:

@@ -257,7 +257,7 @@ def _install_command(
         # A wheel file copied to the host (``eyvan gcp connect``) has the same
         # problem as the gs:// one above: every rebuild keeps its filename and
         # version, so ``--upgrade`` alone leaves the earlier build installed and
-        # a reconnect silently ships nothing (seen live on a v5p-128, 2026-10-25).
+        # a reconnect would silently leave stale code installed.
         return "\n".join(
             (
                 *wheelhouse_lines,
@@ -415,9 +415,8 @@ def build_native_worker_startup_script(
     # The interpreter's home must be shared, not uv's default: uv installs
     # managed interpreters under the invoking user's $HOME, which on a VM
     # startup script is /root -- mode 0700 -- so the unprivileged workload user
-    # was locked out of the very venv built for it, the bootstrap's own final
-    # verification failed, and the cell churned EXECUTION_CONNECTING until it
-    # was replaced by an identically broken one (found live 2026-08-22).
+    # would be locked out of its venv. Bootstrap verification would fail and
+    # replacements would inherit the same inaccessible interpreter.
     python_home = "/opt/eyvan-native/python"
     declared_python_lines: tuple[str, ...] = ()
     if runtime_python is not None:
@@ -633,15 +632,10 @@ def build_native_worker_startup_script(
             "      echo 'Eyvan native worker requires Python venv support and apt-get is unavailable' >&2",
             "      exit 1",
             "    fi",
-            # Both inside the condition, so `set -e` does not abort here. The
-            # message below is written for exactly this failure and was
-            # unreachable: on a GPU cell on 2026-08-13 the install exited 100
-            # with apt's own "Package 'python3-venv' has no installation
-            # candidate", the script died on that line, and the operator got a
-            # message naming neither Eyvan nor what to do about it. apt also
-            # exits 0 from `update` when individual index fetches fail, so the
-            # install is the first place the trouble surfaces and the last place
-            # that should be the one reporting it.
+            # Keep both commands inside the condition so `set -e` cannot abort
+            # before the actionable Eyvan diagnostic below. apt can exit 0 from
+            # `update` when individual index fetches fail, so the install may be
+            # the first command to report the failure.
             "    if ! eyvan_apt_get update || ! eyvan_apt_get install -y --no-install-recommends python3-venv; then",
             "      echo 'Eyvan native worker could not install python3-venv from apt' >&2",
             "    fi",
@@ -693,8 +687,8 @@ def build_native_worker_startup_script(
             "fi",
             # The per-host cache for per-job ``dependencies``. Owned by the
             # workload user because that is who installs into it: left to root,
-            # every job fell back to its own working directory and reinstalled
-            # its packages from scratch (seen on a Spot v6e-4, 2026-09-24).
+            # jobs would fall back to their working directories and reinstall
+            # packages instead of sharing the per-host cache.
             f"install -d -o {workload_user} -g {workload_group} -m 0750 {workload_directory} "
             f"{workload_directory}/.cache {DEPENDENCY_CACHE_ROOT}",
             "for device in /dev/vfio/* /dev/vfio/devices/* /dev/accel* /dev/nvidiactl /dev/nvidia-uvm "

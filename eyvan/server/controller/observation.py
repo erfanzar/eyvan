@@ -914,11 +914,8 @@ class _ControllerObservation:
                     expected_state=workload.state,
                 )
             elif not preemption_owned:
-                # The executor's diagnostic is right here and used one branch
-                # below for LOST, but the terminal-failure path used to drop it:
-                # a failed workload recorded `failure_reason: None`, so the only
-                # account of why it died lived in logs on a cell that is about to
-                # be released. Observed live 2026-08-01.
+                # Persist the executor's diagnostic before releasing the cell;
+                # its logs may otherwise be the only account of the failure.
                 await self._release_terminal(
                     workload,
                     lease,
@@ -1270,9 +1267,7 @@ class _ControllerObservation:
 
         An INDETERMINATE observation says the runtime could not be read, not
         that the workload finished, so the controller keeps polling. Polling
-        forever is the failure this exists to stop: on 2026-08-02 a workload sat
-        in CANCELLING for forty minutes holding a v5p Multislice because every
-        observation came back unreadable and nothing ever escalated.
+        forever would leave an unreadable workload holding capacity indefinitely.
 
         Settling the workload alone would be unsafe -- it might still be running,
         and releasing the lease would let a second workload onto the same
@@ -1474,10 +1469,9 @@ class _ControllerObservation:
             started.append(task)
         if not started:
             return 0
-        # One cell whose worker never answers -- seen live: an attached TPU
-        # reporting READY while its worker port was closed -- costs the agent's
-        # whole readiness timeout on every observation, and waiting for it held
-        # scheduling and the next workload observation by ~6 s every cycle.
+        # A worker that never answers costs the agent's whole readiness timeout
+        # on every observation. Do not let it delay scheduling and observation
+        # of unrelated workloads on every cycle.
         # Wait at most one scheduler interval; a slower observation keeps
         # running and lands on a later cycle, and until then the cell keeps the
         # state it was last observed in -- the same staleness the cell
@@ -1681,11 +1675,9 @@ class _ControllerObservation:
                     else (cell.unavailable_reason if provider_failure_code is not None else remote_state.value)
                 )
                 # A provider draining capacity without saying why has not
-                # reported an outcome yet: the state that follows it does. Scored
-                # as a PROVIDER_ERROR, a Spot v5p-8 seen STOPPING on its way to a
-                # preemption put us-central1-a into cooldown and failed P5's
-                # no-cooldown check, although the TERMINATED observation that
-                # followed was correctly classified as preempted (2026-09-24).
+                # reported an outcome yet: the state that follows it does. Do not
+                # score an intermediate STOPPING state as PROVIDER_ERROR and
+                # impose cooldown before a possible Spot preemption is classified.
                 availability = (
                     cell.availability
                     if reported_failure_code is None and remote_state is CapacityStatus.DRAINING

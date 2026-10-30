@@ -311,9 +311,8 @@ def _quota_fits(row: dict[str, object], accelerator_type: str | None, count: int
 def _refused_spot_queues(cache_dir: Path | None, project: object) -> frozenset[tuple[str, str]]:
     """Return ``(zone, accelerator_type)`` Spot queues GCP refused for ``project``.
 
-    Quota is not access: a zone can hold 1536 chips of Spot v6e quota and still
-    answer every request with "User does not have permission to submit requests
-    into this queue" (example-spot-project, 2026-10-23). Provisioning records those
+    Quota is not access: a zone can have Spot quota and still refuse permission
+    to submit requests into its queue. Provisioning records those
     refusals in the local autoscale cache, which already keeps them out of
     automatic fleet selection; this is the same record read for the quota view.
     An unreadable cache yields no refusals rather than breaking the view.

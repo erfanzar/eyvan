@@ -188,7 +188,7 @@ def ssh_argv(
     if command is None:
         # A held tunnel must own its connection. With the operator's
         # ``ControlMaster auto``, ``ssh -N -L`` hands its forwards to a shared
-        # master and exits at once (2026-10-24), so the supervised process would
+        # master and exits at once, so the supervised process would
         # never be the thing holding the ports, and its death would mean nothing.
         argv.extend(("-N", "-o", "ExitOnForwardFailure=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"))
     argv.extend(("--", destination.target))

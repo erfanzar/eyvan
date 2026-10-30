@@ -27,7 +27,7 @@ DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH = Path("~/.eyvan/gcp-native-runtime.json
 #: operator did not name one. A local plane and its local agent are the same
 #: machine, so the document needs no bucket: keeping it on the local filesystem
 #: means a GCS or CLI failure can never stop the agent from recording that
-#: capacity it is already paying for exists (the 2026-08-22 outage). An
+#: capacity it is already paying for exists. An
 #: explicit ``EYVAN_FLEET_STATE_URI`` still wins.
 DEFAULT_GCP_NATIVE_FLEET_STATE_PATH = Path("~/.eyvan/gcp-native-fleet-state.json")
 GCP_NATIVE_RUNTIME_PROFILE_SCHEMA = "eyvan.gcp-native-runtime-profile"

@@ -614,7 +614,7 @@ def validate_accelerator_write_boundary(
             # Compute-capable when the catalog names a single VM's machine type and
             # its Compute TPU identity, whatever the shape's default backend is: v5e
             # defaults to the queue, and a project the queue refuses can still run
-            # it as Compute Spot VMs of the same machine family (2026-09-24).
+            # it as Compute Spot VMs of the same machine family.
             integrated_tpu = shape is not None and (
                 shape.capacity_backend in {"gcp-compute", "compute"}
                 or (shape.machine_type is not None and shape.tpu_type is not None and shape.hosts == 1)

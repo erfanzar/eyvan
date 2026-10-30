@@ -32,8 +32,7 @@ CONTROL_PLANE_CA_FILE_ENV = "EYVAN_CONTROL_PLANE_CA_FILE"
 #: The same CA as base64-encoded PEM, which is how the plane hands it to a job: a
 #: job runs on another machine, where no file path of the head's means anything.
 #: Encoded because PEM is multi-line and a systemd environment value may not
-#: contain a newline -- sent as PEM, every dispatch from a TLS head was refused
-#: by the worker with a 500 (2026-09-24).
+#: contain a newline; sending raw PEM would make the worker reject dispatch.
 CONTROL_PLANE_CA_B64_ENV = "EYVAN_CONTROL_PLANE_CA_B64"
 #: Where ``eyvan head up`` installs the CA on the head itself (public, 0644), so a
 #: CLI run there trusts its own plane without configuration.

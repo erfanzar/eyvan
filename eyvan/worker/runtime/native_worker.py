@@ -439,10 +439,9 @@ def create_native_worker_app(
         """Refuse a request the executor rejected as invalid, rather than crash on it.
 
         The executor validates a launch by raising ``ValueError`` ("... must not
-        contain a newline"). Unhandled, that was a 500, which every caller up the
-        chain reads as a transient fault: a dispatch the worker could never
-        accept was retried for ever, with the reason visible only in this host's
-        journal (2026-09-24). The same code the cell agent uses for the same case.
+        contain a newline"). An unhandled 500 would be read as a transient fault,
+        retrying a dispatch the worker can never accept. Use the same status and
+        error code as the cell agent for the same case.
         """
 
         return JSONResponse(status_code=400, content={"detail": str(exc), "code": "invalid_configuration"})

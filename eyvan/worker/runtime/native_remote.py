@@ -178,11 +178,10 @@ class NativeRemoteExecutor:
         """Issue one request, healing the one failure a retry is *provably* safe for.
 
         A pooled keep-alive the server already closed surfaces as
-        ``RemoteProtocolError`` on the first request that reuses it -- observed
-        live on a v6e-8 gang, where a poll interval longer than the worker's
-        keep-alive idle timeout made every other status read look like the rank
-        had died, and the aggregate failed four healthy hosts. Retrying that
-        one shape, for reads only, is safe by construction: no bytes reached
+        ``RemoteProtocolError`` on the first request that reuses it. This can
+        happen when polling is slower than the worker's keep-alive idle timeout
+        and must not be mistaken for rank death. Retrying that one shape, for
+        reads only, is safe by construction: no bytes reached
         the server, so nothing was executed twice. Mutations are never retried
         here; their fencing is the caller's to redo.
         """
@@ -199,11 +198,9 @@ class NativeRemoteExecutor:
     def worker_builds(self) -> list[dict[str, object]]:
         """Return this cell's one native worker, in the slice executor's shape.
 
-        A single-host cell has exactly one worker and it is this one. Without
-        this the agent had no probe to call, and the sweep read that as "this
-        backend has no separate worker" -- so a GCE cell running a native worker
-        reported no ranks at all and the fleet was called in agreement without
-        anything having asked it. Seen on a live CPU cell.
+        A single-host cell has exactly one worker and it is this one. Expose it
+        through the same probe as a slice so build checks cannot mistake a
+        missing probe for evidence that the cell has no separate worker.
         """
 
         reported = self.build()

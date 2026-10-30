@@ -83,22 +83,14 @@ def _uses_gce_tpu_cluster_detection(observation: CellObservation) -> bool:
     "can JAX discover this topology itself", and for a Cloud TPU it always can --
     a single ``v5p-16`` is two hosts and is discovered exactly like a multislice.
 
-    Asking "is this multislice?" instead put single-slice multi-host TPUs on the
-    ``EXPLICIT`` path, where Eyvan supplies the coordinator address by reusing
-    the worker's *management* endpoint. That endpoint is the address the control
-    plane reaches the worker on, which for a public-routed cell is an external
-    IP -- so the hosts tried to coordinate over the public internet on port
-    12345, which no firewall rule permits. Every rank died in
-    ``RegisterTask`` with DEADLINE_EXCEEDED, having never joined, while the
-    hosts sat healthy on the same subnet with ``default-allow-internal``
-    covering everything they actually needed.
+    Both single-slice multi-host and multislice TPUs need GCE discovery. The
+    ``EXPLICIT`` path reuses the worker's management endpoint, which may be an
+    external IP. Hosts must instead coordinate over internal addresses; using a
+    public IP can send rendezvous traffic to a port the firewall does not permit.
 
-    Two addresses were being conflated: the *management* endpoint (control plane
-    to worker, may have to be public) and the *coordination* address (host to
-    host, must be internal). GCE metadata gives JAX the second one directly.
-
-    Live on 2026-08-02: every ``pods=1`` inference run failed this way, while the
-    ``pods=2`` job succeeded -- because only multislice reached this branch.
+    The management endpoint (control plane to worker) and coordination address
+    (host to host) serve different purposes. GCE metadata gives JAX the internal
+    coordination address directly.
 
     ``EXPLICIT`` remains correct for multi-host backends that are not GCE TPUs,
     where Eyvan genuinely does have to supply the addresses.

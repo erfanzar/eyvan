@@ -27,10 +27,9 @@ _QUOTA_USAGE_METRIC = "serviceruntime.googleapis.com/quota/allocation/usage"
 _CONSUMER_QUOTA_RESOURCE = "consumer_quota"
 _TPU_QUOTA_SERVICE = "tpu.googleapis.com"
 #: Cloud Monitoring writes an allocation-usage point when usage changes and can
-#: then stay silent for weeks while it does not. In example-spot-project on 2026-10-23
-#: the newest Spot v5p/v6e points were 22 days old (all zero), and the previous
-#: two-day window reported every zone as ``usage_unknown``. The newest point in
-#: the window is still the current value; its own timestamp travels with it, so
+#: then stay silent for weeks while it does not. A short lookback can therefore
+#: report unchanged usage as unknown. The newest point in the window is still
+#: the current value; its own timestamp travels with it, so
 #: callers keep seeing how old the reading is.
 _DEFAULT_LOOKBACK = timedelta(days=90)
 

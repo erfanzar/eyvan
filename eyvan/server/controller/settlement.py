@@ -369,9 +369,8 @@ class _ControllerSettlement:
         # Concurrently, bounded by the same knob the live archiver uses. Each
         # rank's object is independent and immutable, and this runs before the
         # workload is settled -- inside the observe-workloads phase, which every
-        # other workload waits behind. One at a time, a 16-host v5p-128 spent
-        # 197 s here (16 x ~11 s, measured live 2026-10-25) and the job read as
-        # running for three minutes after it had finished.
+        # other workload waits behind. Serial uploads would delay terminal
+        # status and observations of unrelated workloads by the sum of their latencies.
         gate = asyncio.Semaphore(max(int(self.settings.log_archive_concurrency), 1))
 
         async def archive_rank(rank: int) -> _ArchivedRank:
@@ -778,10 +777,9 @@ class _ControllerSettlement:
         candidates = candidate_pool_templates(spec.required_labels)
         if candidates:
             # A workload pinned to pools can only ever use those pools. Judging
-            # it by "any enabled pool of this shape and region" kept a
-            # single-pool workload PENDING forever beside an unrelated fleet's
-            # identical pool, and let two candidates that had *both* denied it
-            # each vouch for the other. Seen live on 2026-09-24.
+            # it by any enabled pool of this shape and region would count
+            # unrelated fleets as supply. Exclude every candidate that denied
+            # this workload so denied pools cannot vouch for one another.
             denied = {denied_cell.pool_id}
             denied.update(
                 cell.pool_id
@@ -1262,12 +1260,9 @@ class _ControllerSettlement:
     async def _export_invariant_violations(self) -> None:
         """Evaluate the fleet's own durability invariants and publish the result.
 
-        These were reachable only by an operator running
-        `eyvan capacity invariants` by hand. On 2026-08-12 two of them were true
-        of a live fleet for twenty minutes -- I9 for a lease naming a cell the
-        planner had dropped, I3 for the cancel that could not land -- while four
-        TPU VMs billed and the plane, which could have said so at any point, was
-        never asked.
+        Exporting the checks makes violations alertable without an operator
+        running `eyvan capacity invariants` by hand, including leases naming
+        missing cells and stuck outbox commands.
 
         Published from this phase rather than a new one because that is what it
         is: a level, on a slow interval, next to the other gauges. Its own
