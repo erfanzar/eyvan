@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_review_cycle2_writer_114 import _alive, _spec, _wait_status
+from test_process_native_local_descendant_retirement import _alive, _spec, _wait_status
 
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
 from eyvan.worker.runtime import LocalProcessExecutor, local_process, local_worker

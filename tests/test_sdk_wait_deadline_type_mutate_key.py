@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Round-016 SDK contracts: wait deadline type, mutate key visibility, follower cursor."""
+"""SDK contracts: wait deadline type, mutate key visibility and the follower cursor."""
 
 from __future__ import annotations
 

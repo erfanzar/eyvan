@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Round-015 persistence fixes: idempotency contract, retention cutoff, env precedence."""
+"""Persistence contracts: idempotency, the retention cutoff and environment precedence."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ async def repository(request: pytest.FixtureRequest, tmp_path) -> typing.AsyncIt
     if request.param == "memory":
         yield InMemoryRepository()
         return
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'round015.db'}")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'repository.db'}")
     await create_schema(engine)
     try:
         yield SqlAlchemyRepository(engine)

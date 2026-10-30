@@ -45,7 +45,7 @@ def test_docker_terminal_outcome_is_durable_before_collection(
 ):
     script = (
         "import sys; from pathlib import Path; sys.path.insert(0, str(Path('tests').resolve())); "
-        "from test_review_cycle2_writer_119 import _container_collection_child; "
+        "from test_docker_outcome_journal_paging_env_encoding import _container_collection_child; "
         "_container_collection_child(Path(sys.argv[1]), int(sys.argv[2]), crash=sys.argv[3] == 'True')"
     )
     child = subprocess.run(

@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from test_review_cycle2_writer_105 import ADMIN, _lease, _submit
+from test_admission_region_policy_cross_plane_authority import ADMIN, _lease, _submit
 
 from eyvan.records import BudgetRecord, CellRecord, CellState, QuotaRecord, ResourceLimits, ResourceVector, utcnow
 from eyvan.server.persistence import InMemoryRepository

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Recovery safety regressions for the SQL repository (writer 086)."""
+"""Recovery safety regressions for the SQL repository."""
 
 from __future__ import annotations
 

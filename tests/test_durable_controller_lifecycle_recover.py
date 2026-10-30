@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Durable regressions for controller-lifecycle-recover-3-{1,2,3}."""
+"""Controller lifecycle recovery: bounded endpoint probes, endpoint fencing and replacement revalidation."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class Trickle(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def test_3_1_total_http_deadline_includes_the_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_total_http_deadline_includes_the_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
     body = Trickle()
     original = httpx.AsyncClient
 
@@ -70,7 +70,7 @@ async def test_3_1_total_http_deadline_includes_the_response_body(monkeypatch: p
     assert body.closed
 
 
-async def test_3_1_custom_probe_cannot_hold_the_serial_leader_phase() -> None:
+async def test_custom_probe_cannot_hold_the_serial_leader_phase() -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz", health_timeout_s=0.02)
     controller, _service, record, _operator = await _service_plane(policy)
     await _running_replica(controller, record.id, "http://10.0.0.1")
@@ -86,7 +86,7 @@ async def test_3_1_custom_probe_cannot_hold_the_serial_leader_phase() -> None:
     assert health.consecutive_failures == 0
 
 
-async def test_3_2_a_superseded_endpoint_probe_is_not_committed() -> None:
+async def test_a_superseded_endpoint_probe_is_not_committed() -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz", health_failure_threshold=1)
     controller, service, record, _operator = await _service_plane(policy)
     replica_id = await _running_replica(controller, record.id, "http://10.0.0.1")
@@ -102,7 +102,7 @@ async def test_3_2_a_superseded_endpoint_probe_is_not_committed() -> None:
     assert await _health(controller, record.id) == []
 
 
-async def test_3_2_same_generation_endpoint_aba_also_fences_the_old_probe() -> None:
+async def test_same_generation_endpoint_aba_also_fences_the_old_probe() -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz")
     controller, service, record, _operator = await _service_plane(policy)
     replica_id = await _running_replica(controller, record.id, "http://10.0.0.1")
@@ -119,7 +119,7 @@ async def test_3_2_same_generation_endpoint_aba_also_fences_the_old_probe() -> N
     assert await _health(controller, record.id) == []
 
 
-async def test_3_2_registration_resets_counters_and_load_but_same_endpoint_retry_does_not() -> None:
+async def test_registration_resets_counters_and_load_but_same_endpoint_retry_does_not() -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz", health_failure_threshold=1)
     controller, service, record, operator = await _service_plane(policy)
     replica_id = await _running_replica(controller, record.id, "http://10.0.0.1")
@@ -154,7 +154,7 @@ async def test_3_2_registration_resets_counters_and_load_but_same_endpoint_retry
     assert reported["observed_load"] is None
 
 
-async def test_3_2_stale_endpoint_health_is_neither_classified_nor_folded_nor_counted_as_load() -> None:
+async def test_stale_endpoint_health_is_neither_classified_nor_folded_nor_counted_as_load() -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz", health_failure_threshold=1)
     controller, service, record, operator = await _service_plane(policy)
     replica_id = await _running_replica(controller, record.id, "http://10.0.0.2")
@@ -203,7 +203,7 @@ async def test_3_2_stale_endpoint_health_is_neither_classified_nor_folded_nor_co
 
 
 @pytest.mark.parametrize("recovery", ["health", "lease", "cell", "policy", "revision"])
-async def test_3_3_replacement_revalidates_current_durable_evidence(recovery: str) -> None:
+async def test_replacement_revalidates_current_durable_evidence(recovery: str) -> None:
     policy = ServicePolicy(replicas=1, revision="v1", health_path="/healthz", health_failure_threshold=1)
     controller, service, record, operator = await _service_plane(policy)
     replica_id = await _running_replica(controller, record.id, "http://10.0.0.1")

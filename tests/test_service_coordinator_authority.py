@@ -15,7 +15,7 @@ from eyvan.server.service import ControlPlaneService
 from eyvan.server.service.errors import AuthorizationError, ConflictError
 from eyvan.server.service.scheduling import CoreSchedulingService
 from eyvan.server.service.services import ServicePolicy
-from tests.test_review_cycle2_expansion_eviction import repository as _repository
+from tests.test_coordinated_admission_preserves_unresolved_asset_eviction import repository as _repository
 
 repository = _repository
 

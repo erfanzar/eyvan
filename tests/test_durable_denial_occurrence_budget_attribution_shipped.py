@@ -12,8 +12,8 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_controller import FakeAgent
-from test_review_cycle2_writer_030 import _blocks, _record, _source
-from test_review_cycle2_writer_080 import _ADMIN, _START, _lease, _settle
+from test_historical_status_reads_become_fresh_provider import _blocks, _record, _source
+from test_period_aware_fleet_budget_reconciliation import _ADMIN, _START, _lease, _settle
 
 from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, CapacityStatus

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Round-017 fixes: config bounds, metrics hardening, TLS floor, workspace packaging."""
+"""Config bounds, metrics hardening, the TLS version floor and workspace packaging."""
 
 from __future__ import annotations
 

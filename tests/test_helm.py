@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Source contracts and optional real Helm regressions for writer 014.
+"""Source contracts and optional real Helm regressions for the chart's policies and ServiceMonitor.
 
 Source contracts do not emulate Go templating or claim cluster/CNI/scrape proof.
 """

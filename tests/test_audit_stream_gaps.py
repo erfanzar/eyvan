@@ -6,7 +6,7 @@
 """Existing bounded SSE lookback compatibility and genuine stored rollback gaps.
 
 Repository allocation is commit-safe; the production concurrency proof lives in
-``test_review_cycle2_commit_safe_audit``. Explicit stored sequence gaps here pin
+``test_commit_safe_audit_cursors_actual_repository``. Explicit stored sequence gaps here pin
 legacy lookback bytes without pretending StateSession accepts caller sequences.
 """
 
