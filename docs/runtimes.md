@@ -19,6 +19,13 @@ The interpreter contract is checked **before provisioning** when
 `major.minor` is refused at submission, not on the accelerator — a live
 multislice run paid for that lesson once (see [proofs](proofs.md)).
 
+Both models describe hosts Eyvan bootstraps (GCP). On `onprem-ssh` and
+`manual` pools Eyvan installs nothing, so fleet validation refuses
+`runtime.container`, `runtime.init_commands` and `runtime.artifacts` there;
+configure the worker's container runtime file on the host instead
+([setting up an on-prem SSH host](reference/capacity-and-providers.md#setting-up-an-on-prem-ssh-host)).
+`runtime.env` and `runtime.python` work on every provider.
+
 ## Two allocation modes
 
 Independent of the runtime: **how a job's `pods` workers are allocated**.

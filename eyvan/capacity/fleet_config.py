@@ -17,7 +17,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object, model_json
-from eyvan.capacity.drivers.base import canonical_execution_backend, capacity_backend_agent_family
+from eyvan.capacity.drivers.base import (
+    canonical_execution_backend,
+    capacity_backend_agent_family,
+    validate_host_runtime_write_boundary,
+)
 from eyvan.capacity.hardware_catalog import shape_for, validate_accelerator_write_boundary
 from eyvan.capacity.providers.gcp.queued_resources import bootstrap_egress_choices
 from eyvan.records import (
@@ -805,6 +809,11 @@ class EyvanFleetConfig(FleetConfigModel):
                 raise ValueError(f"node type {name!r} runtime requires executor eyvan-native")
             if not runtime.is_empty and node_type.provider_options.get("startup_script") is not None:
                 raise ValueError("use runtime.init_commands instead of provider_options.startup_script")
+            validate_host_runtime_write_boundary(
+                capacity_backend=capacity_backend,
+                runtime=runtime,
+                boundary=f"node type {name!r}",
+            )
             if runtime.vm_image is not None:
                 if self.provider.type != "gcp" or not compute_capacity:
                     raise ValueError(f"node type {name!r} runtime.vm_image requires the gcp-compute capacity backend")

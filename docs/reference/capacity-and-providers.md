@@ -164,6 +164,16 @@ pools:
 Declare `start_command`: without it the token file is still refreshed, but a
 running worker keeps the old token until something restarts it.
 
+`runtime.container`, `runtime.init_commands` and `runtime.artifacts` are
+host setup that only GCP bootstrap ships; fleet validation refuses them for
+`onprem-ssh` and `manual` pools rather than accepting and dropping them.
+Configure the host instead: write `/etc/eyvan-native/container-runtime.json`
+(`{"container": {...}, "artifact_mounts": []}`) and add
+`--container-runtime-file /etc/eyvan-native/container-runtime.json` to
+`ExecStart`; run setup and stage artifacts in the host's own provisioning.
+`runtime.env` and `runtime.python` stay accepted: the plane applies them at
+submission and dispatch, on every provider.
+
 ## 4. Provider clients
 
 The provider packages are transport and provider-domain seams, intentionally
