@@ -237,6 +237,30 @@ class InsecureManagedArtifactTransport(PermanentDispatchRefusal):
     """
 
 
+def _worker_source_digest(worker: object) -> str | None:
+    """Return the digest one worker entry of ``CellAgentClient.worker_builds`` reports.
+
+    The agent answers each rank as ``{"rank", "endpoint", "build": {...}}`` --
+    the worker's whole build identity nested under ``build``, or ``None`` when
+    the rank could not say -- which is the shape the capacity-builds report
+    already reads. This guard read a flat ``source_digest`` beside ``rank``
+    instead, a key no agent ever sent, so every worker read as unjudgeable and
+    a worker on another build was dispatched to as if it agreed: observed live,
+    a command workload succeeded on a worker two commits behind its plane while
+    ``/api/v1/capacity/builds`` showed the mismatch. A rank whose build is
+    absent stays unjudgeable, the third state, exactly as an agent that cannot
+    answer is.
+    """
+
+    if not isinstance(worker, dict):
+        return None
+    build = worker.get("build")
+    if not isinstance(build, dict):
+        return None
+    digest = build.get("source_digest")
+    return digest if isinstance(digest, str) and digest else None
+
+
 class AttemptRankSpaceTooLarge(PermanentDispatchRefusal):
     """The composed rank space of an attempt is above the ceiling.
 
@@ -1573,7 +1597,7 @@ class _ControllerWorkloadCommands:
             if reported is not None and reported != head_digest:
                 parts.append(f"agent {reported[:12]}")
             for worker in workers or ():
-                digest = worker.get("source_digest") if isinstance(worker, dict) else None
+                digest = _worker_source_digest(worker)
                 if isinstance(digest, str) and digest != head_digest:
                     parts.append(f"worker {digest[:12]}")
             if parts:
