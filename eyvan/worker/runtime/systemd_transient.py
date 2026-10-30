@@ -914,6 +914,16 @@ class SystemdTransientServiceExecutor:
         if not _defer_startup_recovery:
             self._recover_startup()
 
+    @property
+    def workload_user(self) -> str | None:
+        """Return the unprivileged user workloads run as, or ``None`` for root.
+
+        Read by the worker's GPU readiness probe, which must check device access
+        for the identity that will open the devices -- not for the worker's own.
+        """
+
+        return self._workload_user
+
     def _record_path(self, remote_id: str) -> Path:
         return self.jobs_dir / f"{_record_name(remote_id)}.json"
 

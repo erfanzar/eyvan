@@ -62,11 +62,13 @@ from eyvan.worker.agent.models import (
     ExecRequest,
     MutationConflictCode,
     NativeStageActionRequest,
+    NativeWorkerAccelerators,
     NativeWorkerHealth,
     WorkloadMutationRequest,
     WorkloadReference,
     WorkloadRequest,
 )
+from eyvan.worker.runtime.host_accelerators import check_gpu_readiness
 from eyvan.worker.runtime.local_process import LocalProcessExecutor
 from eyvan.worker.runtime.registry import ExecCapableExecutionDriver, IntrospectableExecutionDriver
 from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
@@ -365,6 +367,29 @@ def create_native_worker_app(
     @app.get("/api/v1/health", dependencies=[Depends(authenticate)])
     def authenticated_health() -> NativeWorkerHealth:
         return NativeWorkerHealth(status="ok", runtime="native-worker")
+
+    @app.get("/api/v1/accelerators", dependencies=[Depends(authenticate)])
+    def accelerators(expected_gpu_devices: int | None = None) -> NativeWorkerAccelerators:
+        """Hold this host to the GPU count its cell's catalog row declares.
+
+        The agent passes the count; the worker is the only process that can look
+        at ``/dev``. Device access is checked for the workload user on the native
+        systemd path only -- the container path opens devices as root through
+        Docker. See ``eyvan.worker.runtime.host_accelerators``.
+        """
+
+        if expected_gpu_devices is not None and expected_gpu_devices < 0:
+            raise HTTPException(status_code=422, detail="expected_gpu_devices must be non-negative")
+        executor = app.state.executor
+        workload_user = executor.workload_user if isinstance(executor, SystemdTransientServiceExecutor) else None
+        verdict = check_gpu_readiness(expected_gpu_devices, workload_user=workload_user)
+        return NativeWorkerAccelerators(
+            ready=verdict.ready,
+            detail=verdict.detail,
+            expected_devices=expected_gpu_devices,
+            observed_devices=verdict.observed.devices,
+            control_node_present=verdict.observed.control_node_present,
+        )
 
     @app.get("/api/v1/build", dependencies=[Depends(authenticate)])
     def build() -> AgentBuild:

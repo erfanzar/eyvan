@@ -168,6 +168,65 @@ paths. Older cache entries remain untouched for jobs that may still use them.
 `@execute(..., workspace="src/")` ships a source tree to the worker's
 working directory for the callable to import.
 
+## GPU hosts
+
+A cell is GPU-aware when its pool's `accelerator_type` is a catalog GPU row:
+`a3-highgpu-8g`, `a2-highgpu-1g` and `g2-standard-48` on GCP, or
+`hgx-h200-8g` for an operator-owned 8x H200 (141 GB, SXM) node under
+`onprem-ssh` or `manual`. The driver then publishes `cell_accelerator`, which
+does two things:
+
+- **Readiness holds the host to the count.** Before a GPU cell becomes
+  schedulable the agent asks its native worker
+  (`GET /api/v1/accelerators?expected_gpu_devices=N`) to look at `/dev`. The
+  cell stays `EXECUTION_CONNECTING`, with the reason as its detail, while:
+  - the NVIDIA driver is loaded but exposes no `/dev/nvidiaN` (a GPU the
+    driver cannot drive),
+  - no NVIDIA node exists at all (driver not loaded),
+  - fewer than `N` GPU nodes exist (a GPU fell off the bus or is unbound),
+  - or, on the native (non-container) path, the workload user cannot open a
+    node read-write.
+
+  A worker too old to answer is reported not ready rather than assumed fine.
+  TPU, CPU and uncatalogued cells are not asked. The probe reads device nodes
+  only: it does not catch Xid or ECC faults, and it does not exercise the
+  container path's NVIDIA toolkit (that needs an image the worker does not own,
+  so a container cell's first workload is its toolkit check).
+- **Multi-cell gangs get per-rank devices** (`CUDA_VISIBLE_DEVICES` and
+  friends), which needs every cell to report a catalog GPU shape.
+
+An on-prem H200 pool still states its own complete `resources` vector (CPU,
+memory, `gpu: 8`); the catalog does not know the host's CPU or memory.
+
+No GPU row is hardware-qualified: no Eyvan workload has run on an H200.
+
+### NVIDIA device access (native path, operator-owned hosts)
+
+Native workloads run as `eyvan-workload`, which must open `/dev/nvidiactl`,
+`/dev/nvidia-uvm` and every `/dev/nvidiaN` read-write. The GCP bootstrap grants
+this with `setfacl`, which a reboot or driver reload undoes; on a host Eyvan
+does not create, install a udev rule instead so the grant is reapplied each time
+the nodes appear:
+
+```bash
+sudo apt-get install -y acl
+sudo tee /etc/udev/rules.d/70-eyvan-nvidia.rules >/dev/null <<'RULE'
+KERNEL=="nvidia[0-9]*|nvidiactl|nvidia-uvm|nvidia-uvm-tools|nvidia-modeset", \
+  RUN+="/usr/bin/setfacl -m u:eyvan-workload:rw /dev/%k"
+RULE
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+Some driver installs create the nodes with `nvidia-modprobe` rather than
+through udev, and then the rule never fires; reboot once and check
+`getfacl /dev/nvidia0`. If the grant is missing, run the same `setfacl` from a
+oneshot systemd unit ordered `After=nvidia-persistenced.service` instead.
+
+Check with `ls -l /dev/nvidia*` first: many Ubuntu driver packages already
+create the nodes mode `0666`, in which case nothing is needed. Readiness names the nodes
+it cannot open if the grant is missing. The container path is unaffected:
+Docker opens the devices as root.
+
 ## Local components
 
 `eyvan runtime init` stages the local native runtime profile
