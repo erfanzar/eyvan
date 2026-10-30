@@ -65,9 +65,10 @@ def _plane_digest(monkeypatch: pytest.MonkeyPatch, digest: str) -> None:
 
 
 class _BuildReportingAgent(FakeAgent):
-    def __init__(self, source_digest: str):
+    def __init__(self, source_digest: str, worker_digest: str | None = None):
         super().__init__()
         self._source_digest = source_digest
+        self._worker_digest = source_digest if worker_digest is None else worker_digest
 
     def build(self):
         return AgentBuild(
@@ -82,7 +83,17 @@ class _BuildReportingAgent(FakeAgent):
         )
 
     def worker_builds(self, cell_id):
-        return [{"source_digest": self._source_digest}]
+        # The shape the agent actually answers (native_remote/native_slice): the
+        # worker's build nested under ``build``. This fake used to answer a flat
+        # ``source_digest``, the same wrong key the guard read, so the two agreed
+        # with each other and with no real agent.
+        return [
+            {
+                "rank": 0,
+                "endpoint": "http://127.0.0.1:8100",
+                "build": {"source_digest": self._worker_digest},
+            }
+        ]
 
 
 class _UnreadableAgent(FakeAgent):
@@ -334,3 +345,57 @@ async def test_the_sweep_skips_an_agent_it_cannot_read_and_keeps_recycling_the_r
         skewed = await transaction.get_cell("cell-skewed")
     assert mute is not None and mute.state is CellState.READY, "unreadable is a third state, not a mismatch"
     assert skewed is not None and skewed.state is CellState.DRAINING
+
+
+@pytest.mark.asyncio
+async def test_a_worker_on_another_build_is_refused_although_its_agent_agrees(monkeypatch) -> None:
+    """Regression: the guard read each worker's digest from a key no agent sends.
+
+    The agent nests a worker's identity under ``build``; the guard looked for a
+    flat ``source_digest`` beside ``rank``, found nothing, and treated every
+    worker as unjudgeable. Observed live: the agent and plane agreed, the worker
+    ran other code, and a command workload was dispatched to it and succeeded.
+    """
+
+    _plane_digest(monkeypatch, "a" * 64)
+    agent = _BuildReportingAgent("a" * 64, worker_digest="b" * 64)
+    repository, controller, leased, command = await _leased_workload(agent)
+
+    await controller._dispatch_workload(command)
+
+    async with repository.transaction() as transaction:
+        workload = await transaction.get_workload(leased.id)
+        cell = await transaction.get_cell("cell-a")
+    assert workload is not None and cell is not None
+    assert agent.submissions == [], "nothing was dispatched onto the stale worker"
+    assert workload.state is WorkloadState.PENDING
+    assert cell.state is CellState.DRAINING
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_judges_workers_as_well_as_agents(monkeypatch) -> None:
+    _plane_digest(monkeypatch, "a" * 64)
+    repository = InMemoryRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    controller = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(),
+        agent_factory=lambda cell: _BuildReportingAgent("a" * 64, worker_digest="b" * 64),
+    )
+    async with repository.transaction() as transaction:
+        await transaction.put_cell(
+            CellRecord(
+                id="cell-worker-skewed",
+                provider="local",
+                region="local",
+                state=CellState.READY,
+                capacity=ResourceVector(cpu=1, memory_gib=1),
+                allocatable=ResourceVector(cpu=1, memory_gib=1),
+            )
+        )
+
+    assert await controller.recycle_stale_build_cells_once() == 1
+    async with repository.transaction() as transaction:
+        cell = await transaction.get_cell("cell-worker-skewed")
+    assert cell is not None and cell.state is CellState.DRAINING
