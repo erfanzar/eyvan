@@ -99,12 +99,14 @@ from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import (
+    CELL_ACCELERATOR_METADATA_KEY,
     CapacityProviderError,
     CapacityProviderFailureCode,
     CellCapabilities,
     CellObservation,
     MutationContext,
     StaleMutationError,
+    describe_cell_accelerator,
 )
 from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
@@ -962,6 +964,18 @@ class OnPremSshCapacityDriver:
             **record.metadata,
             "native_worker_endpoints": list(endpoints),
         }
+        # The same rule ``manual`` follows: the pool's declared type is the
+        # evidence of what these hosts are, the catalog is the authority for
+        # what that type carries, and a type with no row stays unknown. Derived
+        # on every observation, removal included, so a copy persisted by another
+        # build never outlives this build's ability to state it. This is what
+        # makes an ``hgx-h200-8g`` cell GPU-coordinated in a gang and what its
+        # worker's GPU readiness probe is held to.
+        accelerator = describe_cell_accelerator(accelerator_type=record.accelerator_type)
+        if accelerator is None:
+            metadata.pop(CELL_ACCELERATOR_METADATA_KEY, None)
+        else:
+            metadata[CELL_ACCELERATOR_METADATA_KEY] = accelerator.as_metadata()
         return CellObservation(
             cell_id=record.name,
             state=state,

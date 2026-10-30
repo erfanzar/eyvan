@@ -48,6 +48,9 @@ that 0.0.1 will contain.
   `aws` umbrella, `azure-vm` and the `azure` umbrella, `kubernetes` (`k8s`),
   `manual`, and `onprem-ssh`. Nothing that decides names a provider; the
   boundary is enforced by a test.
+- Hardware catalog row `hgx-h200-8g` for an operator-owned 8x H200 (141 GB)
+  node. It fixes the device count and GPU model only; host CPU and memory are
+  explicit `null` and the pool states its own vector. Not hardware-qualified.
 - A single sourced hardware catalog drives accelerator shapes, per-host CPU /
   memory / TPU resources, and TPU profiles; v6e and v5p slice-size coverage was
   corrected against it.
@@ -156,6 +159,13 @@ that 0.0.1 will contain.
 
 ### Fixed
 
+- A GPU cell is no longer reported ready on a host whose GPUs are not there.
+  For a cell whose type is a catalog GPU row, the native worker checks `/dev`
+  against the row's device count (driver loaded with no device node, missing
+  driver, fewer GPUs than declared, or device nodes the workload user cannot
+  open) and the cell stays `EXECUTION_CONNECTING` with the reason.
+- `onprem-ssh` now publishes `cell_accelerator` for a cataloged type, as
+  `manual` already did, so on-prem GPU cells join GPU-coordinated gangs.
 - Local native runtime path that provisioned TPUs but never ran anything.
 - Startup races: a losing race no longer destroys the winner's PID record, and
   the winner is adopted on its record rather than a fresh health probe.

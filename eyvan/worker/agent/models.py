@@ -106,6 +106,23 @@ class NativeWorkerHealth(AgentModel):
     runtime: tp.Literal["native-worker"]
 
 
+class NativeWorkerAccelerators(AgentModel):
+    """A native worker's verdict on whether its host carries the GPUs it was declared with.
+
+    A report rather than a failure status: ``ready`` false is a correct answer
+    about the host, and the agent turns it into a cell that stays
+    ``EXECUTION_CONNECTING`` with ``detail`` as the reason.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ready: bool
+    detail: str
+    expected_devices: int | None = Field(default=None, ge=0)
+    observed_devices: int = Field(ge=0)
+    control_node_present: bool
+
+
 class MutationModel(AgentModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
     generation: int = Field(ge=0)

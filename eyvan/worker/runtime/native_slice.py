@@ -966,6 +966,19 @@ class NativeSliceExecutor:
 
         return all(worker.health() for worker in self._workers)
 
+    def gpu_readiness(self, expected_devices: int) -> tuple[bool, str]:
+        """Hold every host to the cell's per-host GPU count; name the first that fails.
+
+        Per host because the catalog count is per host: a two-host cell of an
+        eight-GPU shape needs eight on each, not sixteen between them.
+        """
+
+        for endpoint, worker in zip(self.endpoints, self._workers, strict=True):
+            ready, detail = worker.gpu_readiness(expected_devices)
+            if not ready:
+                return False, f"{endpoint}: {detail}"
+        return True, f"{len(self._workers)} hosts each expose {expected_devices} GPU device nodes"
+
     def worker_builds(self) -> list[dict[str, object]]:
         """Return what code each host in this slice is running.
 

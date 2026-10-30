@@ -42,6 +42,18 @@ This also means no name that an existing pool already puts in
 ``accelerator_type`` gains a catalog entry here, so no deployment's write
 boundary changes meaning on upgrade.
 
+**Operator-owned GPU hosts state only what is published.** A bare-metal node
+reached through ``onprem-ssh`` or ``manual`` has no provider machine type, and
+its CPU and memory are whatever the operator's vendor built -- an HGX H200
+baseboard ships in servers from many vendors with different processors and
+DIMM counts. Those numbers also never reach admission from here:
+:func:`validate_accelerator_write_boundary` consults the catalog for GCP pools
+only, and every other provider must state a complete resource vector. So such a
+row records ``host_cpu``, ``host_memory_gib`` and ``machine_type`` as an explicit
+``null`` and fixes only what the GPU vendor publishes: the device count and the
+model. That is the part :class:`~eyvan.capacity.drivers.base.CellAccelerator`
+dispatches to ranks, and the part a host's readiness probe holds it to.
+
 **Nothing in this file is hardware-qualified.** The GPU rows are transcribed from
 the provider's published machine-shape table. No GPU has executed an Eyvan
 workload, so treat a GPU row as a reviewable description of a host, not as
@@ -82,6 +94,13 @@ SUPPORTED_KINDS: tp.Final = frozenset({"gpu", "tpu"})
 #: TPU backend would compile into a request no driver can serve.
 _COMPUTE_BACKENDS: tp.Final = frozenset({"compute", "gcp", "gcp-compute"})
 
+#: Capacity backends that adopt a host the operator already owns. A GPU row
+#: naming one describes a bare-metal node rather than a provider machine type,
+#: so it may leave the host's CPU, memory and machine type unstated (see the
+#: module docstring): no provider publishes them, and admission for these
+#: providers never reads them from the catalog.
+_OPERATOR_HOST_BACKENDS: tp.Final = frozenset({"onprem-ssh", "manual"})
+
 
 @dataclass(frozen=True, slots=True)
 class AcceleratorShape:
@@ -108,6 +127,12 @@ class AcceleratorShape:
     its host is not a shape, and a zero would make every workload unschedulable
     on a pool that looks healthy.
 
+    A GPU row whose ``capacity_backend`` adopts an operator's host
+    (``onprem-ssh``, ``manual``) is the one exception to the host-resource rule:
+    it records ``host_cpu``, ``host_memory_gib`` and ``machine_type`` as ``None``
+    because a bare-metal node has no published values for them, and the pools
+    such hosts back must state their own complete resource vector anyway.
+
     No GPU row is hardware-qualified. Nothing has executed on a GPU under Eyvan.
     """
 
@@ -116,8 +141,8 @@ class AcceleratorShape:
     generation: str
     chips: int
     quota_units: int
-    host_cpu: int
-    host_memory_gib: float
+    host_cpu: int | None
+    host_memory_gib: float | None
     capacity_backend: str
     multislice_capable: bool
     source_url: str
@@ -136,12 +161,18 @@ class AcceleratorShape:
             raise HardwareCatalogError(f"{self.accelerator_type}: kind {self.kind!r} is not one of {known}")
         if self.chips <= 0 or self.quota_units <= 0:
             raise HardwareCatalogError(f"{self.accelerator_type}: chips and quota_units must be positive")
-        # A whole number, because a host has whole CPUs and ``TpuProfile``
-        # requires a positive integer. Storing a float here would put the
-        # coercion at every call site instead of at the one boundary.
-        if isinstance(self.host_cpu, bool) or not isinstance(self.host_cpu, int) or self.host_cpu <= 0:
+        # Only an operator-owned GPU host may leave its CPU and memory unstated,
+        # and only as an explicit ``null``: omitting the key is still refused, so
+        # a typo cannot turn a provider shape into an operator one.
+        unstated_host = self.kind == "gpu" and self._normalized_backend in _OPERATOR_HOST_BACKENDS
+        if not (unstated_host and self.host_cpu is None) and (
+            # A whole number, because a host has whole CPUs and ``TpuProfile``
+            # requires a positive integer. Storing a float here would put the
+            # coercion at every call site instead of at the one boundary.
+            isinstance(self.host_cpu, bool) or not isinstance(self.host_cpu, int) or self.host_cpu <= 0
+        ):
             raise HardwareCatalogError(f"{self.accelerator_type}: host_cpu must be a positive integer")
-        if (
+        if not (unstated_host and self.host_memory_gib is None) and (
             isinstance(self.host_memory_gib, bool)
             or not isinstance(self.host_memory_gib, int | float)
             or not math.isfinite(self.host_memory_gib)
@@ -227,13 +258,21 @@ class AcceleratorShape:
             )
         if self.multislice_capable:
             raise HardwareCatalogError(f"{self.accelerator_type}: multislice is a Cloud TPU concept, not a GPU one")
-        backend = self.capacity_backend.strip().lower().replace("_", "-")
-        if backend not in _COMPUTE_BACKENDS:
+        backend = self._normalized_backend
+        if backend not in _COMPUTE_BACKENDS | _OPERATOR_HOST_BACKENDS:
             raise HardwareCatalogError(
-                f"{self.accelerator_type}: a GPU shape is provisioned as a VM, "
+                f"{self.accelerator_type}: a GPU shape is provisioned as a VM or adopted as an operator's host, "
                 f"so capacity_backend {self.capacity_backend!r} cannot serve it"
             )
-        for field_name in ("gpu_model", "machine_type"):
+        # A bare-metal node has no provider machine type to name; everything
+        # else that creates a GPU host is asked for one by name. A bare-metal
+        # row that does name one is held to the same trimmed-string rule.
+        required = (
+            ("gpu_model",)
+            if backend in _OPERATOR_HOST_BACKENDS and self.machine_type is None
+            else ("gpu_model", "machine_type")
+        )
+        for field_name in required:
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip() or value != value.strip():
                 raise HardwareCatalogError(
@@ -241,6 +280,11 @@ class AcceleratorShape:
                 )
         if self.tpu_type is not None:
             raise HardwareCatalogError(f"{self.accelerator_type}: a GPU shape cannot name a tpu_type")
+
+    @property
+    def _normalized_backend(self) -> str:
+        backend = self.capacity_backend if isinstance(self.capacity_backend, str) else ""
+        return backend.strip().lower().replace("_", "-")
 
     @property
     def schedulable_tpu(self) -> int:
