@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from eyvan._internal import fleet_init_script
 from eyvan.records import WorkloadRecord
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
@@ -37,6 +38,44 @@ def _fleet_pool_declaration(pool: CapacityPoolRecord) -> JsonObject:
     declaration = _pool_declaration(pool)
     declaration["demand_below_supply_since"] = None
     return declaration
+
+
+def init_script_unsupported_reason(pool: CapacityPoolRecord) -> str | None:
+    """Why a pool's new cells would never run a fleet init script, or ``None`` when they do.
+
+    Only the GCP driver renders ``runtime.init_commands`` into a new host's
+    bootstrap. An attached TPU or SSH host already exists: its worker was
+    installed by ``eyvan gcp connect``, which is where its setup runs.
+    """
+
+    if pool.provider != "gcp":
+        return f"pool {pool.id!r} uses provider {pool.provider!r}, whose hosts do not run fleet init scripts"
+    if (pool.capacity_backend or "").strip().lower() == "gcp-attach":
+        return (
+            f"pool {pool.id!r} is an attached TPU: Eyvan never creates its hosts, so a script here would never run; "
+            "pass setup to `eyvan gcp connect --init-command` instead"
+        )
+    return None
+
+
+def _carry_init_script(pool: CapacityPoolRecord, previous: CapacityPoolRecord | None) -> CapacityPoolRecord:
+    """Keep a dashboard-written init script across a fleet YAML re-apply that does not mention it.
+
+    ``eyvan up`` and ``eyvan gcp connect`` regenerate fleet YAML from their own
+    profile and know nothing of the script; without this every re-apply would
+    silently delete it. A YAML that carries its own managed entry wins, and the
+    dashboard (or the init-script API) is how one is removed.
+    """
+
+    if previous is None or any(fleet_init_script.is_entry(item) for item in pool.runtime.init_commands):
+        return pool
+    script = fleet_init_script.extract(previous.runtime.init_commands)
+    if script is None:
+        return pool
+    runtime = pool.runtime.model_copy(
+        update={"init_commands": fleet_init_script.with_script(pool.runtime.init_commands, script)}
+    )
+    return pool.model_copy(update={"runtime": runtime})
 
 
 class FleetsMixin:
@@ -185,6 +224,7 @@ class FleetsMixin:
                     )
             now = utcnow()
             supplied_ids = {pool.id for pool in pools}
+            pools = [_carry_init_script(pool, existing.get(pool.id)) for pool in pools]
             for pool in pools:
                 previous = existing.get(pool.id)
                 # An apply that declares exactly what is already stored changes
@@ -261,6 +301,122 @@ class FleetsMixin:
                 )
             )
             return await tx.list_capacity_pools(fleet_name=fleet_name), False
+
+    async def get_fleet_init_script(self, principal: Principal, fleet_name: str) -> JsonObject:
+        """Return a fleet's dashboard-managed init script and whether its pools can run one."""
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        async with self.repository.transaction() as tx:
+            pools = await tx.list_capacity_pools(fleet_name=fleet_name)
+        if not pools:
+            raise NotFoundError(f"fleet {fleet_name!r} was not found")
+        scripts = {fleet_init_script.extract(pool.runtime.init_commands) for pool in pools}
+        unsupported = [reason for pool in pools if (reason := init_script_unsupported_reason(pool))]
+        script = next((item for item in sorted(scripts, key=lambda item: item or "") if item), None)
+        return {
+            "fleet": fleet_name,
+            "script": script or "",
+            # Pools edited by hand (YAML) can disagree; the dashboard says so.
+            "consistent": len(scripts) == 1,
+            "supported": not unsupported,
+            "unsupported_reasons": unsupported,
+            "other_init_commands": sorted(
+                {
+                    command
+                    for pool in pools
+                    for command in pool.runtime.init_commands
+                    if not fleet_init_script.is_entry(command)
+                }
+            ),
+            "pools": [pool.id for pool in pools],
+            "max_bytes": fleet_init_script.MAX_SCRIPT_BYTES,
+        }
+
+    async def set_fleet_init_script(
+        self,
+        principal: Principal,
+        fleet_name: str,
+        script: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[JsonObject, bool]:
+        """Replace (or with an empty script, remove) the init script on every pool of a fleet.
+
+        The script becomes one marked ``runtime.init_commands`` entry. A changed
+        runtime is a changed cell template, so the pool generation advances and
+        existing cells are replaced as the autoscaler retires them -- idle cells
+        first; a cell holding a lease is never drained for this. New cells run
+        the script before their worker starts.
+        """
+
+        self.authorizer.require(principal, Permission.MANAGE_FLEET)
+        try:
+            normalized = fleet_init_script.normalize(script)
+        except fleet_init_script.InitScriptError as exc:
+            raise InputError(str(exc)) from exc
+        key = _validate_idempotency_key(idempotency_key)
+        fingerprint = _fingerprint({"fleet_name": fleet_name, "script": normalized})
+        async with self.repository.transaction() as tx:
+            existing_key = await self._idempotent_resource(tx, "fleet", "fleet.init_script", key, fingerprint)
+            pools = await tx.list_capacity_pools(fleet_name=fleet_name)
+            if not pools:
+                raise NotFoundError(f"fleet {fleet_name!r} was not found")
+            if existing_key is not None:
+                replayed = True
+            else:
+                replayed = False
+                unsupported = [reason for pool in pools if (reason := init_script_unsupported_reason(pool))]
+                if unsupported and normalized:
+                    raise InputError("; ".join(unsupported))
+                now = utcnow()
+                changed: list[str] = []
+                for pool in pools:
+                    commands = fleet_init_script.with_script(pool.runtime.init_commands, normalized or None)
+                    if commands == pool.runtime.init_commands:
+                        continue
+                    runtime = pool.runtime.model_copy(update={"init_commands": commands})
+                    try:
+                        # Re-validated: model_copy would skip the runtime's own checks.
+                        stored = CapacityPoolRecord.model_validate(
+                            pool.model_copy(
+                                update={
+                                    "runtime": runtime,
+                                    "generation": pool.generation + 1,
+                                    "initialized_at": None,
+                                    "updated_at": now,
+                                }
+                            ).model_dump()
+                        )
+                    except ValueError as exc:
+                        raise InputError(f"pool {pool.id!r} rejects this init script: {exc}") from exc
+                    await tx.put_capacity_pool(stored)
+                    changed.append(pool.id)
+                await tx.put_idempotency(
+                    IdempotencyRecord(
+                        scope="fleet",
+                        operation="fleet.init_script",
+                        key=key,
+                        fingerprint=fingerprint,
+                        resource_type="fleet",
+                        resource_id=fleet_name,
+                    )
+                )
+                await tx.append_event(
+                    AuditEvent(
+                        id=_new_id("evt"),
+                        actor=principal.subject,
+                        entity_type="fleet",
+                        entity_id=fleet_name,
+                        action="fleet.init_script_set" if normalized else "fleet.init_script_removed",
+                        # A digest, not the script: setup scripts often carry tokens.
+                        payload={
+                            "capacity_pools": changed,
+                            "sha256_16": fleet_init_script.digest(normalized),
+                            "bytes": len(normalized.encode("utf-8")),
+                        },
+                    )
+                )
+        return await self.get_fleet_init_script(principal, fleet_name), replayed
 
     async def list_submit_fleets(
         self,

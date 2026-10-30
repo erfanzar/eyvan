@@ -489,6 +489,13 @@ class FleetStatusResponse(ApiModel):
     cells: list[CellRecord]
 
 
+class FleetInitScriptRequest(ApiModel):
+    """A fleet's bash init script; an empty string removes it."""
+
+    # Bounded again (in bytes) by the service; this caps the request body.
+    script: str = Field(default="", max_length=64 * 1024)
+
+
 class CapacityPoolResponse(ApiModel):
     """One available pool advertised by the control plane."""
 

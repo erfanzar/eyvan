@@ -10,11 +10,19 @@ from __future__ import annotations
 import asyncio
 import time
 import typing as tp
+import uuid
 from datetime import datetime
 
 from eyvan._internal.build_identity import build_identity
+from eyvan._internal.json_types import JsonObject
 from eyvan.capacity import (
     CapacityStatus,
+)
+from eyvan.capacity.acquisition_backoff import (
+    PoolAcquisitionBackoff,
+    acquisition_backoff_reason,
+    is_acquisition_backoff_reason,
+    workload_acquisition_backoff,
 )
 from eyvan.capacity.audit import CapacityLifecycleEvent, CapacityReplacementReason
 from eyvan.capacity.autoscale.pool_capacity import ClusterCapacityPass
@@ -34,6 +42,7 @@ from eyvan.domain import (
     SchedulingResult,
 )
 from eyvan.records import (
+    AuditEvent,
     CapacityPoolRecord,
     CellRecord,
     CellState,
@@ -57,6 +66,12 @@ from eyvan.server.service.state import ACTIVE_LEASE_STATES
 #: window in which a reservation on a freshly requested cell is the only thing
 #: stopping another workload from taking it.
 _WAITING_FOR_CAPACITY = frozenset({WorkloadState.PENDING, WorkloadState.ADMITTED})
+
+#: Audit actions for a capacity pool whose acquisitions keep failing.
+ACQUISITION_BACKOFF_ACTION = "capacity_pool.acquisition_backoff"
+ACQUISITION_BACKOFF_CLEARED_ACTION = "capacity_pool.acquisition_backoff_cleared"
+#: How far back a newly elected leader looks for the last announcement.
+_BACKOFF_EVENT_SCAN_LIMIT = 50
 
 
 def _still_demanded(cell: CellRecord, pending_specs: tp.Sequence[WorkloadDefinition]) -> bool:
@@ -136,6 +151,21 @@ class _ControllerFleets:
 
         async with self._fleet_capacity_gate(fleet_name).closing():
             return await self.service.apply_fleet(principal, fleet_name, pools, idempotency_key=idempotency_key)
+
+    async def set_fleet_init_script(
+        self,
+        principal: Principal,
+        fleet_name: str,
+        script: str,
+        *,
+        idempotency_key: str,
+    ) -> tuple[JsonObject, bool]:
+        """Change a fleet's init script after closing its capacity-operation admission gate."""
+
+        async with self._fleet_capacity_gate(fleet_name).closing():
+            return await self.service.set_fleet_init_script(
+                principal, fleet_name, script, idempotency_key=idempotency_key
+            )
 
     async def upsert_capacity_pool(
         self,
@@ -582,6 +612,9 @@ class _ControllerFleets:
         await self._persist_shrink_clocks(pool_records, plans, now)
         await self._record_autoscale_quota_blocks(tuple(workloads), planner.quota_blocked_workload_ids)
         await self._record_acquisition_exhausted(tuple(workloads), simulation.acquisition_exhausted_workload_ids)
+        backoffs = planner.acquisition_backoffs
+        await self._announce_acquisition_backoffs(pool_records, backoffs, plans, now)
+        await self._record_acquisition_backoff_reasons(tuple(workloads), backoffs, now)
 
         # Kueue's own view of the cluster, read once per Kubernetes pool. Taken
         # here on purpose: every transaction above is closed and the launch loop
@@ -852,6 +885,141 @@ class _ControllerFleets:
                 drained += 1
 
         return {"launched": launched, "drained": drained, "deleted": deleted}
+
+    async def _record_acquisition_backoff_reasons(
+        self,
+        workloads: tuple[WorkloadRecord, ...],
+        backoffs: dict[str, PoolAcquisitionBackoff],
+        now: datetime,
+    ) -> None:
+        """Name a repeated acquisition failure on each pending workload it is holding up.
+
+        Without this a workload whose pool kept failing read "requesting one
+        elastic cell" -- the plane was asking, but every answer had been no and
+        nothing said so. Written only when the sentence changes, and only where
+        no stronger reason (quota, exhaustion, a queue denial) already owns the
+        field; cleared again, exactly, once the streak stops describing the pool.
+        """
+
+        updates: list[tuple[str, str | None]] = []
+        for workload in workloads:
+            if workload.state is not WorkloadState.PENDING:
+                continue
+            streak = workload_acquisition_backoff(workload, backoffs, now)
+            current = workload.scheduling_reason
+            if streak is not None and workload.autoscale_block_reason is None:
+                reason = acquisition_backoff_reason(streak, now)
+                if reason != current:
+                    updates.append((workload.id, reason))
+            elif is_acquisition_backoff_reason(current):
+                updates.append((workload.id, None))
+        if not updates:
+            return
+        async with self.repository.transaction() as transaction:
+            for workload_id, reason in updates:
+                current_workload = await transaction.get_workload(workload_id)
+                if current_workload is None or current_workload.state is not WorkloadState.PENDING:
+                    continue
+                if reason is None and not is_acquisition_backoff_reason(current_workload.scheduling_reason):
+                    continue
+                if reason is not None and current_workload.autoscale_block_reason is not None:
+                    continue
+                await transaction.put_workload(
+                    current_workload.model_copy(update={"scheduling_reason": reason, "updated_at": utcnow()})
+                )
+
+    async def _announced_acquisition_backoff(self, pool_id: str) -> str | None:
+        """Return the streak last announced for ``pool_id``, from memory or the audit ledger.
+
+        The ledger is the durable answer, so a restarted or newly elected leader
+        neither repeats an announcement nor forgets to say a streak ended.
+        """
+
+        cache = self._acquisition_backoff_announcements
+        if pool_id in cache:
+            return cache[pool_id]
+        async with self.repository.transaction() as transaction:
+            events = await transaction.list_events(
+                entity_type="capacity_pool",
+                entity_id=pool_id,
+                newest_first=True,
+                limit=_BACKOFF_EVENT_SCAN_LIMIT,
+            )
+        announced: str | None = None
+        for event in events:
+            if event.action == ACQUISITION_BACKOFF_ACTION:
+                streak = event.payload.get("streak")
+                announced = streak if isinstance(streak, str) else None
+                break
+            if event.action == ACQUISITION_BACKOFF_CLEARED_ACTION:
+                break
+        cache[pool_id] = announced
+        return announced
+
+    async def _announce_acquisition_backoffs(
+        self,
+        pools: tuple[CapacityPoolRecord, ...],
+        backoffs: dict[str, PoolAcquisitionBackoff],
+        plans: dict[str, PoolScalePlan],
+        now: datetime,
+    ) -> None:
+        """Say once per failed incarnation that a pool is backing off, and once when it stops.
+
+        A pool that keeps failing used to be visible only as an ``unhealthy``
+        lifecycle line per cell, indistinguishable from one bad machine. This
+        names the pool, the run length, the last error and when it will be
+        asked again -- as an audit event, so it survives log rotation, and as a
+        warning. Bounded by construction: one announcement per failed cell, and
+        failed cells are what the backoff spaces out.
+        """
+
+        for pool in pools:
+            backoff = backoffs.get(pool.id)
+            repeated = backoff is not None and backoff.failed_attempts >= 2 and backoff.recent(now)
+            streak = f"{backoff.last_failed_cell_id}:{backoff.failed_attempts}" if repeated and backoff else None
+            announced = await self._announced_acquisition_backoff(pool.id)
+            if streak == announced:
+                continue
+            if streak is not None and backoff is not None:
+                withheld = len(plans[pool.id].withheld_worker_counts) if pool.id in plans else 0
+                payload: JsonObject = {
+                    "streak": streak,
+                    "failed_attempts": backoff.failed_attempts,
+                    "backoff_s": backoff.backoff_s,
+                    "next_attempt_at": backoff.next_attempt_at.isoformat(),
+                    "last_failure_at": backoff.last_failure_at.isoformat(),
+                    "last_failed_cell_id": backoff.last_failed_cell_id,
+                    "failure_code": None if backoff.failure_code is None else backoff.failure_code.value,
+                    "last_error": backoff.last_error,
+                    "withheld_launches": withheld,
+                }
+                action = ACQUISITION_BACKOFF_ACTION
+                logger.warning(
+                    "capacity pool %s (fleet %s) failed %d capacity request(s) in a row; "
+                    "next attempt after %s (backoff %.0fs): %s",
+                    pool.id,
+                    pool.fleet_name,
+                    backoff.failed_attempts,
+                    backoff.next_attempt_at.isoformat(),
+                    backoff.backoff_s,
+                    backoff.last_error or "no diagnostic recorded",
+                )
+            else:
+                payload = {"previous_streak": announced}
+                action = ACQUISITION_BACKOFF_CLEARED_ACTION
+                logger.info("capacity pool %s (fleet %s) is no longer backing off", pool.id, pool.fleet_name)
+            async with self.repository.transaction() as transaction:
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        entity_type="capacity_pool",
+                        entity_id=pool.id,
+                        action=action,
+                        payload=payload,
+                    )
+                )
+            self._acquisition_backoff_announcements[pool.id] = streak
 
     async def _persist_shrink_clocks(
         self,

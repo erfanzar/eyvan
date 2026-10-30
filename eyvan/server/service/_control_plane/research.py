@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
+from eyvan._internal.training_metrics import extract_loss
 from eyvan.records import (
     MAX_RESEARCH_JOBS,
     MAX_RESEARCH_NOTE_CHARS,
@@ -40,6 +41,7 @@ from eyvan.records import (
     RESEARCH_PLAN_TERMINAL_STATES,
     ResearchBudget,
     ResearchJob,
+    ResearchLoss,
     ResearchNote,
     ResearchPlanRecord,
     ResearchSpend,
@@ -82,6 +84,8 @@ _OPEN_STATES = frozenset({"proposed", *RESEARCH_PLAN_ACTIVE_STATES})
 ResearchIterator: tp.TypeAlias = tp.Callable[
     [ResearchPlanRecord, Principal, list[dict[str, tp.Any]]], tp.Awaitable[dict[str, tp.Any] | None]
 ]
+#: ``workload_id -> its printed output``; supplied by the runner (the service has no transport).
+ResearchLogReader: tp.TypeAlias = tp.Callable[[str], tp.Awaitable[str]]
 
 
 def _aware(moment: datetime) -> datetime:
@@ -464,6 +468,7 @@ class ResearchPlansMixin:
         *,
         iterate: ResearchIterator | None = None,
         still_leading: tp.Callable[[], tp.Awaitable[bool]] | None = None,
+        read_logs: ResearchLogReader | None = None,
     ) -> int:
         """Advance every approved, running or stopping plan once; return how many were looked at.
 
@@ -485,7 +490,7 @@ class ResearchPlansMixin:
                 if plan.state == "stopping":
                     await self._drive_research_stop(plan.id, moment)
                 else:
-                    await self._advance_research_plan(plan, moment, iterate)
+                    await self._advance_research_plan(plan, moment, iterate, read_logs)
             except Exception:
                 logger.exception("research plan %s step failed; it is retried on the next step", plan.id)
         return len(plans)
@@ -514,8 +519,54 @@ class ResearchPlansMixin:
             return "over_budget", f"wall-clock budget of {plan.budget.max_wall_seconds}s reached"
         return None
 
+    async def _research_losses(
+        self,
+        plan: ResearchPlanRecord,
+        observed: dict[str, _Observed],
+        read_logs: ResearchLogReader | None,
+        now: datetime,
+        notes: list[ResearchNote],
+    ) -> dict[int, ResearchLoss]:
+        """Read each newly final job's output once and keep the training loss it printed.
+
+        Outside any transaction. An unreadable output is retried next step;
+        output read with no loss in it is recorded as such and never re-read.
+        """
+
+        found: dict[int, ResearchLoss] = {}
+        for item in plan.submitted if read_logs is not None else ():
+            seen = observed.get(item.workload_id or "")
+            if item.loss is not None or seen is None or seen.workload is None:
+                continue
+            if seen.workload.state not in TERMINAL_WORKLOAD_STATES:
+                continue
+            try:
+                curve = extract_loss(await read_logs(seen.workload.id))  # type: ignore[misc]
+            except Exception as exc:
+                logger.warning("research plan %s: output of %s unreadable: %s", plan.id, seen.workload.id, exc)
+                continue
+            name = plan.jobs[item.job_index].name
+            if curve is None:
+                found[item.job_index] = ResearchLoss()
+                notes.append(_note(now, "loss", f"job {item.job_index} {name!r} printed no training loss"))
+                continue
+            found[item.job_index] = ResearchLoss(
+                final=curve["final"],
+                last_step=curve["last_step"],
+                total_steps=curve["total_steps"],
+                points=tuple(curve["points"]),
+            )
+            where = "" if curve["last_step"] is None else f" at step {curve['last_step']}"
+            where += f"/{curve['total_steps']}" if where and curve["total_steps"] else ""
+            notes.append(_note(now, "loss", f"job {item.job_index} {name!r} final loss {curve['final']:g}{where}"))
+        return found
+
     async def _advance_research_plan(
-        self, plan: ResearchPlanRecord, now: datetime, iterate: ResearchIterator | None
+        self,
+        plan: ResearchPlanRecord,
+        now: datetime,
+        iterate: ResearchIterator | None,
+        read_logs: ResearchLogReader | None = None,
     ) -> None:
         principal = await self._research_principal(plan, now)
         started_at = plan.started_at or now
@@ -524,6 +575,17 @@ class ResearchPlansMixin:
         if plan.state == "approved":
             notes.append(_note(now, "started", f"running as {plan.subject}"))
         observed = await self._observe_research(plan, now)
+        losses = await self._research_losses(plan, observed, read_logs, now, notes)
+        if losses:
+            # The iteration model (same step) compares jobs on these.
+            plan = plan.model_copy(
+                update={
+                    "submitted": tuple(
+                        item.model_copy(update={"loss": losses[item.job_index]}) if item.job_index in losses else item
+                        for item in plan.submitted
+                    )
+                }
+            )
         chip_hours = max(plan.spent.chip_hours, sum(item.chip_hours for item in observed.values()))
         stop = self._research_budget_breach(plan, chip_hours, now, started_at)
         allows = self.authorizer.allows  # type: ignore[attr-defined]
@@ -554,6 +616,7 @@ class ResearchPlansMixin:
         if (
             not submissions
             and not notes
+            and not losses
             and set(update) == {"started_at", "state"}
             and update["state"] == plan.state
             and chip_hours - plan.spent.chip_hours < plan.budget.max_chip_hours * 0.01
@@ -561,7 +624,7 @@ class ResearchPlansMixin:
             # Nothing a reader would notice changed: skip the write (on the
             # local store every commit rewrites the whole document).
             return
-        committed = await self._commit_research_step(plan, now, update, submissions, notes, chip_hours)
+        committed = await self._commit_research_step(plan, now, update, submissions, notes, chip_hours, losses)
         if committed is not None and committed.state == "stopping":
             await self._drive_research_stop(plan.id, now)
 
@@ -645,6 +708,12 @@ class ResearchPlansMixin:
                         attempts=workload.attempt if workload is not None else None,
                         chip_hours=round(seen.chip_hours, 4) if seen is not None else None,
                     )
+                    if item.loss is not None:
+                        row["loss"] = {
+                            "final": item.loss.final,
+                            "last_step": item.loss.last_step,
+                            "total_steps": item.loss.total_steps,
+                        }
                     reports = await tx.list_progress_reports(item.workload_id)
                     if reports:
                         latest = max(reports, key=lambda report: (report.reported_at, -report.rank))
@@ -758,6 +827,7 @@ class ResearchPlansMixin:
         submissions: list[ResearchSubmission],
         notes: list[ResearchNote],
         chip_hours: float,
+        losses: tp.Mapping[int, ResearchLoss] | None = None,
     ) -> ResearchPlanRecord | None:
         """Write one step, merged over whatever a concurrent stop changed meanwhile.
 
@@ -776,7 +846,13 @@ class ResearchPlansMixin:
             # so two steps can never both plan a round over each other.
             raced = current.state != seen.state or current.updated_at != seen.updated_at
             known = {item.job_index for item in current.submitted}
-            submitted = (*current.submitted, *(item for item in submissions if item.job_index not in known))
+            stored = tuple(
+                item.model_copy(update={"loss": losses[item.job_index]})
+                if losses and item.loss is None and item.workload_id is not None and item.job_index in losses
+                else item
+                for item in current.submitted
+            )
+            submitted = (*stored, *(item for item in submissions if item.job_index not in known))
             fields: dict[str, tp.Any] = {
                 "submitted": submitted,
                 "notes": (*current.notes, *_fresh_notes(current.notes, notes))[-MAX_RESEARCH_NOTES:],

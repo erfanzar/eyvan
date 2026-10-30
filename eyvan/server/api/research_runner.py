@@ -163,6 +163,7 @@ class ResearchRunner:
         interval_s: float = DEFAULT_RESEARCH_INTERVAL_S,
         clock: tp.Callable[[], datetime] = utcnow,
         iteration_timeout_s: float = DEFAULT_ITERATION_TIMEOUT_S,
+        read_logs: tp.Callable[[str], tp.Awaitable[str]] | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("the research runner interval must be positive")
@@ -174,6 +175,8 @@ class ResearchRunner:
         self.leader = leader
         self.interval_s = interval_s
         self.clock = clock
+        #: Reads a final job's output so the plan records the loss it printed.
+        self.read_logs = read_logs
 
     async def tick(self, now: datetime | None = None) -> int:
         """Step every active plan once; return how many were looked at."""
@@ -187,6 +190,7 @@ class ResearchRunner:
             # Re-checked before every plan, so a replica that lost leadership
             # during a slow iteration call stops stepping plans at once.
             still_leading=leader.acquire if leader is not None else None,
+            read_logs=self.read_logs,
         )
 
     async def run(self, stop: asyncio.Event) -> None:

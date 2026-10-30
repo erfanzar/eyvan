@@ -109,6 +109,13 @@ def plan_document(plan: ResearchPlanRecord, workloads: tp.Mapping[str, WorkloadR
                 failure_reason=workload.failure_reason if workload is not None else None,
                 submitted_at=_iso(item.submitted_at),
             )
+            if item.loss is not None:
+                row["loss"] = {
+                    "final": item.loss.final,
+                    "last_step": item.loss.last_step,
+                    "total_steps": item.loss.total_steps,
+                    "points": [list(point) for point in item.loss.points],
+                }
         jobs.append(row)
     return {
         **plan_summary(plan),

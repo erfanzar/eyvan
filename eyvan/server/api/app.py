@@ -147,6 +147,7 @@ from eyvan.server.api.schemas import (
     DagSubmitResponse,
     EffectiveProjectScope,
     FleetApplyRequest,
+    FleetInitScriptRequest,
     FleetStatusResponse,
     GroupSubmitRequest,
     GroupSubmitResponse,
@@ -751,7 +752,9 @@ def create_app(
             asyncio.create_task(controller.run(stop), name="eyvan-controller") if settings.controller_enabled else None
         )
         # Research plans run beside the controller, only while this replica holds its leadership.
-        _app.state.research_runner = ResearchRunner(service, app=_app, leader=controller.leader)
+        _app.state.research_runner = ResearchRunner(
+            service, app=_app, leader=controller.leader, read_logs=controller.workload_logs
+        )
         research_task = (
             asyncio.create_task(_app.state.research_runner.run(stop), name="eyvan-research")
             if settings.controller_enabled
@@ -3354,6 +3357,33 @@ def create_app(
         pool_ids = {pool.id for pool in pools}
         cells = [cell for cell in await service.list_cells(principal) if cell.pool_id in pool_ids]
         return FleetStatusResponse(name=fleet_name, pools=pools, cells=cells)
+
+    # response_model=None: a small JSON document built by the service.
+    @app.get("/api/v1/fleets/{fleet_name}/init-script", tags=["fleets"], response_model=None)
+    async def get_fleet_init_script(
+        fleet_name: str,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> JsonObject:
+        """Show a fleet's bash init script and whether its pools can run one (fleet admins)."""
+
+        return await service.get_fleet_init_script(principal, fleet_name)
+
+    @app.put("/api/v1/fleets/{fleet_name}/init-script", tags=["fleets"], response_model=None)
+    async def set_fleet_init_script(
+        fleet_name: str,
+        request: FleetInitScriptRequest,
+        response: Response,
+        idempotency_key: tp.Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)],
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> JsonObject:
+        """Set (or, empty, remove) a fleet's bash init script; new cells run it before their worker starts."""
+
+        document, replayed = await controller.set_fleet_init_script(
+            principal, fleet_name, request.script, idempotency_key=idempotency_key
+        )
+        if replayed:
+            response.headers["Idempotent-Replay"] = "true"
+        return document
 
     @app.delete("/api/v1/fleets/{fleet_name}", response_model=list[CapacityPoolRecord], tags=["fleets"])
     async def disable_fleet(

@@ -30,6 +30,7 @@ import difflib
 import functools
 import json
 import math
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from importlib import resources
@@ -41,12 +42,15 @@ __all__ = [
     "DEFAULT_MAX_CHARS",
     "DEFAULT_SHARDING",
     "ELARGE_MODULE",
+    "TORCH_CPU_VERSION",
     "UnknownTrainerError",
     "catalog_info",
     "describe_trainer",
     "list_trainers",
     "render_launch",
+    "requirement_name",
     "resolve_trainer_id",
+    "torch_cpu_requirements",
     "validate_trainer_arguments",
 ]
 
@@ -71,6 +75,42 @@ DEFAULT_SHARDING: dict[str, Any] = {
 }
 _HEREDOC = "EASYDEL_ELARGE_CONFIG_EOF"
 _AUX_ROLES = ("reference_model", "reward_model", "teacher_model", "target_model")
+
+#: The CPU-only PyTorch build EasyDeL's Hugging Face loader imports
+#: (``EasyBridgeMixin._from_torch_pretrained``). The default Linux wheel pulls
+#: several GB of CUDA libraries a TPU host never uses, and a shared TPU disk can
+#: hold a couple of GB free. One wheel per supported worker interpreter and
+#: architecture; the PEP 508 markers let the worker's own installer pick the
+#: one matching *its* Python, which the plane drafting the job cannot know.
+TORCH_CPU_VERSION = "2.15.0"
+_TORCH_CPU_PYTHONS = ("3.11", "3.12", "3.13")
+_TORCH_CPU_MACHINES = ("x86_64", "aarch64")
+
+
+def torch_cpu_requirements() -> list[str]:
+    """Return the marker-selected CPU-only torch requirements, one per (Python, machine)."""
+
+    requirements: list[str] = []
+    for python in _TORCH_CPU_PYTHONS:
+        tag = "cp" + python.replace(".", "")
+        for machine in _TORCH_CPU_MACHINES:
+            url = (
+                "https://download.pytorch.org/whl/cpu/"
+                f"torch-{TORCH_CPU_VERSION}%2Bcpu-{tag}-{tag}-manylinux_2_28_{machine}.whl"
+            )
+            requirements.append(
+                f'torch @ {url} ; python_version == "{python}" and platform_machine == "{machine}" '
+                'and sys_platform == "linux"'
+            )
+    return requirements
+
+
+def requirement_name(requirement: str) -> str | None:
+    """Return the normalized project name of a requirement string, or None when it has none."""
+
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower() if match else None
+
 
 # eLarge ``build_trainer`` (easydel/infra/elarge/model.py) raises without these inputs.
 # Keyed by eLarge trainer_type. Reward: GRPO family, online_dpo, sdpo, compaction_rl/sao,
@@ -850,6 +890,13 @@ def render_launch(
         blocking.append(f"wrong value types for {[item['field'] for item in validation['type_warnings']]}")
     if "save_directory" not in trainer_args:
         assumptions.append("save_directory not set: checkpoints go to the relative EasyDeL-Checkpoints directory.")
+    # eLarge loads Hugging Face checkpoints through EasyDeL's torch bridge; a
+    # job without torch dies before its first step ("install torch first").
+    dependencies = torch_cpu_requirements()
+    assumptions.append(
+        f"Hugging Face checkpoints load through torch: the draft declares the CPU-only torch {TORCH_CPU_VERSION} "
+        "wheel for the worker's Python (no CUDA libraries); a torch requirement you list yourself replaces it."
+    )
 
     config_yaml = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, default_flow_style=False)
     if _HEREDOC in config_yaml:
@@ -872,4 +919,5 @@ def render_launch(
         "script": script,
         "validation": validation,
         "assumptions": assumptions,
+        "dependencies": dependencies,
     }

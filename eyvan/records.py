@@ -1090,6 +1090,25 @@ class ResearchBudget(EyvanModel):
     max_rounds: int | None = Field(default=None, ge=1, le=MAX_RESEARCH_ROUNDS)
 
 
+#: Points of one job's loss curve kept on its plan record.
+MAX_RESEARCH_LOSS_POINTS = 50
+
+
+class ResearchLoss(EyvanModel):
+    """The training loss a finished research job printed, read once from its output.
+
+    ``final`` is ``None`` when the output was read and printed no loss -- a
+    different fact from a job whose output was never read, which has no
+    ``ResearchLoss`` at all.
+    """
+
+    final: float | None = None
+    last_step: int | None = Field(default=None, ge=0)
+    total_steps: int | None = Field(default=None, ge=0)
+    #: ``(step or None, loss)``, ascending by step, thinned to the bound.
+    points: tuple[tuple[int | None, float], ...] = Field(default=(), max_length=MAX_RESEARCH_LOSS_POINTS)
+
+
 class ResearchSubmission(EyvanModel):
     """One job the plane submitted (or tried to) for a plan, in submission order."""
 
@@ -1099,12 +1118,25 @@ class ResearchSubmission(EyvanModel):
     #: Why the plane refused the job (policy, validation); never a credential.
     error: str | None = Field(default=None, max_length=500)
     submitted_at: Annotated[datetime, AwareDatetime]
+    #: Recorded once the job's workload is final and its output was read.
+    loss: ResearchLoss | None = None
 
     @model_validator(mode="after")
     def validate_submission(self) -> ResearchSubmission:
         if (self.workload_id is None) == (self.error is None):
             raise ValueError("a research submission has exactly one of workload_id or error")
+        if self.loss is not None and self.workload_id is None:
+            raise ValueError("only a submitted research job can record a loss")
         return self
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # A submission without a recorded loss serializes exactly as before the
+        # field existed, so stored plans stay byte-stable.
+        document = handler(self)
+        if self.loss is None and isinstance(document, dict):
+            document.pop("loss", None)
+        return document
 
 
 class ResearchSpend(EyvanModel):

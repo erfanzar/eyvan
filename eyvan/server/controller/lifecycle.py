@@ -140,6 +140,9 @@ class _ControllerLifecycle:
             max_s=self.settings.cell_agent_backoff_max_s,
         )
         self._capacity_lifecycle = CapacityLifecycleLogger(logger, sink_path=capacity_audit_sink)
+        # The acquisition-backoff streak last announced per pool. A cache of the
+        # audit ledger, which is the durable answer a new leader reads instead.
+        self._acquisition_backoff_announcements: dict[str, str | None] = {}
 
     def _measure_reconcile(self, operation: str) -> tp.ContextManager[None]:
         """Time one reconciliation operation when metrics are collected.

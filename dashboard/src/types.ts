@@ -1307,6 +1307,22 @@ export interface TpuQuotaFailure {
   reason: string;
 }
 
+/** A fleet's dashboard-managed bash init script, as the init-script route answers. */
+export interface FleetInitScriptDocument {
+  fleet: string;
+  /** The script; "" when the fleet has none. */
+  script: string;
+  /** False when the fleet's pools carry different scripts (hand-edited YAML). */
+  consistent: boolean;
+  /** False when a pool can never run one (attached TPUs); see `unsupported_reasons`. */
+  supported: boolean;
+  unsupported_reasons: string[];
+  /** Init commands declared in the fleet YAML; they also run, and are read-only here. */
+  other_init_commands: string[];
+  pools: string[];
+  max_bytes: number;
+}
+
 export interface TpuQuotaSnapshot {
   observed_at: string;
   provider: string;

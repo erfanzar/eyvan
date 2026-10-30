@@ -62,6 +62,8 @@ BROWSER_ROUTES: dict[str, str] = {
     "GET /api/v1/attachments": "dashboard/src/components/AddTpuModal.tsx recovers recent local jobs",
     "GET /api/v1/attachments/{}": "dashboard/src/components/AddTpuModal.tsx polls durable attachment progress",
     "GET /api/v1/attachments/discovered": "dashboard/src/pages/FleetPage.tsx lists every TPU in the GCP account",
+    "GET /api/v1/fleets/{}/init-script": "dashboard/src/components/FleetInitScript.tsx shows a fleet's bash init script",
+    "PUT /api/v1/fleets/{}/init-script": "dashboard/src/components/FleetInitScript.tsx saves a fleet's bash init script",
     "POST /api/v1/team/invites/preview": "dashboard accept-invite screen shows who an invite is for",
     "POST /api/v1/team/invites/accept": "dashboard accept-invite screen sets the password and signs in",
     "POST /api/v1/team/logout": "dashboard sign-out drops the HttpOnly team session cookie",

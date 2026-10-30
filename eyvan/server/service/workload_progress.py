@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from eyvan.capacity import PENDING_CAPACITY_STATUSES, QUEUED_CAPACITY_STATUSES, CapacityStatus
+from eyvan.capacity.acquisition_backoff import is_acquisition_backoff_reason
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode
 from eyvan.domain.models import PlacementMode
 from eyvan.records import (
@@ -457,6 +458,22 @@ def _phase(
     requested_workers = workload.spec.cell_group_count * workload.spec.worker_count
     if capacity.ready_workers >= requested_workers:
         return WorkloadProgressPhase.READY_FOR_DISPATCH
+    if is_acquisition_backoff_reason(workload.scheduling_reason) and not (
+        capacity.waiting_workers
+        or capacity.provisioning_workers
+        or capacity.ready_workers
+        or any(
+            entry.provider_phase in {CapacityStatus.ACTIVE, CapacityStatus.EXECUTION_CONNECTING}
+            for entry in capacity.phases
+        )
+    ):
+        # Every pool this workload accepts has refused its last requests. A
+        # fresh request in flight, or none at all while the pool waits out its
+        # backoff, is still that story: narrated as "requesting one elastic
+        # cell" it hid hundreds of identical failures (2026-10-25). An existing
+        # phase, so older SDKs keep decoding it; the scheduling_reason carries
+        # the last error and when the next attempt happens.
+        return WorkloadProgressPhase.PROVIDER_FAILURE
     if capacity.requesting_workers:
         return WorkloadProgressPhase.REQUESTING_CAPACITY
     if any(entry.provider_phase is CapacityStatus.EXECUTION_CONNECTING for entry in capacity.phases):

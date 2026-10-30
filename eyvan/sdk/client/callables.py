@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from rich.text import Text
 
 from eyvan.artifacts import ArtifactStore
+from eyvan.capacity.acquisition_backoff import is_acquisition_backoff_reason
 from eyvan.capacity.autoscale import AutoscaleConfigCache, QueueAdmissionDenialRecorder
 from eyvan.records import (
     CallableExecution,
@@ -502,6 +503,17 @@ class _CallableProgressRenderer:
             # counted. When the acquisition budget runs out the workload
             # settles on its own terminal verdict, and that is the receipt
             # that means it.
+            if is_acquisition_backoff_reason(progress.scheduling_reason):
+                # The pool's last requests were all refused and it is waiting
+                # before the next one. The reason names the error and the time;
+                # "the plane is retrying (attempt 1)" hid that it had been
+                # refused hundreds of times on fresh cells (2026-10-25).
+                return JobLifecycleUpdate(
+                    JobLifecycleState.BLOCKED,
+                    scope,
+                    "capacity requests keep failing; the plane is backing off before asking again",
+                    progress.scheduling_reason,
+                )
             retry = progress.retry
             attempt = f" (attempt {retry.attempts})" if retry is not None and retry.attempts else ""
             return JobLifecycleUpdate(

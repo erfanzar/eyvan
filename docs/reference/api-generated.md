@@ -88,6 +88,8 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/fleets/{fleet_name}` | Fleet Status | 200, 422 |
 | PUT | `/api/v1/fleets/{fleet_name}` | Apply Fleet | 200, 422 |
 | POST | `/api/v1/fleets/{fleet_name}/callables` | Submit Pool Callable | 201, 404, 422 |
+| GET | `/api/v1/fleets/{fleet_name}/init-script` | Get Fleet Init Script | 200, 422 |
+| PUT | `/api/v1/fleets/{fleet_name}/init-script` | Set Fleet Init Script | 200, 422 |
 | POST | `/api/v1/fleets/{fleet_name}/node-types/{node_type}/workloads` | Submit Pool Workload | 201, 422 |
 | DELETE | `/api/v1/grants` | Revoke Role Grant | 204, 422 |
 | GET | `/api/v1/grants` | List Role Grants | 200, 422 |

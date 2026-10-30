@@ -177,6 +177,23 @@ def test_render_launch_produces_elarge_yaml_and_command() -> None:
     assert "beta: 0.2" in launch["script"]
 
 
+def test_render_launch_declares_one_cpu_torch_wheel_per_worker_python_and_machine() -> None:
+    launch = ak.render_launch("sft", {"learning_rate": 1e-4}, model="m", dataset="d")
+    assert launch["dependencies"] == ak.torch_cpu_requirements()
+    pairs = set()
+    for item in launch["dependencies"]:
+        assert ak.requirement_name(item) == "torch"
+        url, marker = item.removeprefix("torch @ ").split(" ; ")
+        assert url.startswith("https://download.pytorch.org/whl/cpu/torch-") and "%2Bcpu-" in url
+        python = marker.split('python_version == "')[1].split('"')[0]
+        machine = marker.split('platform_machine == "')[1].split('"')[0]
+        tag = "cp" + python.replace(".", "")
+        assert f"-{tag}-{tag}-manylinux_2_28_{machine}.whl" in url and 'sys_platform == "linux"' in marker
+        pairs.add((python, machine))
+    assert pairs == {(p, m) for p in ("3.11", "3.12", "3.13") for m in ("x86_64", "aarch64")}
+    assert ak.requirement_name("Torch_Vision>=1") == "torch-vision" and ak.requirement_name("@x") is None
+
+
 def test_render_launch_blocks_missing_reward_model_and_bad_mesh() -> None:
     launch = ak.render_launch(
         "grpo",

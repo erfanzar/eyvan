@@ -49,6 +49,7 @@ import type {
   AttachmentPlan,
   AuditEvent,
   DiscoveredTpus,
+  FleetInitScriptDocument,
   AssistantChatStreamInput,
   AssistantConversation,
   AssistantConversationSummary,
@@ -803,6 +804,26 @@ export class EyvanApiClient {
   async listDiscoveredTpus(signal?: AbortSignal): Promise<DiscoveredTpus> {
     if (this.forceDemo) return cloneMock(mockDiscoveredTpus);
     return this.attachmentRequest<DiscoveredTpus>("/api/v1/attachments/discovered", { signal });
+  }
+
+  // A fleet's bash init script (fleet admins). Full literal paths, like the
+  // attachment routes, so the browser route inventory stays auditable. Demo
+  // mode has no fleet behind it, so it refuses rather than pretending to save.
+  async getFleetInitScript(fleet: string, signal?: AbortSignal): Promise<FleetInitScriptDocument> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no fleet init script", 400);
+    return this.attachmentRequest<FleetInitScriptDocument>(`/api/v1/fleets/${encodeURIComponent(fleet)}/init-script`, {
+      signal,
+    });
+  }
+
+  async setFleetInitScript(fleet: string, script: string, signal?: AbortSignal): Promise<FleetInitScriptDocument> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no fleet to change", 400);
+    return this.attachmentRequest<FleetInitScriptDocument>(`/api/v1/fleets/${encodeURIComponent(fleet)}/init-script`, {
+      method: "PUT",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      body: JSON.stringify({ script }),
+      signal,
+    });
   }
 
   // Team accounts. Full literal paths, like the attachment routes, so the

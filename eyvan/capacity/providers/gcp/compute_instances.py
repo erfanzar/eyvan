@@ -623,7 +623,9 @@ class GcloudNativeWorkerSecretStore:
 
         _allowed, denial = self.caller_bind_state(project=project)
         if denial is not None:
-            raise GcloudError(denial)
+            # A missing IAM grant is configuration, not a provider fault: no
+            # retry of the same request can succeed until someone grants it.
+            raise GcloudError(denial, code=CapacityProviderFailureCode.CONFIGURATION)
 
     def ensure(
         self,

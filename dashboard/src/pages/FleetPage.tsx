@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { AddTpuModal, type AttachmentClient } from "../components/AddTpuModal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { FleetInitScript, type FleetInitScriptClient } from "../components/FleetInitScript";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -49,6 +50,8 @@ interface FleetPageProps {
   refreshRevision?: number;
   /** Only supplied to fleet administrators; the server also enforces local-only access. */
   attachmentClient?: AttachmentClient;
+  /** Only supplied to fleet administrators: reads and edits each fleet's bash init script. */
+  initScriptClient?: FleetInitScriptClient;
 }
 
 export function FleetPage({
@@ -63,8 +66,10 @@ export function FleetPage({
   onDrainCell,
   refreshRevision = 0,
   attachmentClient,
+  initScriptClient,
 }: FleetPageProps) {
   const [addingTpu, setAddingTpu] = useState(false);
+  const [initScriptFleet, setInitScriptFleet] = useState<string | null>(null);
   const [attachInitial, setAttachInitial] = useState<AttachmentInput | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredTpus | null>(null);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
@@ -663,7 +668,7 @@ export function FleetPage({
                     <th>Pools</th>
                     <th>Shapes</th>
                     <th>Zone</th>
-                    {onStopFleet && <th aria-label="Actions" />}
+                    {(onStopFleet || initScriptClient) && <th aria-label="Actions" />}
                   </tr>
                 </thead>
                 <tbody>
@@ -682,16 +687,33 @@ export function FleetPage({
                         </span>
                       </td>
                       <td className="monospace">{fleet.zones.join(", ") || "—"}</td>
-                      {onStopFleet && (
+                      {(onStopFleet || initScriptClient) && (
                         <td>
-                          <button
-                            className="button button-secondary"
-                            type="button"
-                            disabled={stopping === fleet.name}
-                            onClick={() => setConfirmStop(fleet.name)}
-                          >
-                            {stopping === fleet.name ? "Stopping" : "Stop"}
-                          </button>
+                          <span className="attachment-actions">
+                            {initScriptClient && (
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                aria-pressed={initScriptFleet === fleet.name}
+                                aria-label={`Init script for ${fleet.name}`}
+                                onClick={() =>
+                                  setInitScriptFleet((current) => (current === fleet.name ? null : fleet.name))
+                                }
+                              >
+                                Init script
+                              </button>
+                            )}
+                            {onStopFleet && (
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                disabled={stopping === fleet.name}
+                                onClick={() => setConfirmStop(fleet.name)}
+                              >
+                                {stopping === fleet.name ? "Stopping" : "Stop"}
+                              </button>
+                            )}
+                          </span>
                         </td>
                       )}
                     </tr>
@@ -714,6 +736,15 @@ export function FleetPage({
             </div>
           )}
         </section>
+      )}
+
+      {initScriptClient && initScriptFleet && (
+        <FleetInitScript
+          key={initScriptFleet}
+          fleet={initScriptFleet}
+          client={initScriptClient}
+          onClose={() => setInitScriptFleet(null)}
+        />
       )}
 
       {stopError && (

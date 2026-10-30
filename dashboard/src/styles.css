@@ -6058,3 +6058,82 @@ body.dock-resizing {
     animation: none;
   }
 }
+
+/* A fleet's bash init script: a monospace editor, its byte budget, and the
+   YAML-declared commands that run beside it (read-only). */
+.fleet-init-body {
+  padding: 4px 14px 12px;
+}
+.fleet-init-body .field {
+  margin-top: 12px;
+}
+.fleet-init-body .field label span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.fleet-init-editor {
+  min-height: 220px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  tab-size: 2;
+  white-space: pre;
+}
+.fleet-init-editor:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+.fleet-init-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-2xs);
+}
+.fleet-init-over {
+  color: var(--red);
+  font-weight: 650;
+}
+.fleet-init-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--amber-soft);
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: var(--text-xs);
+}
+.fleet-init-warning ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.fleet-init-yaml {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+}
+.fleet-init-yaml h3 {
+  font-size: var(--text-xs);
+  font-weight: 650;
+}
+.fleet-init-yaml ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+.fleet-init-body .inline-notice {
+  margin: 12px 0 0;
+}
+.fleet-init-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}

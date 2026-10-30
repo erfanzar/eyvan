@@ -20,6 +20,7 @@ from eyvan.capacity import (
     EXECUTION_PENDING_CAPACITY_STATUSES,
     QUEUED_CAPACITY_STATUSES,
 )
+from eyvan.capacity.acquisition_backoff import PoolAcquisitionBackoff, pool_acquisition_backoffs
 from eyvan.capacity.drivers.base import CapacityProviderFailureCode, backend_capabilities
 from eyvan.domain import Scheduler, SchedulingResult
 from eyvan.domain.models import PlacementMode, PriorityBand
@@ -1178,6 +1179,11 @@ class PoolScaleIntent:
     shrink_since_changed: bool = False
     #: Whether the hysteresis held today's shape on this pass; see ``PoolScalePlan``.
     shrink_held: bool = False
+    #: The pool's failed-acquisition streak while it is backing off, else None.
+    #: A paused intent requests nothing new; see ``PoolScalePlan``.
+    acquisition_backoff: PoolAcquisitionBackoff | None = None
+    #: Launches the pool wanted on this pass and did not make because of it.
+    withheld_worker_counts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1201,6 +1207,14 @@ class PoolScalePlan:
     #: not elapsed. The controller leaves protected cells' idle clocks alone on
     #: such a pass: they are the clocks the post-window fall drains against.
     shrink_held: bool = False
+    #: Set while the pool's recent acquisitions keep failing and its backoff
+    #: has not expired. Nothing new is launched -- for demand or for a warm
+    #: floor -- and nothing is drained to make room for a launch that is not
+    #: happening. Existing cells are untouched.
+    acquisition_backoff: PoolAcquisitionBackoff | None = None
+    #: What this pass would have launched without the backoff, so the
+    #: controller can say a launch was withheld rather than that none was wanted.
+    withheld_worker_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         """Keep every planned physical cell associated with an optional source workload."""
@@ -1242,6 +1256,19 @@ class CapacityPlanner:
         self._now = now
         self._defrag_min_pending_seconds = defragmentation_min_pending_seconds
         self._quota_blocked_workload_ids: frozenset[str] = frozenset()
+        # Read across every incarnation, tombstones included: a failed cell is
+        # replaced, so the replacement loop is only visible in the deleted ones.
+        self._acquisition_backoffs = pool_acquisition_backoffs(
+            pools,
+            (cell for pool_cells in cells_by_pool.values() for cell in pool_cells),
+            now,
+        )
+
+    @property
+    def acquisition_backoffs(self) -> dict[str, PoolAcquisitionBackoff]:
+        """Return each pool's current failed-acquisition streak, active or not."""
+
+        return dict(self._acquisition_backoffs)
 
     @property
     def quota_blocked_workload_ids(self) -> frozenset[str]:
@@ -1357,6 +1384,18 @@ class CapacityPlanner:
             requested.append(1)
             floor_deficit -= 1
             available_units -= 1
+        # The one gate on *new* capacity for a pool whose acquisitions keep
+        # failing. Per-cell belief backs off observation of a failed cell, but a
+        # failed cell is replaced and its replacement started clean, so demand
+        # and warm floors alike minted cell after cell (2026-10-25: past 0439).
+        backoff = self._acquisition_backoffs.get(pool.id)
+        withheld: tuple[int, ...] = ()
+        if backoff is not None and backoff.active(self._now):
+            withheld = tuple(requested)
+            requested = []
+            requested_exact_count = 0
+        else:
+            backoff = None
         return PoolScaleIntent(
             pool=pool,
             live=live,
@@ -1369,6 +1408,8 @@ class CapacityPlanner:
             shrink_since_update=shrink_since_update,
             shrink_since_changed=shrink_since_changed,
             shrink_held=shrink_held,
+            acquisition_backoff=backoff,
+            withheld_worker_counts=withheld,
         )
 
     def _allocate_shared_quota(self, intents: dict[str, PoolScaleIntent]) -> QuotaAllocation:
@@ -1573,6 +1614,11 @@ class CapacityPlanner:
             else 0
         )
         quota_units_to_free = max(quota_reclaim_worker_units - reclaiming_units, 0) if unlaunched_exact else 0
+        if intent.acquisition_backoff is not None:
+            # Room is made for a launch; a backing-off pool is not launching,
+            # and evicting idle capacity for it would turn its failures into
+            # lost capacity elsewhere.
+            capacity_units_to_free = quota_units_to_free = 0
         # A donation is not gated on this pool having unlaunched demand -- the
         # whole point is that the capacity leaves for a peer. Combined with
         # ``max`` rather than a sum: a pool that is both blocked and a donor
@@ -1624,4 +1670,6 @@ class CapacityPlanner:
             shrink_since_update=intent.shrink_since_update,
             shrink_since_changed=intent.shrink_since_changed,
             shrink_held=intent.shrink_held,
+            acquisition_backoff=intent.acquisition_backoff,
+            withheld_worker_counts=intent.withheld_worker_counts,
         )

@@ -3456,6 +3456,20 @@
         "title": "FleetApplyRequest",
         "type": "object"
       },
+      "FleetInitScriptRequest": {
+        "additionalProperties": false,
+        "description": "A fleet's bash init script; an empty string removes it.",
+        "properties": {
+          "script": {
+            "default": "",
+            "maxLength": 65536,
+            "title": "Script",
+            "type": "string"
+          }
+        },
+        "title": "FleetInitScriptRequest",
+        "type": "object"
+      },
       "FleetStatusResponse": {
         "additionalProperties": false,
         "description": "Server-side pool and cell state for one applied fleet.",
@@ -13552,6 +13566,107 @@
         "summary": "Submit Pool Callable",
         "tags": [
           "workloads"
+        ]
+      }
+    },
+    "/api/v1/fleets/{fleet_name}/init-script": {
+      "get": {
+        "description": "Show a fleet's bash init script and whether its pools can run one (fleet admins).",
+        "operationId": "get_fleet_init_script_api_v1_fleets__fleet_name__init_script_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "fleet_name",
+            "required": true,
+            "schema": {
+              "title": "Fleet Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Fleet Init Script",
+        "tags": [
+          "fleets"
+        ]
+      },
+      "put": {
+        "description": "Set (or, empty, remove) a fleet's bash init script; new cells run it before their worker starts.",
+        "operationId": "set_fleet_init_script_api_v1_fleets__fleet_name__init_script_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "fleet_name",
+            "required": true,
+            "schema": {
+              "title": "Fleet Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FleetInitScriptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Fleet Init Script",
+        "tags": [
+          "fleets"
         ]
       }
     },

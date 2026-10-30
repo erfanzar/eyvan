@@ -1275,6 +1275,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
             onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
             attachmentClient={capabilities.manageFleet ? client : undefined}
+            initScriptClient={capabilities.manageFleet ? client : undefined}
             loadPools={loadPools}
             refreshRevision={auxiliaryRefreshRevision}
           />

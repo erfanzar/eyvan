@@ -14,6 +14,7 @@ from datetime import timedelta
 from eyvan._internal.correlation import canonical_correlation_id
 from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, model_json
+from eyvan.capacity.acquisition_backoff import is_acquisition_backoff_reason
 from eyvan.domain import (
     PlacementDecision,
     PreemptionActionKind,
@@ -345,6 +346,10 @@ class _ControllerScheduling:
                 if workload is None or workload.state is not WorkloadState.PENDING:
                     continue
                 if workload.autoscale_block_reason is not None:
+                    continue
+                if is_acquisition_backoff_reason(workload.scheduling_reason):
+                    # The capacity pass owns this sentence and clears it itself;
+                    # "no cell satisfies" would hide why no cell exists.
                     continue
                 if await self._has_active_autoscale_capacity(transaction, workload):
                     continue

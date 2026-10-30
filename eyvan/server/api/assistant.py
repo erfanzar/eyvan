@@ -264,6 +264,14 @@ TOOL_SPECS: tuple[dict[str, tp.Any], ...] = (
                 "priority_band": {"type": "string", "enum": [item.value for item in PriorityBand]},
                 "checkpointable": {"type": "boolean"},
                 "max_preemption_retries": _INT,
+                "dependencies": {
+                    "type": "array",
+                    "items": _STR,
+                    "description": (
+                        "pip requirements installed for this job (e.g. EasyDeL from git). EasyDeL launches add the "
+                        "CPU-only torch wheel automatically unless torch is listed here."
+                    ),
+                },
             },
             ["name"],
         ),
@@ -478,9 +486,15 @@ class AssistantTools:
         easydel_trainer: str | None = None,
         trainer_arguments: dict[str, tp.Any] | None = None,
         easydel_launch: dict[str, tp.Any] | None = None,
+        dependencies: list[str] | None = None,
     ) -> tuple[dict[str, tp.Any], dict[str, tp.Any] | None]:
         """Validate one job and return ``(tool outcome, draft or None when refused)``; records nothing."""
 
+        if dependencies is not None and (
+            not isinstance(dependencies, list) or not all(isinstance(item, str) for item in dependencies)
+        ):
+            raise ValueError("dependencies must be a list of requirement strings")
+        declared = [item.strip() for item in dependencies or () if item.strip()]
         launch: dict[str, tp.Any] | None = None
         if easydel_trainer is not None:
             if command:
@@ -500,6 +514,12 @@ class AssistantTools:
                 }
                 return refusal, None
             command = launch["script"].strip()
+            # The launch's own requirements (CPU torch for the HF loader) unless
+            # the user already pinned that project: their pin wins outright.
+            pinned = {easydel.requirement_name(item) for item in declared}
+            declared.extend(
+                item for item in launch.get("dependencies", ()) if easydel.requirement_name(item) not in pinned
+            )
         if not command:
             raise ValueError("pass command, or easydel_trainer with easydel_launch")
         fields: dict[str, tp.Any] = {
@@ -516,6 +536,8 @@ class AssistantTools:
             fields["max_preemption_retries"] = max_preemption_retries
         if tpu_chips:
             fields["gang"] = ResourceGang(replicas=replicas, per_replica=ResourceVector(tpu=tpu_chips))
+        if declared:
+            fields["dependencies"] = tuple(dict.fromkeys(declared))
         spec = WorkloadDefinition(**fields)
         document = spec.model_dump(mode="json", exclude_defaults=True)
         # The execution's ``kind`` is its union discriminator and also its

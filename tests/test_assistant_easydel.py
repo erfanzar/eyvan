@@ -146,6 +146,71 @@ def test_an_easydel_draft_is_refused_until_its_arguments_are_valid_then_is_runna
     assert submitted.status_code == 201, submitted.text
 
 
+def test_an_easydel_draft_declares_cpu_torch_for_the_hf_loader_and_a_user_pin_wins() -> None:
+    """The live failure: eLarge loads HF checkpoints through torch and the job had none.
+
+    The draft declares the CPU-only wheel for every supported worker Python
+    (markers pick one on the host); a torch requirement the user lists replaces
+    it, and other dependencies they list are kept.
+    """
+
+    easydel_src = "easydel @ git+https://github.com/erfanzar/EasyDeL@3362f13d1#subdirectory=libs/easydel"
+    base = {
+        "easydel_trainer": "sft",
+        "trainer_arguments": {"learning_rate": 1e-4},
+        "easydel_launch": {"model": "hf-internal-testing/tiny-random-LlamaForCausalLM", "dataset": "d.jsonl"},
+    }
+    plain = {"name": "sft-default", **base, "dependencies": ["jax[tpu]", easydel_src]}
+    pinned = {"name": "sft-pinned", **base, "dependencies": ["Torch==2.9.0", easydel_src]}
+    provider = ScriptedProvider(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_call("draft_workload", plain, "c0"), _call("draft_workload", pinned, "c1")],
+            },
+            {"role": "assistant", "content": "Drafted."},
+        ]
+    )
+    http = _client(provider)
+    response = _chat(http, "SFT a tiny llama")
+    assert response.status_code == 200, response.text
+    drafts = {draft["spec"]["name"]: draft for draft in response.json()["drafts"]}
+
+    declared = drafts["sft-default"]["spec"]["dependencies"]
+    assert declared[:2] == ["jax[tpu]", easydel_src]
+    torch = [item for item in declared if item.startswith("torch @ ")]
+    assert len(torch) == 6
+    assert all("download.pytorch.org/whl/cpu/" in item and "%2Bcpu-" in item for item in torch)
+    assert any('python_version == "3.13" and platform_machine == "x86_64"' in item for item in torch)
+    assert any("CPU-only torch" in note for note in drafts["sft-default"]["easydel"]["assumptions"])
+
+    kept = drafts["sft-pinned"]["spec"]["dependencies"]
+    assert kept == ["Torch==2.9.0", easydel_src]
+
+    # The marker requirements survive the real submit route's validation.
+    submitted = http.post(
+        "/api/v1/workloads",
+        json={**SCOPE, "spec": drafts["sft-default"]["spec"]},
+        headers={**ALICE, "Idempotency-Key": "confirm-torch"},
+    )
+    assert submitted.status_code == 201, submitted.text
+    assert submitted.json()["spec"]["dependencies"] == declared
+
+
+def test_a_plain_command_draft_gets_no_torch_and_bad_dependencies_are_refused() -> None:
+    calls = [
+        _call("draft_workload", {"name": "echo", "command": "echo hi", "dependencies": ["numpy"]}, "c0"),
+        _call("draft_workload", {"name": "bad", "command": "echo hi", "dependencies": "numpy"}, "c1"),
+    ]
+    provider = ScriptedProvider([{"role": "assistant", "content": None, "tool_calls": calls}])
+    response = _chat(_client(provider), "draft")
+    assert response.status_code == 200, response.text
+    assert [item["ok"] for item in response.json()["tool_calls"]] == [True, False]
+    (draft,) = response.json()["drafts"]
+    assert draft["spec"]["dependencies"] == ["numpy"]
+
+
 def test_draft_needs_command_or_trainer_but_not_both() -> None:
     calls = [
         _call("draft_workload", {"name": "x"}, "c0"),

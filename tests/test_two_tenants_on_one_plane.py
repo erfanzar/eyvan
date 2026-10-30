@@ -154,6 +154,8 @@ FLEET_ONLY_ROUTES: dict[str, str] = {
     "GET /api/v1/fleets/{fleet_name}": "one fleet",
     "PUT /api/v1/fleets/{fleet_name}": "declarative fleet apply",
     "DELETE /api/v1/fleets/{fleet_name}": "delete a fleet",
+    "GET /api/v1/fleets/{fleet_name}/init-script": "a fleet's host setup script",
+    "PUT /api/v1/fleets/{fleet_name}/init-script": "change what every new host of a fleet runs",
     "POST /api/v1/fleets/{fleet_name}/callables": "place a callable on fleet capacity",
     "POST /api/v1/fleets/{fleet_name}/node-types/{node_type}/workloads": "place work on fleet capacity",
     "GET /api/v1/leases": "fleet lease inventory",
