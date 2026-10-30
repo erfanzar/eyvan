@@ -119,6 +119,8 @@ class _ContainerRuntime:
     working_dir: str
     privileged: bool
     mounts: tuple[_ContainerMount, ...]
+    ipc: str | None
+    shm_size: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,8 @@ def _runtime_from_configuration(configuration: NativeContainerConfig, *, workloa
         working_dir=working_dir,
         privileged=privileged,
         mounts=mounts,
+        ipc=configuration.ipc,
+        shm_size=configuration.shm_size,
     )
 
 
@@ -489,6 +493,42 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         launch_environment = self._resolved_launch_environment(self._container_environment(_environment(spec)))
         _write_environment_file(self._container_env_file_path(remote_id), launch_environment)
 
+    def _accelerator_request(self, spec: tp.Mapping[str, JsonValue]) -> bool:
+        """Return whether a workload requests a GPU, refusing what cannot launch.
+
+        The one place both ``submit`` and ``_launch_command`` read the gang's
+        accelerators from, so the refusals ``submit`` must make before any
+        durable record exists are the same refusals the launch would make, by
+        construction rather than by two copies kept in step.
+        """
+
+        gpu_requested, tpu_requested = _gang_accelerators(spec)
+        if tpu_requested and not self._runtime.privileged:
+            raise ValueError("native OCI TPU workloads require runtime.container.privileged=true")
+        if gpu_requested and tpu_requested:
+            raise ValueError("native OCI workloads cannot request GPU and TPU resources together")
+        return gpu_requested
+
+    def _ipc_arguments(self, *, gpu_requested: bool) -> tuple[str, ...]:
+        """Return the ``docker run`` IPC namespace and ``/dev/shm`` options.
+
+        An unset ``ipc`` is Eyvan's choice, and it is made per workload: a GPU
+        workload gets the host's namespace -- Docker's 64 MiB ``/dev/shm`` is
+        too small for NCCL's shared-memory transport and DataLoader workers,
+        and fails as a bus error that never names the cause -- unless the
+        operator stated a ``shm_size``, which asks for a private namespace of
+        that size instead. Everything else keeps Docker's own default, which is
+        what every container launched before this option had.
+        """
+
+        ipc = self._runtime.ipc
+        if ipc is None and gpu_requested and self._runtime.shm_size is None:
+            ipc = "host"
+        return (
+            *(("--ipc", ipc) if ipc is not None else ()),
+            *(("--shm-size", self._runtime.shm_size) if self._runtime.shm_size is not None else ()),
+        )
+
     def _launch_command(
         self,
         unit_name: str,
@@ -508,11 +548,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             raise RuntimeError("native OCI execution record has no container cidfile")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("native OCI execution record has no remote ID")
-        gpu_requested, tpu_requested = _gang_accelerators(spec)
-        if tpu_requested and not self._runtime.privileged:
-            raise ValueError("native OCI TPU workloads require runtime.container.privileged=true")
-        if gpu_requested and tpu_requested:
-            raise ValueError("native OCI workloads cannot request GPU and TPU resources together")
+        gpu_requested = self._accelerator_request(spec)
         del environment
         return (
             "systemd-run",
@@ -551,7 +587,12 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             *(option for mount in self._automatic_mounts for option in ("--mount", self._mount_argument(mount))),
             "--env-file",
             str(self._container_env_file_path(remote_id)),
-            *(("--gpus", "all") if gpu_requested else ()),
+            *self._ipc_arguments(gpu_requested=gpu_requested),
+            # ``LimitMEMLOCK=infinity`` above reaches only the ``docker`` client
+            # in this unit; the container is the daemon's child and inherits
+            # dockerd's limit. CUDA pins host memory for every async copy and
+            # NCCL registers its buffers, so a GPU container states its own.
+            *(("--gpus", "all", "--ulimit", "memlock=-1:-1") if gpu_requested else ()),
             *(("--privileged",) if self._runtime.privileged else ()),
             "--entrypoint",
             "/bin/sh",
@@ -570,11 +611,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         reports INDETERMINATE forever and ``stop``/``retire`` both refuse to act.
         """
 
-        gpu_requested, tpu_requested = _gang_accelerators(spec)
-        if tpu_requested and not self._runtime.privileged:
-            raise ValueError("native OCI TPU workloads require runtime.container.privileged=true")
-        if gpu_requested and tpu_requested:
-            raise ValueError("native OCI workloads cannot request GPU and TPU resources together")
+        self._accelerator_request(spec)
         return super().submit(spec, context)
 
     def process_status(self, remote_id: str) -> JsonObject:

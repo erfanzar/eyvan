@@ -4282,6 +4282,21 @@
             "title": "Image",
             "type": "string"
           },
+          "ipc": {
+            "anyOf": [
+              {
+                "enum": [
+                  "host",
+                  "private"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ipc"
+          },
           "mounts": {
             "default": [],
             "items": {
@@ -4304,6 +4319,17 @@
             ],
             "title": "Pull Policy",
             "type": "string"
+          },
+          "shm_size": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shm Size"
           },
           "working_dir": {
             "anyOf": [

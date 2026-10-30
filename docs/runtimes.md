@@ -124,6 +124,21 @@ The complete worked shape is
 5. `bootstrap_egress: public-internet` for the docker install and pull, or
    a prebaked engine plus wheelhouse with `private-google-access`.
 
+### GPU containers
+
+A container that requests a GPU (`gpu > 0` per replica) is launched with
+`--gpus`, `--ulimit memlock=-1:-1` and, unless the container block says
+otherwise, `--ipc host`. Docker's own defaults are a 64 MiB `/dev/shm` and
+dockerd's memlock limit; the first makes NCCL's shared-memory transport and
+PyTorch DataLoader workers die with a bus error, and the transient unit's
+`LimitMEMLOCK=infinity` reaches only the `docker` client, not the container.
+Two container fields change the IPC choice:
+
+| Field | Values | Effect |
+|---|---|---|
+| `ipc` | `host`, `private`, unset | Unset: host IPC for GPU workloads with no `shm_size`, Docker's default for everything else. Set: passed as `--ipc` for every workload. |
+| `shm_size` | positive integer with optional `b`/`k`/`m`/`g`, e.g. `16g` | A private `/dev/shm` of that size; a GPU workload then stays in a private namespace. Refused beside `ipc: host`, which ignores it. |
+
 ### Attached TPUs (existing hardware)
 
 A TPU Eyvan did not create gets its image at attach time:

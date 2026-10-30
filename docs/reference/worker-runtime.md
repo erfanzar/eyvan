@@ -343,7 +343,10 @@ service's cgroup. Images use `always`, `if-not-present`, or `never` pull
 policies. Mounts must be absolute, non-root, non-dot paths with unique targets;
 staged artifact mounts are read-only. The callable runner is staged into the
 image and rejects shell composition instead of accepting an arbitrary shell
-entrypoint.
+entrypoint. A workload that requests a GPU gets `--gpus`,
+`--ulimit memlock=-1:-1` and, while the container block states neither `ipc`
+nor `shm_size`, `--ipc host`; `shm_size` (refused beside `ipc: host`) keeps it
+in a private namespace instead.
 
 ### 3.3 Local process / local worker
 

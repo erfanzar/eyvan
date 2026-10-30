@@ -156,6 +156,9 @@ that 0.0.1 will contain.
 
 ### Fixed
 
+- GPU containers no longer run on Docker's 64 MiB `/dev/shm` and dockerd's
+  memlock limit: a GPU workload gets `--ulimit memlock=-1:-1` and host IPC by
+  default, and the container block gains `ipc` and `shm_size`.
 - Local native runtime path that provisioned TPUs but never ran anything.
 - Startup races: a losing race no longer destroys the winner's PID record, and
   the winner is adopted on its record rather than a fresh health probe.
