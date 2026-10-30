@@ -126,6 +126,11 @@ _PROTECTED_CONTAINER_MOUNT_SOURCES = (
     PurePosixPath("/etc/eyvan-native"),
     PurePosixPath("/run/eyvan-native"),
 )
+#: The subset of Docker's ``--shm-size`` grammar Eyvan accepts: a positive
+#: integer and one optional binary unit. Docker also takes fractions and
+#: ``gb``/``GiB`` spellings; one spelling per size keeps the durable fleet API
+#: comparable and is never short of a size an operator can state.
+_CONTAINER_SHM_SIZE = re.compile(r"[1-9][0-9]*[bkmg]?")
 _AUTOMATIC_CONTAINER_MOUNT_TARGETS = frozenset(
     {
         "/opt/eyvan-native/oci-callable-runner",
@@ -315,6 +320,39 @@ class NativeContainerConfig(EyvanModel):
     working_dir: str | None = None
     privileged: bool = False
     mounts: tuple[NativeContainerMount, ...] = ()
+    #: The container's IPC namespace. ``None`` leaves the choice to Eyvan, and
+    #: what Eyvan chooses depends on the workload rather than on the fleet: a
+    #: workload that requests a GPU, with no ``shm_size`` stated, is given the
+    #: host's namespace, and every other workload keeps Docker's default.
+    #:
+    #: Host IPC for GPU work because Docker's default ``/dev/shm`` is 64 MiB.
+    #: NCCL's intra-node transport and PyTorch's DataLoader workers both move
+    #: tensors through shared memory, and at 64 MiB an eight-GPU collective or a
+    #: handful of loader workers fails with a bus error rather than a message
+    #: that names the cause. NVIDIA's container guidance is ``--ipc=host`` or a
+    #: large ``--shm-size``; the first needs no sizing decision, so it is the
+    #: default, and ``shm_size`` is how an operator who wants a private
+    #: namespace says so.
+    ipc: Literal["host", "private"] | None = None
+    #: The size of a private ``/dev/shm``, as Docker spells it: a positive
+    #: integer with an optional ``b``/``k``/``m``/``g`` unit, such as ``16g``.
+    #: Stating it keeps a GPU workload in a private namespace of that size
+    #: instead of the host's. Refused beside ``ipc: host``, where Docker ignores
+    #: it: a size that silently does nothing is worse than no size at all.
+    shm_size: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # A container block that states neither serializes exactly as it did
+        # before they existed. The block travels to native workers in their
+        # container-runtime file and in capacity metadata, and an older worker
+        # validates it with extra="forbid": a null it has never heard of would
+        # refuse the whole runtime and leave the worker unable to start.
+        document = handler(self)
+        for name in ("ipc", "shm_size"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_container(self) -> NativeContainerConfig:
@@ -343,6 +381,13 @@ class NativeContainerConfig(EyvanModel):
             raise ValueError(
                 f"native container mount target {conflicting_target!r} overlaps another configured mount target"
             )
+        if self.shm_size is not None:
+            if not _CONTAINER_SHM_SIZE.fullmatch(self.shm_size):
+                raise ValueError(
+                    "native container shm_size must be a positive integer with an optional b, k, m, or g unit"
+                )
+            if self.ipc == "host":
+                raise ValueError("native container shm_size cannot be combined with ipc: host, which ignores it")
         return self
 
 

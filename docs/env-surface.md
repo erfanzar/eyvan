@@ -230,6 +230,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_NATIVE_WORKER_UNIT` | `eyvan/worker/runtime/native_bootstrap` |
 | `EYVAN_GANG_CELL_ID` | `eyvan/worker/runtime/native_gang` |
 | `EYVAN_GANG_CELL_INDEX` | `eyvan/worker/runtime/native_gang` |
+| `EYVAN_NATIVE_WORKER_GPU_DEVICES` | `eyvan/worker/runtime/native_worker` |
 | `EYVAN_NATIVE_WORKER_HOST` | `eyvan/worker/runtime/native_worker` |
 | `EYVAN_NATIVE_WORKER_SECRET` | `eyvan/worker/runtime/native_worker` |
 | `EYVAN_NATIVE_WORKLOAD_DIRECTORY` | `eyvan/worker/runtime/native_worker` |

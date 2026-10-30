@@ -72,7 +72,11 @@ from eyvan.worker.runtime.host_accelerators import check_gpu_readiness
 from eyvan.worker.runtime.local_process import LocalProcessExecutor
 from eyvan.worker.runtime.registry import ExecCapableExecutionDriver, IntrospectableExecutionDriver
 from eyvan.worker.runtime.stage_executor import AssetStageDriver, AssetStageVerdict, LocalAssetStageExecutor
-from eyvan.worker.runtime.systemd_transient import SystemdLogsUnavailableError, SystemdTransientServiceExecutor
+from eyvan.worker.runtime.systemd_transient import (
+    SystemdLogsUnavailableError,
+    SystemdTransientServiceExecutor,
+    validate_gpu_devices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +170,27 @@ def _load_container_runtime(path: Path) -> tuple[NativeContainerConfig, tuple[st
     return container, _container_artifact_mounts(value["artifact_mounts"])
 
 
+def parse_gpu_devices(value: str) -> tuple[int, ...]:
+    """Parse a ``--gpu-devices`` value such as ``4,5,6,7`` into a device list.
+
+    The one parser for both the flag and ``EYVAN_NATIVE_WORKER_GPU_DEVICES``,
+    which is its default, so a list is read the same way whichever way the
+    unit file states it. Strict about spelling -- decimal integers separated by
+    commas, nothing else -- because a typo here does not fail a job, it slices
+    a host differently from what its operator wrote down.
+
+    Raises:
+        ValueError: If the value is empty or malformed, or names a device that
+            :func:`~eyvan.worker.runtime.systemd_transient.validate_gpu_devices`
+            refuses.
+    """
+
+    parts = value.split(",")
+    if not all(part.isdigit() and part.isascii() for part in parts):
+        raise ValueError(f"--gpu-devices must be comma-separated GPU indices such as 4,5,6,7, not {value!r}")
+    return validate_gpu_devices([int(part) for part in parts])
+
+
 def _base_environment(runtime_env: tp.Mapping[str, str]) -> dict[str, str]:
     """Return workload defaults injected below job-specific environment values."""
 
@@ -218,6 +243,7 @@ def create_native_worker_app(
     runtime_env: tp.Mapping[str, str] | None = None,
     runtime_container: NativeContainerConfig | None = None,
     container_artifact_mounts: tp.Sequence[str] = (),
+    gpu_devices: tp.Sequence[int] | None = None,
     stager: AssetStageDriver | None = None,
 ) -> FastAPI:
     """Create one native execution-worker application.
@@ -246,6 +272,12 @@ def create_native_worker_app(
             fleet YAML. It requires the production systemd worker path.
         container_artifact_mounts: Staged host artifact paths automatically
             made read-only at the same paths inside the container.
+        gpu_devices: The host GPUs this worker's cell owns, by ``/dev/nvidiaN``
+            index, when several cells share one host's GPUs. Workloads see
+            them as ``0..n-1``; a container is given only these devices and a
+            native unit is denied every other one. ``None`` leaves a workload
+            the host's GPUs, as before. Requires the production systemd worker
+            path, which is the only one that can confine a device.
         stager: Managed-staging executor for the cells whose disk this worker
             owns. Built from this host's environment when omitted, and left
             unset when that environment declares no source prefixes -- which is
@@ -268,6 +300,7 @@ def create_native_worker_app(
         or runtime_env is not None
         or runtime_container is not None
         or container_artifact_mounts
+        or gpu_devices is not None
     ):
         raise ValueError("default native worker options cannot be combined with an explicit executor")
     if not isinstance(secret, str) or not secret.strip():
@@ -286,6 +319,10 @@ def create_native_worker_app(
         raise ValueError("native worker container runtime requires systemd_transient")
     if runtime_container is None and container_artifact_mounts:
         raise ValueError("native worker container artifact mounts require a container runtime")
+    if gpu_devices is not None:
+        gpu_devices = validate_gpu_devices(gpu_devices)
+        if not systemd_transient:
+            raise ValueError("native worker GPU devices require systemd_transient")
     if executor is None:
         base_environment = _base_environment(runtime_env)
         if runtime_container is not None:
@@ -298,6 +335,7 @@ def create_native_worker_app(
                 use_exit_type_cgroup=systemd_exit_type_cgroup,
                 workload_directory=os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", "/var/lib/eyvan/workload"),
                 base_environment=base_environment,
+                gpu_devices=gpu_devices,
             )
         elif systemd_transient:
             executor = SystemdTransientServiceExecutor(
@@ -307,6 +345,7 @@ def create_native_worker_app(
                 workload_group=os.getenv("EYVAN_NATIVE_WORKLOAD_GROUP", "eyvan-workload"),
                 workload_directory=os.getenv("EYVAN_NATIVE_WORKLOAD_DIRECTORY", "/var/lib/eyvan/workload"),
                 base_environment=base_environment,
+                gpu_devices=gpu_devices,
             )
         else:
             executor = LocalProcessExecutor(state_dir=state_dir)
@@ -601,6 +640,7 @@ class NativeWorkerArguments(argparse.Namespace):
     secret_file: Path | None
     runtime_env_file: Path | None
     container_runtime_file: Path | None
+    gpu_devices: str | None
     systemd_transient: bool
     mtls_mode: str
     mtls_trust_bundle: str
@@ -619,6 +659,13 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser.add_argument("--secret-file", type=Path)
     parser.add_argument("--runtime-env-file", type=Path)
     parser.add_argument("--container-runtime-file", type=Path)
+    parser.add_argument(
+        "--gpu-devices",
+        # An empty variable reads as unset, so a unit template can always carry
+        # the name and leave it blank on an unsliced host.
+        default=os.getenv("EYVAN_NATIVE_WORKER_GPU_DEVICES") or None,
+        help="host GPU indices this cell owns, e.g. 4,5,6,7, when several cells share one host's GPUs",
+    )
     parser.add_argument("--mtls-mode", default=os.getenv("EYVAN_MUTUAL_TLS_MODE", "off"))
     parser.add_argument("--mtls-trust-bundle", default=os.getenv("EYVAN_MUTUAL_TLS_TRUST_BUNDLE", ""))
     parser.add_argument("--mtls-certificate", default=os.getenv("EYVAN_MUTUAL_TLS_CERTIFICATE", ""))
@@ -654,6 +701,22 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
             runtime_env = _load_runtime_environment(args.runtime_env_file)
         except ValueError as exc:
             parser.error(str(exc))
+    gpu_devices: tuple[int, ...] | None = None
+    if args.gpu_devices is not None:
+        try:
+            gpu_devices = parse_gpu_devices(args.gpu_devices)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not args.systemd_transient:
+            parser.error("--gpu-devices requires --systemd-transient, the only executor that can confine a device")
+        # Named here, like the missing credential below, rather than left to
+        # the executor's ValueError inside a unit that failed to start.
+        visibility = sorted({"CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"} & set(runtime_env))
+        if visibility:
+            parser.error(
+                f"--runtime-env-file sets {visibility[0]}, which --gpu-devices owns; "
+                "remove it and name the cell's GPUs only in --gpu-devices"
+            )
     runtime_container: NativeContainerConfig | None = None
     container_artifact_mounts: tuple[str, ...] = ()
     if args.container_runtime_file is not None:
@@ -696,6 +759,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
             runtime_env=runtime_env if args.runtime_env_file is not None else None,
             runtime_container=runtime_container,
             container_artifact_mounts=container_artifact_mounts,
+            **({"gpu_devices": gpu_devices} if gpu_devices is not None else {}),
             **({"correlation_enabled": True} if correlation_enabled else {}),
         ),
         host=args.host,
@@ -708,7 +772,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     return 0
 
 
-__all__ = ("create_native_worker_app", "main")
+__all__ = ("create_native_worker_app", "main", "parse_gpu_devices")
 
 
 if __name__ == "__main__":

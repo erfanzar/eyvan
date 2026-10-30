@@ -698,3 +698,96 @@ def test_container_rejects_gpu_and_tpu_before_writing_a_durable_record(tmp_path:
     assert not any(command[0] == "systemd-run" for command in daemon.commands)
     after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*")) if root.exists() else []
     assert after == before
+
+
+def _docker_run(daemon: FakeDockerSystemd) -> tuple[str, ...]:
+    launch = next(command for command in daemon.commands if command[0] == "systemd-run")
+    return launch[launch.index("docker") : launch.index("--entrypoint")]
+
+
+def _option_value(docker: tuple[str, ...], option: str) -> str | None:
+    return docker[docker.index(option) + 1] if option in docker else None
+
+
+def test_container_gpu_workload_gets_host_ipc_and_an_unlimited_memlock_by_default(tmp_path: Path) -> None:
+    """Docker's 64 MiB ``/dev/shm`` and dockerd's memlock must not reach a GPU job.
+
+    ``LimitMEMLOCK=infinity`` on the transient unit applies to the ``docker``
+    client only, so the container has to be told directly.
+    """
+
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    executor = _executor(tmp_path, daemon)
+
+    executor.submit(_spec(resources={"gpu": 8}), _context())
+
+    docker = _docker_run(daemon)
+    assert _option_value(docker, "--ipc") == "host"
+    assert "--shm-size" not in docker
+    assert _option_value(docker, "--ulimit") == "memlock=-1:-1"
+    assert _option_value(docker, "--gpus") == "all"
+
+
+def test_container_cpu_workload_keeps_dockers_ipc_and_memlock_defaults(tmp_path: Path) -> None:
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    executor = _executor(tmp_path, daemon)
+
+    executor.submit(_spec(resources={"cpu": 4}), _context())
+
+    docker = _docker_run(daemon)
+    assert "--ipc" not in docker
+    assert "--shm-size" not in docker
+    assert "--ulimit" not in docker
+    assert "--gpus" not in docker
+
+
+def test_container_shm_size_keeps_a_gpu_workload_in_a_private_ipc_namespace(tmp_path: Path) -> None:
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    runtime = NativeContainerConfig(image="registry.example/easydel:latest", shm_size="16g")
+    executor = _executor(tmp_path, daemon, runtime=runtime)
+
+    executor.submit(_spec(resources={"gpu": 2}), _context())
+
+    docker = _docker_run(daemon)
+    assert "--ipc" not in docker
+    assert _option_value(docker, "--shm-size") == "16g"
+    assert _option_value(docker, "--ulimit") == "memlock=-1:-1"
+
+
+@pytest.mark.parametrize(("ipc", "resources"), [("private", {"gpu": 1}), ("host", {"cpu": 4})])
+def test_container_explicit_ipc_is_passed_through_whatever_the_workload_requests(
+    tmp_path: Path, ipc: str, resources: dict[str, int]
+) -> None:
+    daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
+    runtime = NativeContainerConfig(image="registry.example/easydel:latest", ipc=ipc)
+    executor = _executor(tmp_path, daemon, runtime=runtime)
+
+    executor.submit(_spec(resources=resources), _context())
+
+    assert _option_value(_docker_run(daemon), "--ipc") == ipc
+
+
+@pytest.mark.parametrize("size", ["0", "16G", "1.5g", "16gb", "-1g", "g", " 16g", "16 g"])
+def test_container_config_refuses_a_shm_size_outside_the_accepted_grammar(size: str) -> None:
+    with pytest.raises(ValueError, match="shm_size must be a positive integer"):
+        NativeContainerConfig(image="registry.example/easydel:latest", shm_size=size)
+
+
+def test_container_config_refuses_a_shm_size_beside_host_ipc() -> None:
+    with pytest.raises(ValueError, match="cannot be combined with ipc: host"):
+        NativeContainerConfig(image="registry.example/easydel:latest", ipc="host", shm_size="16g")
+
+    accepted = NativeContainerConfig(image="registry.example/easydel:latest", ipc="private", shm_size="512m")
+    assert (accepted.ipc, accepted.shm_size) == ("private", "512m")
+
+
+def test_container_config_without_ipc_settings_serializes_as_before_they_existed() -> None:
+    """Older workers validate the container block with extra="forbid"."""
+
+    plain = NativeContainerConfig(image="registry.example/easydel:latest")
+    assert set(plain.model_dump(mode="json")) == {"image", "pull_policy", "working_dir", "privileged", "mounts"}
+
+    stated = NativeContainerConfig(image="registry.example/easydel:latest", ipc="private", shm_size="8g")
+    document = stated.model_dump(mode="json")
+    assert (document["ipc"], document["shm_size"]) == ("private", "8g")
+    assert NativeContainerConfig.model_validate(document) == stated

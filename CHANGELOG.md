@@ -120,6 +120,10 @@ that 0.0.1 will contain.
 
 #### Packaging and deployment
 
+- `--gpu-devices` (or `EYVAN_NATIVE_WORKER_GPU_DEVICES`) on the native worker
+  slices one host's GPUs between cells: a container gets only those devices, a
+  native unit is denied every other GPU, and a job cannot select outside the
+  slice.
 - Five console entry points: `eyvan`, `eyvan-server`, `eyvan-agent`,
   `eyvan-native-worker`, `eyvan-migrate`.
 - Helm chart (`deploy/helm/eyvan`) with a pre-install migration hook, hardened
@@ -166,6 +170,9 @@ that 0.0.1 will contain.
   open) and the cell stays `EXECUTION_CONNECTING` with the reason.
 - `onprem-ssh` now publishes `cell_accelerator` for a cataloged type, as
   `manual` already did, so on-prem GPU cells join GPU-coordinated gangs.
+- GPU containers no longer run on Docker's 64 MiB `/dev/shm` and dockerd's
+  memlock limit: a GPU workload gets `--ulimit memlock=-1:-1` and host IPC by
+  default, and the container block gains `ipc` and `shm_size`.
 - Local native runtime path that provisioned TPUs but never ran anything.
 - Startup races: a losing race no longer destroys the winner's PID record, and
   the winner is adopted on its record rather than a fresh health probe.
