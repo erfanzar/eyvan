@@ -36,7 +36,14 @@ import typing as tp
 import urllib.request
 from pathlib import Path
 
-from eyvan._internal.plane_tls import control_plane_urlopen_options
+if __package__:
+    from eyvan._internal.plane_tls import control_plane_urlopen_options
+else:  # staged standalone copy in the OCI bridge mount (tests/test_oci_job_wrappers.py)
+    # Inside a workload image ``eyvan`` is not importable. The stager puts this
+    # file beside its stdlib-only siblings, and the wrapper runs with ``-I``,
+    # which keeps the script's own directory off sys.path -- so add it here.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from plane_tls import control_plane_urlopen_options  # type: ignore[import-not-found,no-redef]
 
 DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
 
@@ -85,7 +92,10 @@ def materialize(
         expected = hmac.new(signing_key, payload, hashlib.sha256).hexdigest()
         if signature is None or not hmac.compare_digest(expected, signature):
             raise ValueError("workspace bundle signature mismatch")
-    from eyvan._internal.workspace import create_private_directory, extract_workspace
+    if __package__:
+        from eyvan._internal.workspace import create_private_directory, extract_workspace
+    else:  # staged standalone copy: the hardened extractor is a sibling file
+        from workspace import create_private_directory, extract_workspace  # type: ignore[import-not-found,no-redef]
 
     create_private_directory(base)
     # Never reuse, overwrite, or remove a sibling's execution tree. Unique

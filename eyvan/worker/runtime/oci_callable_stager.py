@@ -25,6 +25,10 @@ OCI_HTTP_RETRY_FILENAME = "http_retry.py"
 OCI_PLANE_TLS_FILENAME = "plane_tls.py"
 """Shared protocol sources staged beside the OCI callable runner."""
 
+OCI_DEPENDENCY_ENTRY_FILENAME = "dependency_entry.py"
+OCI_WORKSPACE_ENTRY_FILENAME = "workspace_entry.py"
+"""Per-job wrappers (``--with`` packages, ``--workspace`` trees) staged for images without Eyvan."""
+
 
 def _stage_file(source: Path, destination: Path) -> None:
     """Atomically copy one immutable runtime source file into the state directory."""
@@ -102,6 +106,12 @@ def stage_oci_callable_runner(directory: str | os.PathLike[str]) -> Path:
     # And the control-plane CA trust, so a containerized callable verifies a
     # head's private CA exactly as a native one does. Stdlib-only by design.
     _stage_file(Path(plane_tls.__file__).resolve(), destination_directory / OCI_PLANE_TLS_FILENAME)
+    # The command-job wrappers. The controller launches them as
+    # ``python -I -m eyvan.worker.runtime.<wrapper>``, which an image without
+    # Eyvan cannot import; the Docker executor rewrites them to these copies.
+    # Both are stdlib-only (workspace_entry imports the siblings staged above).
+    for filename in (OCI_DEPENDENCY_ENTRY_FILENAME, OCI_WORKSPACE_ENTRY_FILENAME):
+        _stage_file(source_directory / filename, destination_directory / filename)
     return runner_destination
 
 
@@ -109,7 +119,9 @@ __all__ = (
     "OCI_CALLABLE_PROTOCOL_FILENAME",
     "OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY",
     "OCI_CALLABLE_RUNNER_FILENAME",
+    "OCI_DEPENDENCY_ENTRY_FILENAME",
     "OCI_HTTP_RETRY_FILENAME",
     "OCI_PLANE_TLS_FILENAME",
+    "OCI_WORKSPACE_ENTRY_FILENAME",
     "stage_oci_callable_runner",
 )

@@ -65,9 +65,22 @@ def resolve_attach_runtime(
         or f"{sys.version_info.major}.{sys.version_info.minor}"
     )
     image = container_image or (defaults.runtime_container_image if defaults is not None else None)
+    # The same block generated fleets state (eyvan/capacity/autoscale/compiler.py):
+    # the OCI executor refuses every TPU workload launched unprivileged, so an
+    # image given for an attached TPU without it could never run a TPU job.
+    container = (
+        NativeContainerConfig(
+            image=image,
+            pull_policy="if-not-present",
+            working_dir="/var/lib/eyvan/workload",
+            privileged=True,
+        )
+        if image
+        else None
+    )
     return NativeRuntimeConfig(
         init_commands=(*(defaults.runtime_init_commands if defaults is not None else ()), *init_commands),
-        container=NativeContainerConfig(image=image) if image else None,
+        container=container,
         python=selected_python,
     )
 

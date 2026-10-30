@@ -36,6 +36,8 @@ from eyvan.secrets import redact_secret_material
 from eyvan.worker.runtime.oci_callable_stager import (
     OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY,
     OCI_CALLABLE_RUNNER_FILENAME,
+    OCI_DEPENDENCY_ENTRY_FILENAME,
+    OCI_WORKSPACE_ENTRY_FILENAME,
     stage_oci_callable_runner,
 )
 from eyvan.worker.runtime.systemd_transient import (
@@ -55,6 +57,14 @@ from eyvan.worker.runtime.systemd_transient import (
 _CONTAINER_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 _CALLABLE_WORKER_MODULE = "eyvan.worker.runtime.callable_worker"
+#: ``-m`` modules the controller launches and the staged standalone file each
+#: becomes inside the image. Wrappers nest (``--with`` around ``--workspace``
+#: around a callable), so every occurrence is rewritten, not only the first.
+_STAGED_MODULES = {
+    _CALLABLE_WORKER_MODULE: OCI_CALLABLE_RUNNER_FILENAME,
+    "eyvan.worker.runtime.dependency_entry": OCI_DEPENDENCY_ENTRY_FILENAME,
+    "eyvan.worker.runtime.workspace_entry": OCI_WORKSPACE_ENTRY_FILENAME,
+}
 # Tokens that prove an entrypoint is a shell composition rather than the one
 # callable-worker command. Quoted argument values survive shlex as ordinary
 # tokens, so an exact-token comparison only rejects real shell control flow.
@@ -333,18 +343,21 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             parts = shlex.split(entrypoint)
         except ValueError:
             return entrypoint
-        try:
-            module_index = parts.index(_CALLABLE_WORKER_MODULE)
-        except ValueError:
-            return entrypoint
-        # Interpreter flags (``python -u -m ...``) may precede the module
-        # pair; everything before ``-m`` is retained verbatim.
-        if module_index < 2 or parts[module_index - 1] != "-m":
+        if not any(part in _STAGED_MODULES for part in parts):
             return entrypoint
         if any(part in _SHELL_CONTROL_TOKENS or _STANDALONE_REDIRECT.fullmatch(part) for part in parts):
             return entrypoint
-        runner_path = f"{OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY}/{OCI_CALLABLE_RUNNER_FILENAME}"
-        return shlex.join((*parts[: module_index - 1], runner_path, *parts[module_index + 1 :]))
+        rewritten: list[str] = []
+        changed = False
+        for index, part in enumerate(parts):
+            # Interpreter flags (``python -I -m ...``) may precede the module
+            # pair; everything before ``-m`` is retained verbatim.
+            if part in _STAGED_MODULES and index >= 2 and parts[index - 1] == "-m" and rewritten[-1:] == ["-m"]:
+                rewritten[-1] = f"{OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY}/{_STAGED_MODULES[part]}"
+                changed = True
+                continue
+            rewritten.append(part)
+        return shlex.join(rewritten) if changed else entrypoint
 
     def _verify_docker(self) -> None:
         result = self._run(("docker", "version", "--format", "{{.Server.Version}}"))
