@@ -1,53 +1,44 @@
 # DR-0002: Flattened global log ranks and opaque cursors
 
-**Status:** Substantially implemented; host-tested only. Strict
-topology-bound rejection and the full archive manifest remain pending, along
-with multi-host hardware evidence.
+**Status:** Global ranks, typed cursor outcomes, topology-bound cursor decoding
+and schema-v2 terminal archive manifests are implemented. Bound v2 cursor
+emission is opt-in and defaults off. Multi-host deployment qualification
+remains separate from host tests.
 
-## Context
+## Ordering and identity
 
-A workload's logs come from many writers — the plane, agents, native
-workers, one per host — and every consumer wants to page through them in one
-consistent order. Per-host sequence numbers cannot provide that: hosts start
-and restart independently, so "host 3, seq 100" is not a position anyone can
-sort against "host 1, seq 8500". The attempt topology itself is only known
-at dispatch.
+Log writers share a flattened global rank space. The attempt topology is frozen
+at dispatch so later topology changes do not renumber history. Merged records
+are ordered by timestamp, then rank (`eyvan/worker/runtime/log_records.py`);
+rank is a deterministic tie-breaker, not a causal timeline. Clock skew can
+change apparent cross-host order.
 
-## Decision
+## Cursor contract
 
-1. **Flattened global ranks.** Log records carry a rank assigned from a flat
-   global space, not a (host, sequence) pair, so a single sort is the
-   timeline regardless of how many hosts contributed.
-2. **The attempt topology is frozen at dispatch.** Rank allocation for a
-   workload happens against the topology recorded when that workload was
-   dispatched; later topology changes do not renumber history.
-3. **Cursors are opaque and untrusted.** A cursor handed back by a client is
-   state, not a credential and not a promise: it is validated and decoded
-   strictly, and an invalid, stale, or incompatible cursor yields a typed
-   outcome — never a silent reset to the beginning and never a leak of
-   internal structure.
+Cursors are opaque, untrusted positions, not credentials. The decoder validates
+structure and reports typed invalid/incompatible outcomes. A bound cursor for
+a different workload, topology, kind or mode is rejected. Topology checks need
+a bound cursor; legacy cursor compatibility is not full topology binding.
 
-## Invariants
+The controller reports `attempt_changed` and restarts a new attempt at empty
+positions. A legacy cursor without a recoverable rank witness may also reset
+when topology is unknown; it does not gain a fabricated topology.
 
-- One sort order over all writers, stable across reads within a workload.
-- No cursor is honored beyond validation: an untrusted cursor can neither
-  authorize anything nor corrupt a stream position.
-- Typed cursor outcomes (invalid / incompatible) are distinguishable at the
-  API surface; clients can tell "you are too old" from "you are wrong".
+`EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED` enables fully bound v2 emission. Decode
+support must reach all serving and rollback images before enabling emission.
+See `decode_log_cursor()` and the controller's `_decoded_cursor()` in
+`eyvan/server/controller/observation.py`.
 
-## Implemented surface
+## Terminal archives
 
-The M1.3 surface — global ranks, the discriminated cursor codec with typed
-invalid/incompatible outcomes, and the archive read path — is implemented
-and host-tested (`eyvan workload logs` pages through it).
+Settlement writes an immutable schema-v2 manifest last for each terminal
+attempt. It records topology, per-rank outcomes, limits, gaps and completeness.
+Archive replay validates the manifest and each object's recorded digest and
+size. An unreadable manifest or mismatching object remains an explicit gap;
+it must not silently fall back to a less complete view.
 
-## Open
+## Qualification still required
 
-- Strict topology-bound rejection: a cursor from a different topology must
-  be refused with its own typed outcome rather than approximated.
-- The full archive manifest, so long-retention archives are self-describing.
-- Multi-host hardware evidence: rank assignment under real concurrent
-  writers on real pods, where clock skew and restarts are not simulated.
-
-Consumers should treat cursor handling as settled (opaque, typed) and rank
-order as the only ordering contract.
+Exercise concurrent writers, clock skew, missing ranks, retries, archive
+retention and decode-before-emit upgrades on the target multi-host deployment.
+Local tests establish protocol behavior, not hardware or production timing.

@@ -21,8 +21,9 @@ the guided tour.
    `max_workers: 0` means the package-wide bound, not infinite capacity.
 3. **Validate** — fleet/pool name patterns, cell-ID prefix collisions, GCP
    project+zone presence, `capacity_backend` required for non-GCP, and the
-   **one-capacity-backend-per-agent-endpoint** rule: one cell agent serves exactly
-   one driver family.
+   **one-backend-family-per-agent-endpoint** rule: one agent constructs one
+   driver. The GCP router can serve TPU, Compute, and attached-TPU pools at the
+   same endpoint.
 4. **Compile** — `pool_payloads()` emits one `CapacityPoolRecord` per node type
    (`id = f"{fleet}-{node_type}"`, labels like `eyvan_pool`, `eyvan_fleet`);
    `desired_cells()` compiles deterministic initial cell ids

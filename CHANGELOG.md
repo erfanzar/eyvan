@@ -7,25 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 0.0.1
 
-First public release candidate. Development history begins with the initial
-import on 2026-04-15 and runs through 2026-08-31 (the latest commit at the time
-of writing); no git tag has been cut yet, so this section collects everything
-that 0.0.1 will contain.
+Changes planned for the first public release.
 
 ### Added
 
 #### SDK and workloads
 
 - `@execute` decorator over `TpuConfig`, `GpuConfig`, and `CpuConfig`: submit a
-  signed-or-unsigned Python callable, block with live progress narration, or
-  detach into an `EyvanJob` handle with `status()`, `logs()`, `wait()`,
-  `result()`, and `cancel()`.
+  digest-verified unsigned Python callable to an explicitly trusted project,
+  block with live progress narration, or detach into an `EyvanJob` handle with
+  `status()`, `logs()`, `wait()`, `result()`, and `cancel()`.
 - Elastic worker packing by default (`atomic=False`): pack warm cells of the
   same type and provision only the deficit, with one JAX world per cell; exact
   single-resource shapes remain opt-in via `atomic=True`.
 - `workspace=` shipping of a directory tree to the worker's working directory,
-  extracted per content digest, with reuse of a completed extraction and the
-  caller's working directory shipped by default.
+  extracted per content digest, with reuse of a completed extraction. By default,
+  Eyvan derives the workspace from the decorated function's source-file directory;
+  `workspace=False` disables shipping.
 - Per-job `dependencies` installed on the cell before the callable loads, so
   adding a library no longer requires rebuilding an image.
 - Checkpointing surface: `checkpointable`, `checkpoint_hook`, and
@@ -80,8 +78,8 @@ that 0.0.1 will contain.
   decoupled from the artifact window, and log lines attributed to the worker
   (and reachable address) that produced them.
 - Secret delivery by reference: `secret_mounts` resolve at dispatch into each
-  attempt's environment, with dispatch-time hardening and rotation of the
-  workload and artifact capability secrets.
+  attempt's environment, with dispatch-time hardening. Deployment-wide
+  signing-key rotation remains unavailable.
 
 #### Identity and tenancy
 
@@ -117,8 +115,8 @@ that 0.0.1 will contain.
 
 #### Packaging and deployment
 
-- Five console entry points: `eyvan`, `eyvan-server`, `eyvan-agent`,
-  `eyvan-native-worker`, `eyvan-migrate`.
+- Six console entry points: `eyvan`, `eyvan-server`, `eyvan-agent`,
+  `eyvan-native-worker`, `eyvan-migrate`, and `eyvan-tracker`.
 - Helm chart (`deploy/helm/eyvan`) with a pre-install migration hook, hardened
   shipped manifests, split liveness/readiness probes, and runtime-served
   dashboard OIDC config.
@@ -198,7 +196,7 @@ that 0.0.1 will contain.
   from pre-commit.
 - Dashboard OIDC sessions are backend-for-frontend: the server runs the
   authorization-code + PKCE flow, and the browser holds an HttpOnly/Secure/
-  SameSite=Lax `eyvan_session` cookie instead of sessionStorage tokens that
+  SameSite=Lax `__Host-eyvan_session` cookie instead of sessionStorage tokens that
   any cross-site script could read; dashboard HTML is served with a strict
   Content-Security-Policy and `nosniff`/`frame-deny` companions.
 - No static default database password anywhere in the shipped tree: the
@@ -215,9 +213,10 @@ that 0.0.1 will contain.
   is refused before a TPU is built for it.
 - Secret material is never delivered in clear text without explicit consent;
   the reference (never the value) is what persists.
-- Bearer token required on `/metrics`; workload, artifact, and node credentials
-  rotate; an unreadable node credential is reported rather than breaking every
-  command.
+- `/metrics` requires a bearer token when `EYVAN_METRICS_TOKEN` is configured;
+  network-bound startup requires that setting. Deployment-wide signing-key
+  rotation remains unavailable. An unreadable node credential is reported
+  rather than breaking every command.
 - Log cursors are kept out of access logs and redacted from httpx's outbound
   request logs; bad cursors are refused instead of restarting the read.
 - Profile directories and per-owner records are created with private

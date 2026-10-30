@@ -6,10 +6,11 @@ Source: `eyvan/worker/` — `agent/` (the cell agent API and client) and `runtim
 
 ## The cell agent (`eyvan-agent`)
 
-One agent owns machines for **exactly one backend** — the fleet config rule from
-Part 6 exists so a single `CellAgentService` (`worker/agent/service.py`) constructs
-one `CapacityDriver` and reconciles one cell at a time. The plane and the agent are
-separate processes: either can restart independently.
+One agent serves one **backend family** through a single `CapacityDriver`
+(`worker/agent/service.py`). The GCP router can serve `gcp-tpu`, `gcp-compute`, and
+`gcp-attach` pools behind the same endpoint. Fleet validation compares backend
+families, not just backend names. The plane and agent are separate processes:
+either can restart independently.
 
 - Transport: FastAPI app from `create_agent_app()` (`worker/agent/app.py`).
 - Auth: bearer `EYVAN_AGENT_SHARED_SECRET`, compared with `hmac.compare_digest`.
@@ -33,11 +34,9 @@ the plane's client (`worker/agent/client.py`) distinguishes every one:
 | 502 | `CapacityProviderError` | `CellAgentCapacityProviderError` | provider failure, operator-safe detail |
 | other 5xx / transport error | agent itself failing | `CellAgentUnavailableError` | **nothing was learned** |
 
-The taxonomy encodes observed incidents: a DNS hiccup on the agent's path was once
-recorded as a provider error, and the control plane retired a v5p-16 multislice
-that had just cleared a 100-minute queue (2026-08-01). `CellAgentUnavailableError`
-exists so "the agent could not answer" is never read as a statement about the
-capacity. `CellAgentClient` sizes timeouts by what the operation does.
+Agent unavailability is inconclusive: it does not establish that provider
+capacity is absent or failed. `CellAgentUnavailableError` preserves that boundary.
+`CellAgentClient` sizes timeouts by the operation.
 
 The agent also probes execution readiness: `_with_execution_readiness` runs the
 resolver's readiness probe for ready cells, and a failed probe **downgrades** the
@@ -78,7 +77,7 @@ Sibling modules and their jobs:
 | | venv model | OCI model |
 |---|---|---|
 | Python | the fleet, via `runtime.python` | your image |
-| libraries | `runtime.init_commands` + per-job `dependencies` | the image (`runtime.artifacts` adds code) |
+| libraries | `runtime.init_commands` + per-job `dependencies` | image packages plus per-job dependencies (`--with`); workspaces (`--workspace`) are supported |
 | container | none — native venv at `/opt/eyvan-native/venv` | `runtime.container.image` |
 | typical use | fast iteration | pinned, reproducible training runtime |
 

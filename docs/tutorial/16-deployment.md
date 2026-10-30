@@ -4,39 +4,46 @@ Sources: `docs/install.md`, `docs/operate.md`, `deploy/` (`prerequisites.yaml`,
 `migration-job.yaml`, `cell-agent.yaml`, `control-plane.yaml`,
 `helm/eyvan/`), `Dockerfile*`, `docker-compose.yml`, `oci/`.
 
-## The fifteen things a network-bound deployment needs
+## Network deployment prerequisites
 
-A network-bound deployment needs fifteen separately configured things; the local
-`eyvan up` path needs none of them. The headline items (full table in
-`docs/install.md`):
+Configure these for a network-bound deployment. The loopback development path has
+different defaults; see Part 2. Full setup details are in `docs/install.md`:
 
 1. **PostgreSQL** + `EYVAN_DATABASE_URL` — the local store has no cross-replica
    leader election. A network bind with the local backend is refused at startup.
 2. **Schema via `eyvan-migrate`** — production disables auto-create
    (`EYVAN_AUTO_CREATE_SCHEMA`); existing-schema changes need maintenance
    acknowledgement. A revision mismatch fails closed (`SchemaRevisionMismatch`).
-3–6. **OIDC**: `EYVAN_OIDC_ISSUER`, `EYVAN_OIDC_AUDIENCE`, the non-secret
-   `EYVAN_OIDC_DASHBOARD_CLIENT_ID` (the browser is a public PKCE client), and an
-   IdP `eyvan_grants` claim or durable grants from `eyvan grant add`.
-7. **`EYVAN_ARTIFACT_TOKEN_KEY`** — one signing key ≥32 bytes, identical on every
+3. **Authentication** — OIDC, bootstrap bearer authentication, or team accounts.
+   For OIDC, configure `EYVAN_OIDC_ISSUER`, `EYVAN_OIDC_AUDIENCE`, the non-secret
+   `EYVAN_OIDC_DASHBOARD_CLIENT_ID`, and IdP `eyvan_grants` or durable grants from
+   `eyvan grant add`. The dashboard uses a BFF: the server completes the
+   authorization-code/PKCE exchange and keeps provider tokens server-side.
+   Bootstrap identity uses the generated bearer token instead of an OIDC issuer;
+   team accounts require `EYVAN_TEAM_MODE`. Development headers are not a network
+   authentication option.
+4. **Listener TLS** — `EYVAN_TLS_CERT_FILE` and `EYVAN_TLS_KEY_FILE`, or the
+   explicit `EYVAN_INSECURE_PLAINTEXT_BIND=1` acknowledgement. TLS termination at a
+   proxy does not waive this listener requirement.
+5. **`EYVAN_ARTIFACT_TOKEN_KEY`** — one signing key ≥32 bytes, identical on every
    replica (capability tokens are HMACs).
-8. **`EYVAN_ARTIFACT_STORE_URI`** (`gs://...`) — a pod filesystem is not shared.
-9. **`EYVAN_PUBLIC_URL`** over HTTPS — jobs receive capability URLs built from it.
-10. **`EYVAN_TRUSTED_CALLABLE_PROJECTS`** — a pickled callable executes arbitrary
-    code; empty trusts nobody.
-11. **`EYVAN_METRICS_TOKEN`** — `/metrics` requires scrape auth on a network bind.
-12. **Agent shared secret** (`EYVAN_AGENT_SHARED_SECRET`).
-13. **A distinct native-worker root secret** — reusing the agent secret collapses
+6. **`EYVAN_ARTIFACT_STORE_URI`** (`gs://...`) — a pod filesystem is not shared.
+7. **`EYVAN_PUBLIC_URL`** over HTTPS — jobs receive capability URLs built from it.
+8. **`EYVAN_TRUSTED_CALLABLE_PROJECTS`** — a pickled callable executes arbitrary
+   code; network deployments must explicitly trust the submitting projects.
+9. **`EYVAN_METRICS_TOKEN`** — `/metrics` requires scrape auth on a network bind.
+10. **Agent shared secret** (`EYVAN_AGENT_SHARED_SECRET`).
+11. **A distinct native-worker root secret** — reusing the agent secret collapses
     capability boundaries.
-14. **`platform.yaml` + one agent per capacity boundary**, each with its own
+12. **`platform.yaml` + one agent per capacity boundary**, each with its own
     `EYVAN_FLEET_STATE_URI` — shared fleet-state ownership fences competing agents.
-15. **A worker artifact pinned by digest** (Kubernetes) or wheel/wheelhouse
+13. **A worker artifact pinned by digest** (Kubernetes) or wheel/wheelhouse
     SHA-256 + GCS generation (GCP) — tags can be replaced, and private-egress VMs
     cannot reach PyPI.
 
-TLS termination, secret-manager integration, and mTLS in front of every external
-agent are additional platform prerequisites. `eyvan doctor --server-host
-<address>` previews the refusals before anything is running.
+Configure secret-manager integration and authenticated TLS for external agent
+connections separately. `eyvan doctor --server-host <address>` previews server
+startup refusals; it does not validate every deployment dependency.
 
 ## Path A: `eyvan head up` — one GCP VM
 
@@ -119,8 +126,8 @@ restore a backup only as deliberate disaster recovery.
 - `kubectl rollout status` green for control-plane and cell-agent; pods use the
   three verified digests.
 - `/healthz` and `/readyz` through the production ingress (readyz proves database
-  readiness); authenticate a real request via the production OIDC path and verify
-  an unauthorized request is rejected.
+  readiness); authenticate a real request via the configured authentication path
+  and verify an unauthorized request is rejected.
 - Scrape `/metrics` with the configured bearer; confirm current metrics; check
   logs for auth/database errors.
 - The cell agent registers and stays healthy; run one harmless capacity operation.

@@ -75,8 +75,8 @@ DISPATCHING -> RUNNING | CANCELLING | FAILED
 RUNNING -> CHECKPOINTING | SUCCEEDED | CANCELLING | FAILED
 CHECKPOINTING -> RUNNING | SUCCEEDED | CANCELLING | FAILED
 CANCELLING -> SUCCEEDED | CANCELLED | FAILED
-FAILED -> PENDING              (retry)
-SUCCEEDED, CANCELLED           terminal
+FAILED, CANCELLED -> PENDING   (explicit retry)
+SUCCEEDED                     no outgoing transition
 
 Leases:
 PENDING -> ACTIVE | RELEASED | EXPIRED | QUARANTINED
@@ -124,7 +124,7 @@ caller body cannot safely be replayed. Table families: core execution
 `service_decisions`), artifacts/federation (`managed_artifacts`,
 `artifact_references`, `plane_peers`, budget/quota grants).
 
-Migrations: packaged Alembic scripts, current revision `0019_webhooks`
+Migrations: packaged Alembic scripts, current revision `0024_research_plans`
 (`eyvan-migrate` entry point). The repository rejects a stamped revision that does
 not equal the build's head (`SchemaRevisionMismatch`); upgrades run during
 explicitly acknowledged maintenance with writers quiesced; **a failed rollout is

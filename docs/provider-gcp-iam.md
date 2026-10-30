@@ -29,10 +29,8 @@ administration permissions; a purpose-built custom role may be narrower.
 A role label such as Editor is not proof of effective permission: conditional
 grants, deny policies and other IAM bindings also matter.
 
-An observed research-project incident showed successful bootstraps followed by
-403 `setIamPolicy` denials. Those receipts establish the observed change in
-behavior, not the exact IAM policy change that caused it. Check effective
-permissions rather than inferring them from historical success.
+Check effective permissions rather than inferring them from historical
+bootstrap success.
 
 Eyvan checks both `secretmanager.secrets.create` and
 `secretmanager.secrets.setIamPolicy` up front via the read-only

@@ -118,8 +118,8 @@ Determinism is structural, not aspirational:
 
 ### 1.4 Why side-effect-free
 
-Purity is what allows the same function to serve three different call sites
-(see §9): the live admission path, the "explain" path that asks *what would
+Purity is what allows the same function to serve three different call sites:
+the live admission path, the "explain" path that asks *what would
 happen to this workload* without committing anything, and the fenced
 re-validation a preemption controller runs inside a transaction before
 executing a plan. Because the function cannot write, re-running it is always
@@ -238,5 +238,8 @@ fields:
 
 The reservation unit. Carries `resources`, `priority`, `hourly_cost`,
 `reserved_cost` (both validated finite and non-negative), and
-`resource_hours_reserved` (the per-dimension hour vector the accelerator-hour
-budget gate
+`resource_hours_reserved` (the per-dimension hour vector used by the
+accelerator-hour budget gate). It identifies one workload attempt and cell,
+with the charged identity, checkpoint policy, revocability and a non-negative
+`fencing_epoch`. Construction requires non-empty IDs and resources, a positive
+attempt, and finite non-negative costs.

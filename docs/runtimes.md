@@ -16,8 +16,7 @@ prerequisites live in [install](install.md).
 
 The interpreter contract is checked **before provisioning** when
 `runtime.python` is declared: a callable pickled on a different
-`major.minor` is refused at submission, not on the accelerator — a live
-multislice run paid for that lesson once (see [proofs](proofs.md)).
+`major.minor` is refused at submission.
 
 ## Two allocation modes
 
@@ -154,17 +153,23 @@ those files. The image still needs a Python 3.11+ on `PATH` as `python`, and
 
 ## Per-job additions
 
-`TpuConfig(dependencies=("flax",))` installs packages on the cell before
-the callable loads — adding a library should not mean rebuilding an image.
-The job gets its own environment, built from the worker's interpreter and
-layered over the worker's environment (`/opt/eyvan-native/venv`: Eyvan, JAX,
-libtpu) and the host's system packages, so a package it pins wins and
-everything else resolves to what the cell already has. Environments are cached
-per requirement set and interpreter in `/var/lib/eyvan/runtime-envs`, which the
-bootstrap creates for the workload user, so a second job or rank using the same
-interpreter reuses the install. The cache identity includes the format version,
-resolved interpreter path, Python version, and inherited parent site-packages
-paths. Older cache entries remain untouched for jobs that may still use them.
+`TpuConfig(dependencies=("flax",))` installs packages before the callable loads.
+The job gets its own environment, built from the interpreter running the
+wrapper and inheriting that interpreter's packages.
+
+For native venv workers, this includes `/opt/eyvan-native/venv` (Eyvan, JAX,
+libtpu) and the host's system packages. Environments are cached per requirement
+set and interpreter in `/var/lib/eyvan/runtime-envs`, which the bootstrap
+creates for the workload user. A second job or rank using the same interpreter
+can reuse the install. The cache identity includes the format version, resolved
+interpreter path, Python version, and inherited parent site-packages paths.
+Older cache entries remain untouched for jobs that may still use them.
+
+In OCI mode, the environment inherits the image's Python packages, not the
+host venv. Containers are removed after execution; cross-job cache reuse needs
+an explicit persistent mount. The native host cache is not mounted
+automatically.
+
 `@execute(..., workspace="src/")` ships a source tree to the worker's
 working directory for the callable to import.
 

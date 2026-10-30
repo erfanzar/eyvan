@@ -6,8 +6,8 @@ Eyvan is a **capacity plane**: software that sits between "I need this much
 accelerator, shaped this way" and machines actually running your code. You submit
 Python callables with a requested *shape* (for example `TpuConfig(type="v5p-16",
 pods=2, capacity_class=CapacityClass.SPOT)`). The plane asks providers for machines
-matching that shape, boots them into **cells**, dispatches your callable, returns
-your return value, and records a receipt for every claim it makes along the way.
+matching that shape, boots them into **cells**, dispatches your callable, and
+returns its result. Workloads, leases, and audit events record the lifecycle.
 
 It is not a job queue with human babysitting: the plane retries refused capacity on
 its own, reaps idle cells, and reconciles its entire world from durable state after
@@ -28,10 +28,9 @@ its own restart.
 4. **Nothing that decides names a provider.** The scheduler, the planner, and the
    durable model may not special-case any cloud. Backends declare capabilities; the
    core reads them. `tests/test_provider_boundary.py` enforces this.
-5. **Durable everything.** Workloads, cells, leases, and fleet state live in the
-   plane's store. A plane that dies mid-dispatch and comes back reconciles the
-   whole world from it (demonstrated with 113 workloads in the 2026-08-29
-   receipt — `docs/proofs.md`).
+5. **Recover from durable state.** Workloads, cells, leases, and pending commands
+   live in the plane's store. After restart, the controller reconciles those
+   records with agent observations. See `docs/proofs.md` for recovery checks.
 
 ## Architecture
 
@@ -42,7 +41,7 @@ its own restart.
         eyvan-server  ── the plane: API, scheduler, capacity planner,
                 │        controller, durable state
                 ▼
-        eyvan-agent   ── owns machines per backend; reconciles cells
+        eyvan-agent   ── owns machines per backend family; reconciles cells
                 │
         ┌───────┴────────┐
      local backend     GCP backend (queued resources: spot / on-demand)
@@ -55,7 +54,7 @@ Three programs do the work (all are console scripts in `pyproject.toml`):
 |---|---|---|
 | `eyvan` | `eyvan.sdk.cli:main` | The CLI and the SDK's command layer |
 | `eyvan-server` | `eyvan.server.api.app:main` | The control plane: FastAPI app + leader-elected controller |
-| `eyvan-agent` | `eyvan.worker.agent.cli:main` | The cell agent: owns machines for exactly one backend |
+| `eyvan-agent` | `eyvan.worker.agent.cli:main` | The cell agent: owns machines for one backend family |
 
 Plus two support entry points: `eyvan-native-worker` (the worker runtime on an
 acquired machine) and `eyvan-migrate` (schema migrations).
@@ -82,7 +81,7 @@ eyvan/
 | term | meaning |
 |---|---|
 | **plane** | the control plane (`eyvan-server`) — scheduler, planner, state |
-| **agent** | a cell agent (`eyvan-agent`) owning machines on one backend |
+| **agent** | a cell agent (`eyvan-agent`) serving one backend family |
 | **fleet** | a named set of capacity pools you can submit into |
 | **pool** | one (backend, accelerator, capacity class, zone) combination |
 | **cell** | one acquired allocation (e.g. one spot queued resource) — the unit that costs money |
@@ -94,13 +93,12 @@ eyvan/
 
 From `eyvan/capacity/drivers/registry.py`: `local` (loopback laptop fleets),
 `gcp-tpu` (generated zone fleets driving TPU queued resources), `gcp-compute`,
-`gcp` (umbrella), `aws-ec2` (+ `aws`), `azure-vm` (+ `azure`), `kubernetes`/`k8s`,
-`manual`, and `onprem-ssh`.
+`gcp-attach` (existing TPU slices), `gcp` (router), `aws-ec2` (+ `aws`),
+`azure-vm` (+ `azure`), `kubernetes`/`k8s`, `manual`, and `onprem-ssh`.
 
-Breadth and qualification are different axes: GCP TPU is the substrate with the
-deepest receipts; Kubernetes runs on any conformant cluster but its live evidence
-is one GKE run (proof P7); the on-premises path is code with no run against a real
-SSH host yet. `docs/proofs.md` keeps the honest ledger per backend.
+A registered backend is not evidence that a particular account, network, image,
+or accelerator works. Use `docs/proofs.md` to select checks for the backend and
+build you intend to deploy.
 
 ## A workload's full journey
 

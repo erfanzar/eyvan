@@ -38,17 +38,20 @@ not import another backend's dependencies. Built-ins are registered in
 
 | Registered names | Driver and substrate | Notable behavior |
 |---|---|---|
-| `gcp`, `gcp-tpu`, `tpu` | GCP TPU queued-resource driver | TPU queued resources; native or configured execution |
-| `gcp-compute`, `compute` | GCP Compute Engine driver | One VM per cell; CPU/GPU/TPU machine shapes |
-| `kubernetes`, `k8s` | Kubernetes driver | One Indexed Job per cell; Kueue is the capacity-admission boundary |
-| `aws-ec2`, `aws`, `ec2` | AWS EC2 driver | One instance per cell |
+| `gcp`, `gcp-tpu` | GCP router / TPU queued-resource driver | TPU queued resources; native or configured execution |
+| `gcp-compute` | GCP Compute Engine driver | One VM per cell; CPU/GPU/TPU machine shapes |
+| `gcp-attach` | Existing GCP TPU slice | Observes an operator-owned slice; release does not delete it |
+| `kubernetes`, `k8s` | Kubernetes driver | One Indexed Job per cell; Kueue admission only with `queue_name` configured |
+| `aws-ec2`, `aws` | AWS EC2 driver | One instance per cell |
 | `azure-vm`, `azure` | Azure VM driver | One VM per cell |
 | `local` | Local development driver | Logical, unisolated cell on the agent host |
 | `manual` | Fixed operator-declared hosts | Provisions/deletes nothing |
 | `onprem-ssh` | SSH-claimed operator-owned hosts | Fenced remote marker; optional start/stop commands |
 
-The registry normalizes case and underscores to hyphens. Execution names are a
-separate vocabulary: `local`/`local-process` canonicalize to `native-local`, and
+The registry normalizes case and underscores to hyphens. `tpu`, `compute` and
+`ec2` are agent-family aliases in `base.py`, not registered backend names.
+Execution names are a separate vocabulary: `local`/`local-process` canonicalize
+to `native-local`, and
 `native`, `native-remote`, `native-worker`, `eyvan` to `eyvan-native`.
 Retired `ray`/`rayjobs` names canonicalize to `ray-jobs` and remain a refused
 backend rather than an unknown typo. Out-of-tree providers are opt-in through
@@ -64,18 +67,21 @@ replayed creates use idempotency; provider state belonging to another
 incarnation is a leak and is recreated, not adopted; an unreachable provider is
 unknown/inconclusive, not absent.
 
-* **GCP.** The router shares one factory for TPU and Compute modes. TPU queued
-  resources use a provider management UID and generation; Compute uses a VM
-  identity and startup configuration. Native-worker endpoint, secret, artifact,
+* **GCP.** The router shares one factory for TPU queued-resource, Compute and
+  attached-TPU modes. TPU queued resources use a provider management UID and
+  generation; Compute uses a VM identity and startup configuration.
+  `gcp-attach` observes an existing operator-owned TPU slice: drain retains an
+  unschedulable local claim, and release tombstones the claim. Neither operation
+  deletes or stops the TPU or its workers. Native-worker endpoint, secret, artifact,
   service-account, ingress, bootstrap, and runtime options are persisted with the
   incarnation. TPU placement distinguishes stockout, quota, queue admission,
   preemption, and provider-unavailable failures.
 * **Kubernetes.** The cell is an Indexed Job. Durable Eyvan fencing is not
   substituted by `resourceVersion`; Jobs carry generation labels and a fencing
-  fingerprint annotation for leak detection. Eyvan delegates *capacity*
-  admission to Kueue, but retains workload admission and preemption policy. The
-  ClusterQueue used by Eyvan must be exclusively Eyvan's with preemption
-  disabled. Unreadable cluster capacity is UNKNOWN, never full.
+  fingerprint annotation for leak detection. When `queue_name` is configured,
+  Eyvan delegates *capacity* admission to Kueue but retains workload admission
+  and preemption policy. That ClusterQueue must be exclusively Eyvan's with
+  preemption disabled; without `queue_name`, this Kueue admission path is unused. Unreadable cluster capacity is UNKNOWN, never full.
 * **AWS EC2.** `RunInstances` is one instance per cell, ownership is encoded in
   cell/generation/fence tags, and the same client token makes launch replay
   idempotent. Spot reclamation is `PREEMPTED`, not a generic loss. The hand-rolled

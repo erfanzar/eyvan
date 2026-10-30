@@ -25,32 +25,6 @@
    - [Jobs & callable submission](#68-jobs--callable-submission)
 7. [Supporting SDK modules](#7-supporting-sdk-modules)
 8. [CLI reference (`eyvan ...`)](#8-cli-reference)
-   - [Top-level entry point](#80-top-level-entry-point)
-   - [workloads](#81-eyvan-workloads)
-   - [start](#82-eyvan-start)
-   - [state](#83-eyvan-state)
-   - [resources](#84-eyvan-resources)
-   - [capacity](#85-eyvan-capacity)
-   - [fleets & fleet-status](#86-eyvan-fleets--fleet-status)
-   - [autoscale](#87-eyvan-autoscale)
-   - [head & head-discovery](#88-eyvan-head)
-   - [connect](#89-eyvan-connect)
-   - [contexts](#810-eyvan-contexts)
-   - [dashboard](#811-eyvan-dashboard)
-   - [deployment](#812-eyvan-deployment)
-   - [doctor](#813-eyvan-doctor)
-   - [federation](#814-eyvan-federation)
-   - [governance](#815-eyvan-governance)
-   - [http](#816-eyvan-http)
-   - [operations](#817-eyvan-operations)
-   - [proof](#818-eyvan-proof)
-   - [query](#819-eyvan-query)
-   - [receipts](#820-eyvan-receipts)
-   - [runtime](#821-eyvan-runtime)
-   - [services](#822-eyvan-services)
-   - [soak & soak-monitor](#823-eyvan-soak--soak-monitor)
-   - [tenancy](#824-eyvan-tenancy)
-   - [artifacts](#825-eyvan-artifacts)
 9. [Appendix: shared CLI helpers](#9-appendix-shared-cli-helpers)
 10. [Cross-cutting HTTP behavior](#10-cross-cutting-http-behavior)
    - [Authentication](#101-authentication)
@@ -146,8 +120,8 @@ _(partial.)
 
 ## 8. CLI reference
 
-_(partial; the TOC preserves the intended command-family coverage, but this
-page is not a complete option reference. Run `eyvan <command> --help` against
+_(partial; this page is not a complete option reference.
+Run `eyvan <command> --help` against
 the installed version for authoritative options and defaults.)_
 
 ## 9. Appendix: shared CLI helpers

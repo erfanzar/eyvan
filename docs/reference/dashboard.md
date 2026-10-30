@@ -44,9 +44,13 @@ and retryable error states.
 ## Hash routing (without a router)
 
 `dashboard/src/routing.ts` defines the route union and the sections
-`overview`, `workloads`, `fleet`, `capacity`, `billing`, `budgets`, and `audit`.
-It parses `#/section` and `#/workloads/<id>` (decoding the workload ID), and
-`routeHash`/`navigate` write the corresponding hash. Unknown sections fall
+`overview`, `workloads`, `runs`, `research`, `fleet`, `capacity`, `billing`,
+`budgets`, `audit`, `assistant`, and `settings`. Detail routes include
+`#/workloads/<id>`, `#/research/<id>`, and `#/runs/<id>` with optional
+`episodes`, `histograms`, `rollouts`, `completions`, or `media` tabs (charts
+are the default). IDs are decoded on read and encoded on navigation.
+`#/users` is a compatibility alias for Settings. `routeHash`/`navigate` write
+the corresponding hash. Unknown sections fall
 back to Overview. `App` listens for `hashchange`; `accessibleRoute` applies
 server-derived section availability before rendering. Workload IDs are
 `encodeURIComponent`-encoded when navigated.
@@ -76,11 +80,14 @@ control-plane contracts, not an independent source of truth.
 
 ## Authentication and authorization
 
-`AuthGate` (`dashboard/src/auth/AuthGate.tsx`) first absorbs a loopback
-credential from the URL fragment and loads `/api/v1/dashboard/config` when
-baked OIDC settings are incomplete. It then calls `serverIdentity()` in
-`dashboard/src/auth/oidc.ts` to probe `/api/v1/session` before rendering `App`
-for an OIDC session; a refused or missing session shows the sign-in screen.
+`AuthGate` (`dashboard/src/auth/AuthGate.tsx`) absorbs a loopback credential
+from the URL fragment, loads team-mode state and `/api/v1/dashboard/config`
+when baked OIDC settings are incomplete, then calls `serverIdentity()` in
+`dashboard/src/auth/oidc.ts` to probe `/api/v1/session`. A team password session
+uses its own HttpOnly cookie identity. Invite links open the acceptance screen
+before the application; signed-out team users see password login and, when
+configured, an OIDC sign-in option. Otherwise a refused or missing OIDC session
+shows the OIDC sign-in screen.
 
 OIDC uses a backend-for-frontend boundary. `beginLogin()` navigates to
 `/api/v1/dashboard/auth/login`; the server performs issuer discovery and

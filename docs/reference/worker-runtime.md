@@ -14,13 +14,13 @@ Module map (all paths relative to the repository root):
 | `eyvan/worker/agent/client.py` | HTTP client the control plane uses to talk to agents |
 | `eyvan/worker/agent/cli.py` | CLI entry point that runs the agent |
 | `eyvan/worker/agent/models.py` | Pydantic request/response models for the agent API |
-| `eyvan/worker/agent/service.py` | `WorkerAgentService`: business logic behind the routes |
+| `eyvan/worker/agent/service.py` | `CellAgentService`: business logic behind the routes |
 | `eyvan/worker/distributed_environment.py` | Multi-host distributed environment construction (JAX coordination) |
 | `eyvan/worker/identity.py` | Worker identity and attestation helpers |
 | `eyvan/worker/runtime/native_worker.py` | Native (bare-metal) single-host worker execution |
 | `eyvan/worker/runtime/native_gang.py` | Native gang execution across hosts |
 | `eyvan/worker/runtime/native_slice.py` | TPU slice execution model |
-| `eyvan/worker/runtime/native_remote.py` | Remote native worker over SSH |
+| `eyvan/worker/runtime/native_remote.py` | HTTP(S) execution client for a remote native worker |
 | `eyvan/worker/runtime/native_bootstrap.py` | Bootstrap payload executed on native hosts |
 | `eyvan/worker/runtime/container.py` | Container (OCI) worker execution |
 | `eyvan/worker/runtime/local_process.py` | Local subprocess execution |
@@ -87,13 +87,10 @@ The agent's deliberate answers are status codes with a machine-readable
 | 502 | `CapacityProviderError` | `CapacityProviderFailure` (`detail`, `code: CapacityProviderFailureCode`) | `CellAgentCapacityProviderError` (provider failure, operator-safe) |
 | any other 5xx, transport error | agent itself failing | unstructured | `CellAgentUnavailableError` — *nothing was learned* |
 
-The taxonomy is the point, and the code documents why with observed
-incidents: a transport failure or bare 5xx recorded as a provider error made
-the control plane retire capacity the provider never lost (a v5p-16 Spot
-Multislice granted after a 100-minute queue was discarded over one DNS
-hiccup on 2026-08-01), and an unstructured 500 hid a one-line YAML mistake
-behind `"Internal Server Error"`. `CellAgentUnavailableError` exists so "the
-agent could not answer" is never read as a statement about the capacity.
+Agent unavailability is not provider failure. A transport error or bare 5xx
+means the agent could not answer; it is not evidence that capacity was lost.
+Typed configuration and provider failures remain distinct so an operator can
+act on the cause without retiring capacity by inference.
 
 ### 1.3 Route inventory
 
@@ -248,11 +245,9 @@ agent must never be handed a field it would persist and then fail to read
 back. The compensating rule lives on the client: `CellAgentClient._wire`
 serializes every request with `exclude_none=True`, so an omitted optional
 field parses to exactly the same object on a matching agent, while an agent
-that predates the field accepts the payload. Sending explicit `null` cost a
-real run — a head one commit ahead sent `runtime.python: null` to an agent
-whose `NativeRuntimeConfig` had no such field, every allocation died on
-`extra_forbidden`, and the operator was told "provider rejected capacity
-request" about a provider that had never been called.
+that predates the field accepts the payload. Sending explicit `null` for an
+unknown optional field can instead trigger `extra_forbidden` before any
+provider call; that protocol refusal is not provider rejection.
 
 New information therefore travels on **new routes** (which old agents
 answer 404 and old clients never call) rather than new fields on
@@ -461,8 +456,9 @@ or a fence change yields an unproven result, never a false cache hit.
 
 ## 7. Secret materialization
 
-`materialize_secrets` runs in the agent before launch. Dispatch supplies one
-short-lived capability per declared mount; the worker redeems it and places
+`materialize_secrets` runs in the native worker's execution backend before
+launch (`systemd_transient.py:_resolved_launch_environment`). Dispatch supplies
+one short-lived capability per declared mount; the worker redeems it and places
 the resulting text value in the private environment file. Capability scaffolding
 (`EYVAN_SECRET_*`) is removed before the job starts and secrets are not put in
 argv, unit definitions, or durable records. Names must be valid environment
@@ -497,10 +493,13 @@ Live logs are backend-native: plain text is supplied by `logs`, while
 `StructuredLogExecutionDriver.log_page` supplies resumable `LogRecord` pages.
 Journald provides the body and opaque cursors; the control plane retains an
 index and archives terminal-attempt logs so cell release does not destroy
-history. Cursor decoding rejects malformed, mismatched, oversized, or changed
-attempt/topology cursors—clients must request a fresh cursor, never silently
-restart from the beginning. A backend without structured logs is reported as
-501, distinct from a workload with no output.
+history. Malformed, mismatched or oversized cursors produce typed refusals.
+An attempt change reports `attempt_changed` and restarts at empty positions;
+a legacy cursor with unknown topology may also need a reset. Bound cursors
+reject a different topology digest; legacy cursors do not carry that full
+binding. Fully bound v2 emission is opt-in through
+`EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED` (off by default). A backend without
+structured logs is reported as 501, distinct from a workload with no output.
 
 ## 10. Node health
 

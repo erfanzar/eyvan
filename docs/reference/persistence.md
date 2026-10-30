@@ -62,7 +62,7 @@ refused until reloaded; it is never silently treated as a failed write.
 A companion `.lock` file is held with a non-blocking `fcntl.flock`.  Thus only
 one local server process may own a state document; a second server receives
 `LocalControlPlaneInUseError`.  The document has its own versioned format (the
-current feature versions are 1 through 6, selected to preserve all collections)
+supported versions are 1 through 11, selected to preserve all collections)
 and is not the PostgreSQL schema.
 
 ### PostgreSQL (`SqlAlchemyRepository`)
@@ -140,7 +140,14 @@ indexes, and bounded sweeps.
 - **Delivery and history:** `idempotency_keys` (`IdempotencyRecord`),
   `outbox` (`OutboxRecord`), and `audit_events` (`AuditEvent`).  Idempotency is
   keyed by scope/operation/key; the outbox couples backend commands to domain
-  commits; audit events have a monotonic sequence and are immutable.
+  commits; audit events have a monotonic sequence and are immutable. `webhooks`
+  stores scoped subscriptions and delivery cursors.
+- **Team accounts and requests:** `users`, `invites`, `api_tokens`, and
+  `team_requests` store accounts, invitations, revocable tokens, and
+  capacity/approval requests.
+- **Assistant and research:** `assistant_providers`,
+  `assistant_conversations`, and `research_plans` store provider configuration,
+  user-owned conversations, and budgeted research plans.
 - **Execution evidence and operations:** `progress_reports` (latest report
   per workload/rank), `workload_topologies` (frozen rank map per workload/
   attempt), `cell_stages` (one asset per cell), `credential_rotations` (one
@@ -158,11 +165,13 @@ indexes, and bounded sweeps.
 
 Packaged Alembic scripts live in
 `eyvan/server/persistence/migrations/versions/`.  The current SQL revision is
-`SCHEMA_REVISION = "0019_webhooks"`; the migration sequence includes the
+`SCHEMA_REVISION = "0024_research_plans"`; the migration sequence includes the
 transactional outbox, capacity pools and query indexes, retention columns,
 artifact/federation/tenant and grant support, progress and audit history,
 scoped artifact identity/lifecycle, attempt topology, cell staging, credential
-rotation, expansion admissions, service operations, and webhooks.
+rotation, expansion admissions, service operations, and webhooks. Revisions
+0020–0024 add team accounts, team requests, assistant providers, assistant
+conversations, and research plans.
 
 Use the packaged `eyvan-migrate` entry point (or `persistence/migrate.py`), which
 uses `EYVAN_DATABASE_URL` or the documented local-development default

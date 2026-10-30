@@ -1,10 +1,11 @@
 # Part 5 — The domain layer and scheduling
 
-`eyvan/domain/` is the pure policy core: immutable objects in, decisions out, no
-I/O, no clock, no randomness, no provider names. The server-side adapter
-(`eyvan/server/service/scheduling.py`, `CoreSchedulingService`) converts persisted
-records into domain objects, runs the scheduler, and commits the proposals; the
-controller realizes them through fenced reconciliation.
+`eyvan/domain/` holds provider-neutral policy. Scheduler decisions take immutable
+snapshots and return proposals without I/O, a clock, or randomness. Availability
+helpers can use the current time when no timestamp is supplied. The server-side
+adapter (`eyvan/server/service/scheduling.py`, `CoreSchedulingService`) converts
+persisted records into domain objects, runs the scheduler, and commits the
+proposals; the controller realizes them through fenced reconciliation.
 
 Module map:
 

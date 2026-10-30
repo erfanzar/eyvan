@@ -36,8 +36,8 @@ is happy with the defaults never has to name it. Resolution order for the plane
 
 The returned `ExecutionContext` carries the winning `base_url`, so you always know
 which plane you are submitting to. Passing both `address` and `base_url` is an
-error, not a silent winner; `artifact_uri` and `artifact_store` are mutually
-exclusive. Two safety rules worth knowing:
+error only when their values differ; `artifact_uri` and `artifact_store` are
+mutually exclusive. Two safety rules worth knowing:
 
 - On a **loopback** plane with no explicit identity, the SDK/CLI default to the
   `fleet_admin` role (it is your own dev plane). Anything naming a token or remote
@@ -106,7 +106,7 @@ result = run(epochs=3)      # blocks; live progress lines; returns your value
 job = run.submit(epochs=3)            # alias: run.remote(...)
 job.id                                # workload id
 job.status()                          # WorkloadState
-job.logs()                            # flattened, globally-ranked log stream
+job.logs()                            # currently available logs as a string
 job.wait(timeout=600, progress=True)  # blocking wait, same narration
 job.result(timeout=3600)              # your value or EyvanJobError
 job.cancel()                          # durable cancel
@@ -115,8 +115,9 @@ job.cancel()                          # durable cancel
 Errors: `EyvanJobError` (terminal failure — the message contains the provider's
 own sentence), `EyvanPlacementError` (actionable: names the types/fleets that
 *are* placeable and suggests `eyvan use FLEET`), `EyvanUnavailableError` (the
-plane could not be reached). The job also exposes its transport (`.base_url`) so
-tooling built on the SDK can follow the same plane.
+plane could not be reached). `EyvanJob` has no `.base_url` attribute. Keep the
+`ExecutionContext` returned by `init()` and read its `.base_url` when tooling
+needs the resolved plane URL.
 
 ## In-job helpers
 
@@ -154,11 +155,13 @@ Compatibility: requests carry `X-Eyvan-Client-Version`; a server with
 TpuConfig(
     type="v5p-16", pods=2,
     checkpointable=True,
-    checkpoint_hook="my_module.save_checkpoint",   # real hook, or no protection
+    checkpoint_hook="python -m my_module.save_checkpoint",  # shell command
     checkpoint_output_uri="gs://my-bucket/checkpoints/",
 )
 ```
 
+The hook is a shell command, not a Python import path. The runtime passes its
+output location in `EYVAN_CHECKPOINT_URI` (empty when no output URI was supplied).
 The scheduler grants preemption-checkpoint time (`ON_PREEMPTION` policy) only when
-a real hook is named; otherwise a reclaimed spot job restarts from zero — declared
-honestly rather than pretended.
+a real hook is named. The workload must save and restore its checkpoint; merely
+setting `checkpointable=True` does not implement recovery.

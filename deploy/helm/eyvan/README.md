@@ -117,6 +117,16 @@ provider behavior, accelerator compatibility, TPU/GPU runtime behavior, or
 performance. Qualify those separately in the exact target environment without
 editing the release receipt.
 
+## Listener TLS prerequisite
+
+Before either install example, create a TLS Secret in the release namespace
+containing `tls.crt` and `tls.key` for the control-plane listener. The chart
+references it through `controlPlane.tls.existingSecret`; it does not create
+certificates. A network-bound plane refuses startup without listener TLS or
+an explicit `controlPlane.insecurePlaintextBind=true` acknowledgement. External
+TLS termination alone does not bypass that refusal; protect any plaintext hop
+when using the reviewed exception.
+
 ## GCP capacity mode
 
 `cellAgent.enabled` defaults to `false`; set an external mTLS agent endpoint or
@@ -137,6 +147,7 @@ helm upgrade --install eyvan ./deploy/helm/eyvan \
   --namespace eyvan-system --create-namespace --wait --wait-for-jobs \
   --set-string image.repository="$EYVAN_CONTROL_PLANE_REPOSITORY" \
   --set-string image.digest="$EYVAN_CONTROL_PLANE_DIGEST" \
+  --set-string controlPlane.tls.existingSecret=eyvan-listener-tls \
   --set-string agentImage.repository="$EYVAN_AGENT_REPOSITORY" \
   --set-string agentImage.digest="$EYVAN_AGENT_DIGEST" \
   --set-string controlPlane.publicUrl=https://eyvan.example.com \
@@ -181,6 +192,7 @@ helm upgrade --install eyvan ./deploy/helm/eyvan \
   --namespace eyvan-system --create-namespace --wait --wait-for-jobs \
   --set-string image.repository="$EYVAN_CONTROL_PLANE_REPOSITORY" \
   --set-string image.digest="$EYVAN_CONTROL_PLANE_DIGEST" \
+  --set-string controlPlane.tls.existingSecret=eyvan-listener-tls \
   --set-string agentImage.repository="$EYVAN_AGENT_REPOSITORY" \
   --set-string agentImage.digest="$EYVAN_AGENT_DIGEST" \
   --set cellAgent.enabled=true \

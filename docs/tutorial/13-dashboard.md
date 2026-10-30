@@ -17,10 +17,12 @@ converts control-plane snake_case JSON into the UI types of `types.ts`.
 
 ## Hash routing without a router
 
-`routing.ts` defines sections `overview`, `workloads`, `fleet`, `capacity`,
-`billing`, `budgets`, `audit`, parsing `#/section` and `#/workloads/<id>` (the
-workload id is `encodeURIComponent`-encoded). Unknown sections fall back to
-Overview; `App` listens to `hashchange`; `accessibleRoute` applies server-derived
+`routing.ts` defines sections `overview`, `workloads`, `runs`, `research`,
+`fleet`, `capacity`, `billing`, `budgets`, `audit`, `assistant`, and `settings`.
+Detail routes are `#/workloads/<id>`, `#/runs/<id>[/<tab>]`, and
+`#/research/<id>`; IDs are `encodeURIComponent`-encoded. Run tabs include charts,
+episodes, histograms, rollouts, completions, and media. Unknown sections fall back
+to Overview; `App` listens to `hashchange`; `accessibleRoute` applies server-derived
 section availability before rendering, so forbidden sections are removed from
 navigation and inaccessible routes project back to Overview. Hash routing means
 the server needs no per-page rewrite rules (Part 9).

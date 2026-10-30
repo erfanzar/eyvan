@@ -39,8 +39,11 @@ secrets. Binding wider is **refused at startup** until:
   election),
 - `EYVAN_METRICS_TOKEN` (a network `/metrics` requires scrape auth),
 - `EYVAN_ARTIFACT_TOKEN_KEY` (capability tokens must be replica-stable),
+- `EYVAN_TLS_CERT_FILE` and `EYVAN_TLS_KEY_FILE`, or the explicit
+  `EYVAN_INSECURE_PLAINTEXT_BIND=1` opt-in. A reverse proxy does not waive this
+  listener requirement.
 
-plus the OIDC and artifact-store prerequisites enumerated in Part 16. `eyvan
+Also configure authentication and the artifact store as described in Part 16. `eyvan
 doctor --server-host 0.0.0.0` names every refusal before you start — the same list
 the server would refuse with, asked in advance.
 
@@ -83,8 +86,10 @@ state** — do not read a design as a provider claim:
 
 A few concrete places where the posture is enforced rather than hoped for:
 
-- Dev-auth headers are gated by `is_own_dashboard_request()` — same-origin fetch,
-  loopback literal Host — defending against DNS rebinding (Part 9).
+- `is_own_dashboard_request()` restricts the default browser development identity
+  to the plane's own dashboard. Explicit dev-auth headers do not require this
+  predicate. On the automatic loopback dev-auth path, the separate local
+  credential check still applies (Part 9).
 - The worker's stage-actions route enforces the `EYVAN_CELL_STAGE_SOURCES`
   allowlist (empty by default) so it can never become an arbitrary-read primitive
   (Part 10).
@@ -94,6 +99,7 @@ A few concrete places where the posture is enforced rather than hoped for:
   standalone SDK/API, including on loopback planes. Optional low-level HMAC
   helpers require a custom producer/verifier protocol; the standalone controller
   does not distribute callable signing keys.
-- `EYVAN_TRUSTED_CALLABLE_PROJECTS`: a pickled callable executes arbitrary code;
-  empty trusts nobody — callable submissions are refused until projects are
-  explicitly trusted (command workloads still run).
+- `EYVAN_TRUSTED_CALLABLE_PROJECTS`: a pickled callable executes arbitrary code.
+  Network deployments refuse callable submissions until projects are explicitly
+  trusted. Automatic loopback development also trusts `default/default`, even
+  when this setting is empty. Command workloads do not require callable trust.

@@ -27,7 +27,8 @@ All under `/api/v1` unless noted:
 
 - **system**: `/health`, `/build`, `/session`, `/query`, `/process/stacks`,
   `/process/allocations`, `/dashboard/config`, `/system/invariants`,
-  `/system/soak-evidence`, `/system/reconcile`, `/secrets/rotate`, `/metrics`.
+  `/system/soak-evidence`, `/system/reconcile`, `/secrets/rotate`;
+  Prometheus metrics are at `/metrics`, outside `/api/v1`.
 - **workloads**: submit/estimate/list/get/children/progress/endpoints/exec/
   log-page/process-status/cancel/kick/checkpoint/retry, plus
   `/workloads/{id}/logs/stream`.
@@ -42,25 +43,36 @@ All under `/api/v1` unless noted:
   projects, budgets, quotas, webhooks, leases, peers, cross-plane grants.
 - **events**: `/events`, `/fleet/events`, and SSE `/events/stream`.
 
-## The four authentication paths (`auth.py`)
+## Authentication paths (`auth.py`)
 
-1. **OIDC** — `OIDCTokenVerifier` validates issuer, audience (`EYVAN_OIDC_AUDIENCE`),
-   expiry, and signature via the issuer's JWKS (RS256/ES256). An `eyvan_grants`
-   claim maps to role grants — roles need an authoritative source.
-2. **Bootstrap token** — a head started with bootstrap identity accepts its
-   generated secret as a bearer for the fixed `eyvan-bootstrap` principal
-   (`Role.FLEET_ADMIN`). Possession-of-secret only; the caller cannot self-assign
-   roles. Comparison is `secrets.compare_digest` so hostile input yields 401, not
-   a 500.
-3. **Development auth** — `X-Eyvan-User` / `X-Eyvan-Roles` / `X-Eyvan-Org` /
-   `X-Eyvan-Project` headers, only when development auth is enabled, and guarded
-   by `is_own_dashboard_request()` (same-origin `Sec-Fetch-Site`, non-navigate
-   mode, loopback literal Host — anti-DNS-rebinding). Development auth is refused
-   on a network bind.
-4. **Local credential** — once a `LocalDevelopmentCredential` (0600 file) is
-   issued on a loopback plane, *every* caller must present it as
-   `X-Eyvan-Local-Credential` — including the plane's own dashboard. Possession of
-   the port or identity headers alone is not authentication.
+A presented bearer token takes precedence over cookies and development auth:
+
+- **Team tokens** — with team mode enabled, `eyv_...` bearer tokens resolve
+  against team accounts. Invalid, expired, or revoked tokens return 401; they do
+  not fall through to OIDC.
+- **Bootstrap token** — a head started with bootstrap identity accepts its
+  generated secret for the fixed `eyvan-bootstrap` principal (`Role.FLEET_ADMIN`).
+  The caller cannot self-assign roles. Comparison uses `secrets.compare_digest`.
+- **OIDC bearer** — `OIDCTokenVerifier` validates issuer, audience
+  (`EYVAN_OIDC_AUDIENCE`), expiry, and signature via JWKS (RS256/ES256). An
+  `eyvan_grants` claim supplies role grants.
+
+Without a bearer token, the server checks the team-session cookie when team mode
+is enabled, then the OIDC BFF session cookie. Cookie-authenticated writes require
+an Origin matching `EYVAN_PUBLIC_URL`. The OIDC BFF keeps provider tokens
+server-side; the browser holds an HttpOnly cookie (Part 13).
+
+**Development auth** is the final fallback and is refused on a network bind.
+Explicit `X-Eyvan-User` / `X-Eyvan-Roles` / `X-Eyvan-Org` /
+`X-Eyvan-Project` headers supply the development identity. The
+`is_own_dashboard_request()` predicate controls only the default identity for the
+plane's own dashboard; explicit dev headers do not require that predicate.
+
+On the automatic loopback development-auth path, an issued
+`LocalDevelopmentCredential` (0600 file) must be presented as
+`X-Eyvan-Local-Credential`, including by the plane's dashboard. The local-credential
+check is separate from the dashboard predicate. Bearer and authenticated cookie
+paths return before this check and do not require the local credential.
 
 Authorization: `authenticated_principal()` unions OIDC claims with plane-issued
 durable grants, resolved per request (no cache), so `eyvan grant revoke` takes

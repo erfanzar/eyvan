@@ -46,11 +46,10 @@ or make an untrusted pickle safe.
   key distribution or end-to-end standalone signature authentication: the
   standalone controller does not distribute a producer/verifier key.
 - **Plane → agent:** bearer authentication with
-  `EYVAN_AGENT_SHARED_SECRET`. A mismatch does not fail closed silently —
-  it 401-loops visibly in both logs (receipt: 2026-08-29, a bare
-  `eyvan-server` restart against a profiled agent; fixed by restarting the
-  plane with the profile's secret). `--allow-unauthenticated` on the agent
-  exists for local development only.
+  `EYVAN_AGENT_SHARED_SECRET`. A credential mismatch is rejected with HTTP 401.
+  Restore the matching shared secret before restarting the plane.
+  `--allow-unauthenticated` on the agent exists for loopback local development
+  only.
 - **Agent → native workers:** a separate root secret
   (`EYVAN_NATIVE_WORKER_ROOT_SECRET`) fences worker initialization.
 
@@ -62,7 +61,10 @@ or make an untrusted pickle safe.
 | `EYVAN_NATIVE_WORKER_ROOT_SECRET` | agent | native worker bring-up |
 | `EYVAN_ARTIFACT_TOKEN_KEY` | plane | artifact store tokens |
 | `EYVAN_METRICS_TOKEN` | metrics clients | metrics scrape auth |
-| `EYVAN_BOOTSTRAP_TOKEN` | plane bootstrap | first-touch provisioning |
+| `EYVAN_BOOTSTRAP_TOKEN` | plane and admin clients | authenticates a global fleet-admin principal on every request |
+
+Treat the bootstrap token as a full administrator credential, not a one-time
+provisioning token. It remains usable for authenticated requests while configured.
 
 Secrets enter via environment or the runtime profile
 (`~/.eyvan/gcp-native-runtime.json`, written `0600`), never via fleet configs

@@ -13,11 +13,10 @@ The SDK stages callables and workspaces to **digest-named** objects — e.g.
 
 - A pre-existing object under a digest name is fetched and **re-hashed**; a
   corrupted or foreign object is rejected, never trusted.
-- Identical callables deduplicate to one object. On 2026-08-29 three zones raced
-  one identical callable at the same instant: the losers' `--no-clobber` uploads
-  answered `HTTPError 412` and crashed submission — fixed in `e7abd59` so the
-  loser verifies the winner's digest and continues. Pinned by three tests in
-  `tests/test_callable_execution.py`.
+- Identical callables deduplicate to one object. If a concurrent upload wins the
+  race and `--no-clobber` returns `HTTPError 412`, the losing submitter fetches
+  and verifies the stored digest before continuing. A mismatch is rejected.
+  Tests in `tests/test_callable_execution.py` cover concurrent submissions.
 
 CLI failures travel with their own words: `GcsCommandError` carries the failing
 command and its stderr.
@@ -75,11 +74,12 @@ Specific capability surfaces:
 
 ## Secret rotation
 
-`POST /secrets/rotate` (`server/api/app.py`) is **materialless**: replicas mint
-their own key material, and the request body carries only the overlap window —
-no secret value ever travels through the API. Rotation state is durable
-(`credential_rotations` table, one generation per credential); `eyvan/identity/`
-holds the rotation and mTLS machinery.
+`POST /api/v1/secrets/rotate` (`server/api/app.py`) requires fleet-management
+permission but returns **503**: deployment-wide signing credential rotation is
+not implemented. It changes neither signing material nor the rotation ledger.
+The missing shared credential distribution and startup recovery cannot be
+replaced by minting a new key in one replica. `eyvan/identity/` contains low-level
+rotation and mTLS helpers, not a working deployment-wide rotation procedure.
 
 ## Tenancy guarantees
 

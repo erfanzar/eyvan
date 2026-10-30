@@ -35,52 +35,58 @@ territory.
 | `eyvan capacity pool list/get`, `eyvan capacity cell get`, `eyvan capacity ingress list/release` | pool/cell/ingress detail |
 | `eyvan gcp browse [--project P] [--json]` | list existing TPU VMs and unreachable locations; a terminal can pick and confirm attachment, while JSON/non-TTY use only lists |
 | `eyvan gcp connect --tpu NAME [--project P] [--zone Z] --dry-run` | preview attaching an existing TPU without creating, stopping or deleting it |
-| `eyvan gcp connect --ssh user@host --cpus N --memory-gib N --dry-run` | preview a reserved CPU fleet backed by an already-prepared native-worker host |
+| `eyvan gcp connect --ssh user@host --dry-run` | discover a TPU slice or preview a prepared CPU native-worker host; CPU/memory overrides are optional |
 
 ### Attach existing hardware
 
 ```bash
 eyvan gcp browse --project my-project --json
 eyvan gcp connect --tpu my-tpu --project my-project --zone us-east5-a --dry-run
-eyvan gcp connect --tpu my-tpu --project my-project --zone us-east5-a --yes
+eyvan gcp connect --tpu my-tpu --project my-project --zone us-east5-a
 # Once ready, use the printed fleet name in init(fleet="...").
 ```
 
 TPUs must be READY and have a shipped catalog shape and an address on every
 host. Their actual Spot/on-demand/reserved class is retained. A missing zone is
 resolved from project inventory; ambiguous names or unreachable locations require
-an explicit `--zone`. `--endpoint-mode public` is the default: the CLI reuses the
-profile-owned laptop IPv4 `/32` ingress rule and adds its tag. `internal` skips
-that ingress and uses internal addresses for workers and SSH/SCP.
+an explicit `--zone`. For `--tpu`, `--endpoint-mode public` is the default: the CLI
+reuses the profile-owned laptop IPv4 `/32` ingress rule and adds its tag.
+`internal` uses internal addresses for workers and SSH/SCP. For a TPU discovered
+through `--ssh`, the CLI probes worker reachability and may select an SSH tunnel;
+`--endpoint-mode tunnel` explicitly selects that route and requires `--ssh`.
 
 Execution builds the local worker wheel, copies it to every host, delivers a
 per-incarnation token over SSH stdin into a root-owned `0600` file, and reuses the
 native-worker Python/venv/systemd bootstrap. It requires the local native GCP
 runtime profile (`eyvan runtime init`) and passwordless sudo on the TPU hosts.
-The wheel uses `scp --worker=all`; stdin-bearing SSH calls select each worker
-separately so parallel SSH children cannot consume one another's private input.
-No IAM or Secret Manager changes are made.
+Wheel copies and stdin-bearing SSH calls select each worker separately. Parallel
+SSH children cannot consume one another's private input. No IAM or Secret Manager
+changes are made.
 
 After every worker passes health checks, the command writes
 `~/.eyvan/attached/<fleet>.yaml`, applies it through the same service as `eyvan up`,
 activates its context and waits for readiness. `--fleet NAME` overrides the stable
 name; `--timeout SECONDS` bounds worker-health and fleet-readiness waits.
-`--dry-run` prints every step and the YAML without building, writing, SSH or cloud
-mutations. Mutating non-TTY use requires `--yes`; `--json` keeps stdout to one
-plan/result document. A failure leaves installed workers/ingress intact, names its
-step, and never attempts to destroy hardware as rollback.
+`--dry-run` reads inventory and prints every step and the YAML without builds or
+mutations. It may run read-only SSH probes. Connect never prompts, including in a
+non-TTY session; omit `--dry-run` only when ready to attach. The hidden `--yes`
+option remains for compatibility but is not required. `--json` keeps stdout to
+one plan/result document. A failure leaves installed workers/ingress intact,
+names its step, and never destroys hardware as rollback.
 
-The `--ssh` route is deliberately narrower: **one already-prepared CPU native
-worker**, an onprem-ssh agent with SSH access and matching worker authentication,
-and an absolute worker state directory writable by that SSH user are prerequisites.
-It does not install software, distribute GCP credentials, or create firewall rules.
-The CLI checks worker liveness; agent authentication and the fenced claim are
-established during fleet readiness. Declare real resources using `--cpus` and
-`--memory-gib`; capacity defaults to `reserved` (`--capacity-class on_demand` is
-also supported, never Spot), and `--region` defaults to `onprem`.
+With `--ssh`, the CLI first discovers whether the address belongs to a TPU through
+the TPU API or host-side discovery. A TPU is attached as its **whole slice**, with
+shape, hosts, and purchase class discovered rather than supplied by the caller.
+Otherwise it reads CPU and memory over SSH for a plain host. That path requires
+an already-prepared native worker, an onprem-ssh agent with matching authentication,
+and an absolute worker state directory writable by the SSH user. It does not
+install software or create firewall rules on a plain host. `--cpus` and
+`--memory-gib` are optional resource overrides for plain hosts only; their capacity
+class defaults to `reserved` (`--capacity-class on_demand` is also supported,
+never Spot), and `--region` defaults to `onprem`.
 
-These CLI paths have offline validation only; successful attachment, multi-host
-SSH behavior and real TPU execution have not been hardware-verified.
+A successful plan does not establish worker reachability or TPU execution.
+Verify readiness and run a workload before relying on an attached fleet.
 
 ## Autoscale (generated zone fleets)
 
@@ -101,7 +107,7 @@ changing defaults.
 eyvan head up fleet.yaml --dry-run   # print every action and resource name; issues nothing
 eyvan head up fleet.yaml --yes       # create/adopt the VM, generate credentials, run migrations, systemd
 eyvan head status fleet.yaml
-eyvan head rollback fleet.yaml
+eyvan head rollback fleet.yaml --yes
 eyvan head down fleet.yaml --yes     # requires --yes; never infers confirmation
 ```
 
@@ -130,7 +136,7 @@ candidate cells, provisioning cell ids, and delivery state/error.
 | `eyvan cells` | every cell and its stage |
 | `eyvan cell-drain` / `cell-delete` | drain/delete a cell by id |
 | `eyvan leases` | active leases |
-| `eyvan events` | the audit event feed — input for a watchdog |
+| `eyvan events --org ORG --project PROJECT` | the scoped audit event feed; both scope flags are required |
 | `eyvan preemption-force-finalize` / `workload-force-finalize` | the stuck-case escape hatches (a cancel that raced a dispatch pass) |
 
 ## Governance, tenancy, federation
@@ -153,8 +159,10 @@ candidate cells, provisioning cell ids, and delivery state/error.
   and explained decisions
 - `eyvan query` — read-only query console (SQL-backed repositories only);
   `eyvan process stacks/allocations` — process diagnostics
-- `eyvan list <kind>` / `eyvan get <kind> <id>` — a generic surface over `workloads`, `cells`,
-  `pools`, `leases`, `events`, `fleets`, `quotas`, `budgets`
+- `eyvan list <kind>` — list `workloads`, `cells`, `pools`, `leases`, `events`,
+  `fleets`, `quotas`, or `budgets`
+- `eyvan get <kind> <id>` — get a single `workloads`, `cells`, `pools`, `leases`,
+  or `fleets` record; events, quotas, and budgets are list-only on this surface
 
 ## Artifacts
 
@@ -170,5 +178,6 @@ deletion claim.
   secret, artifact root, wheel URIs)
 - `eyvan runtime restart` / `runtime deploy` — rebuild and redeploy the local
   plane and agent from current source
-- `eyvan dashboard` — open/serve the console; `eyvan dashboard-dev` — run the Vite
-  dev server against the plane (Part 13)
+- `eyvan dashboard` — open the console already hosted by the configured plane;
+  it does not start a server. `eyvan dashboard-dev` starts the source-checkout
+  Vite development server against the plane (Part 13).

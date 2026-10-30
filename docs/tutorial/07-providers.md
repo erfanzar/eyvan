@@ -1,10 +1,9 @@
 # Part 7 — Providers: writing a capacity backend
 
 A provider is **one driver, one capability entry, and a transport** — with no edit
-to the scheduler, the planner, or the durable model. The worked example is
-`aws-ec2`: written after the contract existed, and two real ownership bugs in it
-were found by the conformance suite rather than its own tests. Contract doc:
-`docs/providers.md`; implementation reference: `docs/reference/capacity-and-providers.md`.
+to the scheduler, the planner, or the durable model. `aws-ec2` is a built-in
+example of that contract. Contract doc: `docs/providers.md`; implementation
+reference: `docs/reference/capacity-and-providers.md`.
 
 ## The shape
 
@@ -32,10 +31,12 @@ another's dependencies):
 
 | Registered names | Driver | Cells are … |
 |---|---|---|
-| `gcp`, `gcp-tpu`, `tpu` | GCP TPU queued resources | queued resource per cell (multislice capable) |
-| `gcp-compute`, `compute` | GCP Compute Engine | one VM |
+| `gcp` | GCP router | TPU queued resources, Compute VMs, or attached TPUs, selected by pool backend |
+| `gcp-tpu` | GCP TPU queued resources | queued resource per cell (multislice capable) |
+| `gcp-compute` | GCP Compute Engine | one VM |
+| `gcp-attach` | attached GCP TPU | existing TPU slice; never provisioned or deleted by the driver |
 | `kubernetes`, `k8s` | Kubernetes | one Indexed Job; Kueue is the capacity-admission boundary |
-| `aws-ec2`, `aws`, `ec2` | AWS EC2 | one instance |
+| `aws-ec2`, `aws` | AWS EC2 | one instance |
 | `azure-vm`, `azure` | Azure VM | one VM |
 | `local` | local development | a logical, unisolated record on the agent host |
 | `manual` | operator-declared hosts | adopted, never provisioned/deleted |
@@ -135,8 +136,10 @@ You guarantee back:
 
 ## Turning a provider on
 
-Install the package into the plane's environment and enable it through
-`EYVAN_CAPACITY_BACKEND` or the fleet config's provider block. Pools appear in
-`eyvan capacity list` once quota and fleet state say they exist. Providers declare
-versions; the plane records which provider version served each cell and workload —
-a proof run against provider X vN says nothing about vN+1.
+Install the provider package into the **cell agent's environment**. Allowlist it
+with `EYVAN_CAPACITY_PROVIDER_PLUGINS` there, then select its backend with the
+agent's `EYVAN_CAPACITY_BACKEND`. Point the fleet's pools at that agent and name
+the matching capacity backend in the fleet configuration. The agent constructs
+the driver; installing the package only in the plane does not enable it.
+`eyvan capacity list` shows the pools available to the project. Qualify the
+installed provider version before relying on it.

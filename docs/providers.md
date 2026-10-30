@@ -76,9 +76,9 @@ ownership, fencing and cleanup validation.
 - Your driver decides machine-level truth (exists? booting? gone?) and the
   core trusts your answers, including "unavailable/inconclusive" — ambiguity
   is surfaced, never converted into a prettier verdict.
-- Capabilities are declarative: declare what your backend can do and
-  multislice-shaped work becomes reachable; do not declare it and every cell
-  you build is one machine — the safe reading of a silent driver.
+- Planning uses the in-tree backend capability table. ABI 1.0 plugins cannot
+  register capability declarations; an unknown backend is limited to
+  single-machine cells.
 
 ## 5. What you guarantee back
 
@@ -93,11 +93,12 @@ ownership, fencing and cleanup validation.
 
 ## Capability entries
 
-`BackendCapabilities` (in `capacity/drivers/base.py`) is how a backend says
-what it can do — for example, allocating **one cell spanning several
-machines** (multislice). Declaring it is what makes multi-worker atomic
-shapes schedulable on your cloud; without the declaration the core refuses
-to plan what it cannot honestly build.
+`BackendCapabilities` and `_BACKEND_CAPABILITIES` live in
+`eyvan/capacity/drivers/base.py`. The in-tree table defines planning limits,
+including whether one cell may span several machines and its worker ceiling.
+ABI 1.0 exposes no plugin capability field. Multi-worker atomic planning needs
+an in-tree capability entry and a pool factory that supports the shape;
+a plugin declaration alone cannot enable it.
 
 ## Qualification
 

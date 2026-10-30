@@ -36,15 +36,29 @@ not services left running for later CLI commands.
 
 ## 2. Bring up the laptop fleet
 
+First start a matching agent in a separate terminal:
+
+```bash
+EYVAN_CAPACITY_BACKEND=local EYVAN_EXECUTION_BACKEND=native-local \
+  uv run eyvan-agent --host 127.0.0.1 --port 8095 --allow-unauthenticated
+```
+
+This unauthenticated agent is for loopback development only. The YAML requires
+`local` capacity, the `native-local` executor, and port `8095`; the agent's
+GCP/native defaults on port `8090` do not match it. For an authenticated setup,
+configure the same `EYVAN_AGENT_SHARED_SECRET` on the plane and agent instead of
+using `--allow-unauthenticated`.
+
+Then apply the fleet:
+
 ```bash
 uv run eyvan up examples/laptop.yaml
 ```
 
 The explicit laptop configuration describes CPU capacity on the `local` backend.
 Omitting the configuration instead selects from autoscale configuration; it is
-not an implicit laptop-fleet command. The persistent laptop path also requires
-a local cell agent at the endpoint declared in the YAML. Use the disposable
-`eyvan demo` above when you want all of that setup managed for one short run.
+not an implicit laptop-fleet command. Use the disposable `eyvan demo` above when
+you want the plane and matching agent managed for one short run.
 On a loopback address, `up` starts and supervises the control plane for you. Do **not**
 start `eyvan-server` first in this path — `up` refuses a plane it cannot prove it
 owns, because adopting a process it did not supervise is how two control planes end
@@ -68,9 +82,10 @@ uv run eyvan doctor     # what is missing, named together
 ```
 
 `eyvan doctor --server-host 0.0.0.0` previews what a network-bound server would
-refuse to start without (`EYVAN_REPOSITORY_BACKEND=postgres`,
-`EYVAN_METRICS_TOKEN`, `EYVAN_ARTIFACT_TOKEN_KEY`) — none of which the loopback
-path needs. The loopback plane binds `127.0.0.1` and requires no secrets.
+refuse to start without: PostgreSQL, `EYVAN_METRICS_TOKEN`,
+`EYVAN_ARTIFACT_TOKEN_KEY`, and listener TLS (`EYVAN_TLS_CERT_FILE` plus
+`EYVAN_TLS_KEY_FILE`) or explicit `EYVAN_INSECURE_PLAINTEXT_BIND=1`. The loopback
+path uses different defaults and does not require these network-bind settings.
 
 ## 4. Submit your first callable
 
@@ -123,7 +138,7 @@ results — against an unisolated local cell.
 ```python
 job = hello.submit()        # EyvanJob — submit without blocking
 job.status()                # WorkloadState
-job.logs()                  # the flattened, globally-ranked log stream
+job.logs()                  # currently available logs as a string
 job.wait(timeout=600, progress=True)
 job.result(timeout=3600)    # your value, or EyvanJobError with the reason
 job.cancel()                # durable cancel
@@ -166,10 +181,19 @@ Then see Part 13 for what the console shows.
 
 ## 8. Run the test suite
 
+Build the dashboard before the Python suite, even if you skipped the optional
+console check:
+
 ```bash
-uv run pytest tests -q           # full suite (~7 min; host + disposable Postgres)
+npm --prefix dashboard ci
+npm --prefix dashboard run build
+uv run pytest tests -q           # full Python selection; inspect PostgreSQL skips
 uv run ruff check eyvan tests    # lint (line 121, py3.11)
 ```
+
+PostgreSQL tests skip without a test URL or usable `initdb`/`pg_ctl` binaries.
+Set `EYVAN_REQUIRE_POSTGRES=1` to make PostgreSQL mandatory; Part 15 shows the
+explicit disposable-database setup. Memory/SQLite tests are separate evidence.
 
 ## Where you are
 

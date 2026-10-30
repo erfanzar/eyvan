@@ -3,22 +3,37 @@
 Layout: `tests/` (Python, pytest), `dashboard/src/**/*.test.ts(x)` (Vitest),
 `eyvan/capacity/conformance.py` (provider ABI suite). Config lives in
 `pyproject.toml` (`testpaths = ["tests"]`, `asyncio_mode = "auto"`); dev
-dependencies are `pytest`, `pytest-asyncio`, `aiosqlite` — aiosqlite exists so the
-SQLAlchemy repository has a real database in tests, because a retention prune that
-could never make forward progress on it once looked green when only the in-memory
-store was exercised.
+dependencies include `pytest`, `pytest-asyncio`, and `aiosqlite`. SQLite tests
+exercise SQLAlchemy persistence, but do not establish PostgreSQL locking or
+transaction semantics.
 
 ## Running
 
-```bash
-uv run pytest tests -q            # full suite (~7 min; host + disposable Postgres)
-uv run pytest tests/test_cli.py -q   # one file
-uv run ruff check eyvan tests     # lint (line-length 121, target py311)
+Build the dashboard first: Python tests check that the plane serves
+`dashboard/dist/index.html`.
 
+```bash
 npm --prefix dashboard ci
-npm --prefix dashboard test
 npm --prefix dashboard run build
+
+uv run pytest tests -q             # full Python selection; inspect PostgreSQL skips
+uv run pytest tests/test_cli.py -q # one file
+uv run ruff check eyvan tests      # lint (line-length 121, target py311)
+npm --prefix dashboard test
 ```
+
+PostgreSQL tests use `EYVAN_TEST_POSTGRES_URL`, or start a disposable cluster with
+`initdb`/`pg_ctl` from `EYVAN_TEST_POSTGRES_BINDIR` or `PATH`. Without either they
+skip. To require PostgreSQL, select a disposable test database and run:
+
+```bash
+EYVAN_REQUIRE_POSTGRES=1 EYVAN_TEST_POSTGRES_URL=postgresql+asyncpg://user:password@localhost/eyvan_test \
+  uv run pytest tests -q -rs
+```
+
+Never use a production database. `EYVAN_REQUIRE_POSTGRES=1` turns unavailable
+PostgreSQL into a failure instead of a skip; memory/SQLite results alone do not
+qualify PostgreSQL behavior.
 
 ## The rules the tests enforce
 
@@ -28,8 +43,8 @@ npm --prefix dashboard run build
 - **Tests assert public behavior**: state transitions, API outputs, parity — not
   private helper calls or log strings.
 - **Diagnostics travel with failures**: `GcsCommandError` carries command + stderr;
-  the agent's error taxonomy (Part 10) exists because two real incidents were
-  caused by mis-typed errors.
+  the agent's error taxonomy distinguishes provider conclusions from inconclusive
+  agent failures (Part 10).
 - **Grounded docs**: `tests/test_docs_are_grounded.py` keeps documentation honest
   against the code.
 

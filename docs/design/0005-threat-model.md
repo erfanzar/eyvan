@@ -43,8 +43,10 @@ Eyvan has these principal actors and boundaries:
 - **Operator, deployment, and identity-provider boundaries.** Operators control
   host files, environment, provider projects, TLS material, OIDC configuration,
   databases, and object stores. Eyvan does not claim to secure a compromised
-  operator environment, an identity provider, or provider account. Federation
-  remains disabled pending external PKI and a quorum-backed ownership witness.
+  operator environment, an identity provider, or provider account. Peer
+  registration and budget/quota grant federation are implemented. Shared-fleet
+  ownership federation and automatic failover remain open pending external PKI
+  and a quorum-backed ownership witness.
 
 ## Assets and security objectives
 
@@ -79,7 +81,7 @@ spend/metrics data, and release artifacts. The objectives are:
 | Secret leakage through logs, diagnostics, or audit | Secret-bearing output is suppressed; authentication audit omits credentials, cookies, query strings, raw identifiers, and unverified claims; redaction tests exist | Retention, log access, IdP-side audit, and browser callback audit remain deployment/provider responsibilities |
 | Metrics or dashboard data exposure | Network binds require a metrics token; dashboard CSP and authentication controls protect operator views | Deployment network policy and rate limiting are still required; metrics token management is operator-owned |
 | Dependency, source, or release substitution | Hash-pinned exports, lock consistency checks, detect-secrets baseline, dependency audit, SBOM and pinned provenance workflow inputs | No local/public provenance attestation has been issued here; external review and real release verification are pending |
-| Split-brain federation or unsafe failover | Federation design explicitly requires external PKI and quorum-backed witnessed ownership; automatic failover remains disabled | PKI, witness client, reconciliation, and failover rehearsal are implementation-pending |
+| Split-brain federation or unsafe failover | Peer registration and budget/quota grants exist; shared-fleet ownership and automatic failover are not implemented | External PKI, quorum-backed witnessed ownership, reconciliation, and failover rehearsal remain open |
 | Denial of service through login, outbox, or provider failure | Dashboard stores cap admissions rather than evicting live sessions; outbox retries/backoff and per-aggregate ordering; provider errors remain distinct from agent unavailability | Edge rate limiting, capacity planning, and production SLO evidence remain pending |
 
 ## Security evidence boundaries

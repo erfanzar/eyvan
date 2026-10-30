@@ -1,8 +1,9 @@
 # Installing Eyvan
 
-A network-bound deployment needs fifteen separately configured things. Local
-`eyvan up` needs none of them: it is a loopback development path, not a remote
-installation recipe. This page covers both. Eyvan requires Python `>=3.11,<3.14`,
+A network-bound deployment needs explicit identity, storage, and listener
+configuration. Local `eyvan up examples/laptop.yaml` starts a loopback CPU
+fleet without cloud credentials; it is not a remote installation recipe.
+This page covers both paths. Eyvan requires Python `>=3.11,<3.14`,
 as declared in `pyproject.toml`. Python 3.10 is no longer supported. Upgrade
 existing worker/submitter environments before deploying this version; explicit
 unsupported interpreter declarations are refused. Native bootstrap selects a
@@ -11,30 +12,31 @@ none is available.
 
 ## Ask before you start
 
-Three of the fifteen are refused at startup rather than defaulted, and they
-used to be discovered one restart at a time. They are now reported together,
-and the same list can be asked for before anything is running:
+Ask `doctor` for all applicable startup refusals before starting the server:
 
 ```bash
 uv run eyvan doctor --server-host 0.0.0.0     # the address eyvan-server will bind
 ```
 
-The check reads this machine's `EYVAN_*` environment and reports every
-requirement a server bound to that address would refuse without --
-`EYVAN_REPOSITORY_BACKEND=postgres`, `EYVAN_METRICS_TOKEN`, and
-`EYVAN_ARTIFACT_TOKEN_KEY` -- each with the reason it exists. It exits
-non-zero when any is unsatisfied. Without `--server-host` it answers for
-`eyvan-server`'s own default of `127.0.0.1`, which requires none of them.
+The check reads this machine's `EYVAN_*` environment and reports all
+applicable refusals, including listener TLS, PostgreSQL, `EYVAN_METRICS_TOKEN`,
+and `EYVAN_ARTIFACT_TOKEN_KEY`, with the reason for each. Authentication-mode
+conflicts and team-mode public URL requirements also depend on configuration.
+It exits non-zero when any requirement is unsatisfied. Without `--server-host`
+it checks the server default, `127.0.0.1`. Loopback binds skip the network-bind
+requirements, not every configuration check.
 
-## The fifteen
+## The fifteen configuration areas
 
-| # | What | Why it cannot be defaulted | Missing looks like |
-|---|------|---------------------------|--------------------|
+These areas depend on the deployment; they are not fifteen mandatory overrides.
+
+| # | What | Purpose or default | Missing looks like |
+|---|------|--------------------|--------------------|
 | 1 | PostgreSQL and `EYVAN_DATABASE_URL` | The local repository has no cross-replica leader election. | Startup refuses a network bind/backend mismatch, naming `EYVAN_REPOSITORY_BACKEND`. |
 | 2 | The schema, managed by `eyvan-migrate` | Production disables auto-create. Existing-schema changes require maintenance acknowledgement. | Startup reports `SchemaRevisionMismatch`, or the migration safety gate refuses. |
-| 3 | `EYVAN_OIDC_ISSUER` | Development auth is refused on a network bind. | Every request is 401. |
-| 4 | `EYVAN_OIDC_AUDIENCE` | A token for another service must not authenticate here. | IdP-valid tokens are rejected by Eyvan. |
-| 5 | The non-secret `EYVAN_OIDC_DASHBOARD_CLIENT_ID` | The browser is a public PKCE client and must know its client identifier at runtime. | Hosted dashboard login cannot start. |
+| 3 | An authentication mode: OIDC (`EYVAN_OIDC_ISSUER`), bootstrap bearer (`EYVAN_BOOTSTRAP_TOKEN`), or team accounts | Development auth is refused on a network bind. Bootstrap tokens grant global fleet-admin authority; bootstrap and OIDC cannot be configured together on a network bind. | Requests cannot authenticate without a usable mode and credential. |
+| 4 | `EYVAN_OIDC_AUDIENCE` when using OIDC | Defaults to `eyvan`; set it to the audience issued for this API. | Tokens with a different audience are rejected. |
+| 5 | The non-secret `EYVAN_OIDC_DASHBOARD_CLIENT_ID` for browser OIDC login | The server-side BFF runs authorization-code + PKCE; the browser holds only a session cookie. | OIDC dashboard login cannot start without its client ID. |
 | 6 | An IdP `eyvan_grants` claim or durable grants from `eyvan grant add` | Roles need an authoritative source. | Authenticated requests are 403. |
 | 7 | One artifact signing key of at least 32 bytes, identical on every replica, as `EYVAN_ARTIFACT_TOKEN_KEY` | Capability tokens are HMACs. | Startup refuses a network bind naming the setting; an accepted per-process key would give intermittent artifact/secret 403s tracking replica count. |
 | 8 | `EYVAN_ARTIFACT_STORE_URI` (`gs://...`) | A pod filesystem is not shared. | One replica cannot read another's result. |
@@ -114,26 +116,28 @@ head keeps the control plane's durable state on its own disk.
 
 ```bash
 uv sync --extra dev
-uv run eyvan up                         # loopback fleet (laptop-cpu), no cloud, no secrets
+uv run eyvan up examples/laptop.yaml    # loopback CPU fleet, no cloud credentials
 uv run eyvan start                      # discovers: local plane reachable? heads in the project?
 ```
 
-Run `eyvan up` before calling the SDK's `init()` for the local fleet. State
-lands under `~/.eyvan/`: `control-plane.json` (the loopback plane's
+Run `eyvan up examples/laptop.yaml` before calling the SDK's `init()` for the
+local fleet. Bare `eyvan up` selects a cached generated autoscale fleet instead.
+State lands under `~/.eyvan/`: `control-plane.json` (the loopback plane's
 durable world), `autoscale/defaults.yaml` plus `autoscale/configs/` (generated
-zone fleets), and `cell-agent-*` records. Run the plane and agent as separate
-processes when you use accelerators:
+zone fleets), and `cell-agent-*` records.
+
+For accelerator fleets, configure `EYVAN_AGENT_SHARED_SECRET` on the plane and
+agent and `EYVAN_NATIVE_WORKER_ROOT_SECRET` on the native agent before starting
+them as separate processes:
 
 ```bash
 uv run eyvan-server --log-level info       # the plane
-uv run eyvan-agent --port 8090 --log-level info  # a cell agent
+uv run eyvan-agent --port 8090 --log-level info  # requires the configured secrets
 ```
 
-The agent requires `EYVAN_AGENT_SHARED_SECRET` (and, for native workers,
-`EYVAN_NATIVE_WORKER_ROOT_SECRET`). For a profiled GCP setup both already sit
-in `~/.eyvan/gcp-native-runtime.json` -- and a plane restarted **without** that
-profile's secrets 401-loops against a still-running agent (receipt:
-2026-08-29). Local components rebuild from source with
+For a profiled GCP setup both secrets are stored in
+`~/.eyvan/gcp-native-runtime.json`. Restore matching credentials before
+restarting the plane and agent. Local components rebuild from source with
 `uv run eyvan runtime deploy`.
 
 ### Dashboard verification
@@ -205,16 +209,28 @@ Secrets enter via environment or the runtime profile
 or the repository. Everything else (timeouts, batch sizes, backend selection)
 is [environment surface](env-surface.md) with safe defaults; fleet-level
 runtime provisioning (interpreter, init commands, default container image)
-lives in the [autoscale defaults profile](operate.md) so every generated zone
-fleet derives it.
+lives in the [autoscale defaults profile](runtimes.md#the-defaults-profile) so
+every generated zone fleet derives it.
 
 ## Safe schema upgrades
 
-The plane owns its schema (`EYVAN_AUTO_CREATE_SCHEMA` for development).
-Upgrade the plane binary, let its migrations run against a backed-up database,
-and keep the previous release's artifacts until the new one has served real
-work -- the [artifact-safety](artifact-safety.md) page defines what may be
-cleaned and when.
+The server does not run Alembic migrations at startup. It refuses a stamped
+schema revision that does not match the build; `EYVAN_AUTO_CREATE_SCHEMA` is
+for development schema creation, not production upgrades.
+
+1. Quiesce submissions and every database writer. Verify a backup and rehearse
+   an isolated restore.
+2. Install the candidate and run `eyvan-migrate --check` to inspect its migration
+   policy. A known-behind schema requires a one-use maintenance acknowledgement.
+3. With writers still stopped, run `eyvan-migrate --maintenance-acknowledged`
+   for that schema upgrade. Omit the acknowledgement for a fresh or exact-head
+   database; the migration gate refuses an unnecessary acknowledgement.
+4. Start the matching server build, verify it, then reopen writes. Repair failed
+   upgrades forward; do not use an Alembic downgrade as rollback.
+
+Keep the previous release's artifacts until the new one has served real work.
+The [artifact-safety](artifact-safety.md) page defines what may be cleaned and
+when.
 
 ## After install
 

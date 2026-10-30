@@ -54,7 +54,7 @@ The schedule is declared by `_leader_phases()` in
 2. capacity-pool reconciliation;
 3. cell observation, expired-lease quarantine, workload observation, and
    orphan/coordinator settlement;
-4. DAG-node and admitted-group release, group placement, and expansion-wave
+4. DAG-node release, group placement, admitted-group release, and expansion-wave
    release;
 5. service health probing, replica lifecycle reconciliation, autoscaling, and
    ordinary service reconciliation;
@@ -159,8 +159,8 @@ DISPATCHING -> RUNNING | CANCELLING | FAILED
 RUNNING -> CHECKPOINTING | SUCCEEDED | CANCELLING | FAILED
 CHECKPOINTING -> RUNNING | SUCCEEDED | CANCELLING | FAILED
 CANCELLING -> SUCCEEDED | CANCELLED | FAILED
-FAILED -> PENDING                 (retry)
-SUCCEEDED, CANCELLED -> terminal
+FAILED, CANCELLED -> PENDING      (retry)
+SUCCEEDED -> no outgoing transition
 ```
 
 `TERMINAL_WORKLOAD_STATES` is `{SUCCEEDED, FAILED, CANCELLED}`. A service

@@ -11,18 +11,19 @@ eyvan capacity list              # pools this project can submit into
 eyvan cells                      # every cell and its stage
 eyvan capacity quota --fits v5p-16:2   # zone-by-zone fit for a shape
 eyvan capacity launch-latency    # per-pool handover seconds, plane-recorded
-eyvan events                     # the audit feed — input for a watchdog
+eyvan events --org my-org --project my-project   # scoped audit feed
 ```
 
-`quota --fits` flags zones whose usage is *unknown* — treat those as unproven, not
-free: the europe-west4-b receipt shows a zone whose quota row exists but whose
-queue admission is refused.
+`quota --fits` flags zones whose usage is *unknown*; treat them as unproven, not
+free. A quota row does not establish queue admission or available supply. Verify
+all three before relying on a zone.
 
 ## Production design contracts
 
-- **Durable state wins.** If the plane dies, restart it — everything reconciles
-  from the store (demonstrated: 113 workloads recovered from
-  `~/.eyvan/control-plane.json` on 2026-08-29).
+- **Recover from durable state.** Restart the plane against the same store and
+  configuration. Check existing workload IDs, leases, and pending command delivery
+  with `eyvan workload explain <id>` and the scoped audit feed. A listening API
+  alone does not establish that reconciliation has completed.
 - **Restart with credentials, or don't restart.** A bare `eyvan-server` comes up
   without the runtime profile's secrets and 401-loops against a still-running
   agent (cells flip `unavailable` in a recreate loop). Restore the agent secret
@@ -61,28 +62,29 @@ queue admission is refused.
 - Follow detached: `eyvan workload status|logs|cancel <id>`, and
   `eyvan workload explain <id>` for placement truth.
 
-## Choosing a zone: race it, don't guess
+## Choosing a zone
 
-The 2026-08-29 one-probe-per-zone race (v5p-16 × 1, spot, `jax.device_count()`):
+1. Run `eyvan capacity quota --fits v5p-16:2` for the required shape. Keep unknown
+   usage separate from known quota headroom; check recorded admission refusals.
+2. Inspect `eyvan capacity launch-latency`. Compare handover times and sample
+   counts for relevant pools. No samples means unmeasured, not fast.
+3. If live validation is needed, explicitly authorize a bounded probe with the
+   same shape and purchase class. Check queue admission, worker readiness, and
+   an actual workload result separately.
+4. Cancel owned probe workloads, drain their capacity, and verify provider
+   cleanup. Repeat when shape, zone, or runtime changes.
 
-| zone | verdict |
-|---|---|
-| `us-central1-a` | granted + ready in **409.7 s** (idle zone) |
-| `us-east5-a` | no grant in ~14 min — `WAITING_FOR_RESOURCES`, congested |
-| `europe-west4-b` | refused at queue admission — no v5p permission there |
-
-Quota is permission to be *billed*; queue admission is permission to *ask* — a
-zone needs both. Spot supply is a market: re-race before big spends, and prefer
-shapes with receipts (spot v6e-8 boots "in about two minutes, repeatedly"; larger
-spot slices have been accepted and reclaimed before a host finished booting).
+Quota, queue admission, and available supply are separate gates. Previous launch
+times do not guarantee current Spot availability.
 
 ## When something is queued and not running
 
 1. `eyvan workload explain <id>` — placeable? provisioning? delivery state?
 2. `hard_constraint: no cell satisfies all hard workload constraints` **with** a
    provisioning cell id → capacity is being built; wait.
-3. Same, with **no** provisioning cell → no pool in the fleet matches the shape;
-   check `capacity fleets` / `capacity list`.
+3. With **no** provisioning cell, check matching pools, pool bounds, shared quota,
+   and acquisition backoff using `eyvan capacity fleets`, `eyvan capacity list`,
+   and workload explanation. A matching pool alone does not guarantee a launch.
 4. Provider queue `WAITING_FOR_RESOURCES` for tens of minutes → the zone is
    congested. Cancel and race another zone rather than waiting blind.
 
@@ -96,7 +98,7 @@ spot slices have been accepted and reclaimed before a host finished booting).
 | cells `unavailable` + recreate loop | plane↔agent auth mismatch or provider `PROVIDER_ERROR` | read both logs |
 | `leased · attempt N` stuck; `explain` shows quarantined lease | plane crashed mid-dispatch | cancel and resubmit (known rough edge) |
 | workload stuck in CANCELLING | cancel raced a dispatch/reap pass | give the controller a pass; `eyvan workload-force-finalize` for the stuck case |
-| `GcsCommandError … HTTPError 412` on submit | concurrent identical submissions, pre-`e7abd59` behavior | update past that commit |
+| `GcsCommandError … HTTPError 412` on submit | an object appeared during a digest-addressed upload | current code re-hashes the stored object and continues only if it matches; report a regression if 412 still escapes |
 | `eyvan down/up` says config missing | given a fleet name, not a path | use `~/.eyvan/autoscale/configs/<fleet>.yaml` |
 
 ## Proof runs
@@ -109,13 +111,11 @@ observation outside the warm window — each produces a clean-looking run that
 establishes nothing. Subcommands: `catalog`, `children`, `logs`, `preemption`,
 `warm-window`, `secret`, `kubernetes`, `verify`.
 
-The proof ledger (P0–P7) in `docs/proofs.md` records what is established and at
-what cost — e.g. P0 (multislice callable end-to-end, passed 2026-08), P2
-(multi-host logs with a rank lost mid-stream, passed on the seventh attempt), P5
-(spot reclamation charged to the preemption budget, not the failure budget), P7
-(Kubernetes against a real API server). **No historical run qualifies the current
-candidate without an immutable exact-candidate receipt** — re-run against the
-current candidate when a spend decision depends on it.
+`docs/proofs.md` defines the contracts: catalog shape, child identity, ranked logs,
+secret handling, preemption accounting, warm windows, and Kubernetes transport.
+Choose the contract before running, retain the build identity and verdict, and
+state which dimensions were not exercised. Historical results do not qualify a
+changed build or deployment.
 
 ## Watchdogging
 

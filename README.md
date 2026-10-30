@@ -1,17 +1,17 @@
 # Eyvan (ایوان)
 
 Eyvan is a capacity plane for research compute. You state the shape of work you
-need — `2 × v5p-16, spot, this fleet` — as a signed Python callable, and the
-plane acquires the machines, boots them, dispatches your callable to them, and
-hands you the result. Every claim it makes about capacity is grounded in
-recorded receipts, not vibes: what was requested, what a provider accepted or
-refused, and how long the handover actually took.
+need — `2 × v5p-16, spot, this fleet` — as a digest-verified unsigned Python
+callable submitted to an explicitly trusted project. The plane acquires the
+machines, boots them, dispatches your callable, and returns its result.
+Capacity records show what was requested, what a provider accepted or refused,
+and how long the handover took.
 
 ## The sixty-second version
 
 ```bash
 uv sync --extra dev                      # workspace install + development dependencies
-uv run eyvan up                          # start the local loopback fleet before SDK init
+uv run eyvan up examples/laptop.yaml     # start the local loopback CPU fleet before SDK init
 uv run eyvan start                       # find or point at a control plane
 uv run eyvan doctor                      # what is missing, named together
 ```
@@ -19,23 +19,39 @@ uv run eyvan doctor                      # what is missing, named together
 Eyvan supports Python `>=3.11,<3.14` (the range declared in `pyproject.toml`).
 
 ```python
+from eyvan import CpuConfig, execute, init
+
+init(fleet="laptop")
+
+
+@execute(CpuConfig())
+def train():
+    return sum(range(10))
+```
+
+Calling `train()` submits the callable and waits, narrating progress:
+`queued`, `provisioning`, `blocked … the plane is retrying (attempt N)`,
+`dispatching`, then your result. The job is durable — it keeps running if your
+client exits (`eyvan workload status <id>` to follow).
+
+### With a TPU fleet
+
+First configure a fleet with matching TPU pools and a runtime that provides
+JAX. The laptop fleet above has only CPU capacity.
+
+```python
 from eyvan import TpuConfig, execute, init
 from eyvan.records import CapacityClass
 
-init(fleet="laptop")                     # or a GCP zone fleet
+init(fleet="research-us-central1-a")
 
 
 @execute(TpuConfig(type="v5p-16", pods=2, capacity_class=CapacityClass.SPOT))
-def train():
+def device_count():
     import jax
 
     return jax.device_count()
 ```
-
-Calling `train()` submits the callable and waits, narrating progress
-honestly: `queued`, `provisioning`, `blocked … the plane is retrying
-(attempt N)`, `dispatching`, then your result. The job is durable — it keeps
-running if your client exits (`eyvan workload status <id>` to follow).
 
 ## The SDK in one page
 
@@ -65,7 +81,7 @@ TPU config's full surface (`eyvan/sdk/client/jobs.py`):
 | `type` | — | accelerator type, e.g. `"v5p-16"`, `"v6e-8"` |
 | `pods` | `1` | workers — how many slices of `type` the job asks for |
 | `atomic` | `False` | `False` (**elastic**, node-pool style): pack warm cells of the same type and provision only the deficit — going `pods` 2→4 keeps the two warm slices and asks for two more, one lease group, one hardware world per cell. `True`: one exact-shape provider resource, one hardware world spanning every pod — what single-mesh training needs |
-| `capacity_class` | `SPOT` | `SPOT` or `ON_DEMAND` |
+| `capacity_class` | Spot preference | `SPOT`, `ON_DEMAND`, `RESERVED`, or `FLEX_START`; an explicit value is exact. If omitted, a reserved-only fleet may substitute `RESERVED` |
 | `max_retries` | `DEFAULT` | retries for **lost capacity** attempts |
 | `max_preemption_retries` | `10` | restarts after the provider reclaims spot — deliberately generous; reclamation is the cheap failure |
 | `max_failure_retries` | `0` | retries of the job's *own* failure — deliberately stingy; a non-zero exit usually repeats, and re-running it costs an accelerator |
@@ -82,10 +98,11 @@ def run(epochs: int):
     ...
 ```
 
-`workspace=` (a path, or `True` for the callable's own package root) ships a
-directory tree to the worker's working directory — it is extracted before
-your callable imports, so a research script can import its own modules
-without an image build. Without it, nothing ships but the callable.
+`workspace=` accepts a directory path and ships that tree to the worker's
+working directory before the callable imports. Omit it to derive the workspace
+from the decorated function's source-file directory; interactive callables
+without a source file need an explicit path. Set `workspace=False` to disable
+workspace shipping.
 
 ### Calling: blocking wait, or detached handle
 
@@ -104,10 +121,9 @@ job.cancel()                    # durable cancel
 
 Your callable's *return value* comes back through the artifact store; its
 imports resolve on the cell (image packages + `dependencies` + whatever
-`workspace` shipped). Identical callables deduplicate to one stored artifact
-by content digest — resubmitting the same function is cheap, and concurrent
-identical submissions are safe (the 2026-08-29 zone race pinned this; see
-[artifact-safety](docs/artifact-safety.md)).
+`workspace` shipped). Identical callables deduplicate by content digest;
+a concurrent upload verifies the existing object's digest before using it.
+See [artifact-safety](docs/artifact-safety.md).
 
 One more client-side knob worth knowing: the returned job exposes its
 transport (`.base_url`) so tooling built on the SDK can follow the same
@@ -128,13 +144,13 @@ Four seams, in order of how often you need them:
    permission **and** supply are three different gates).
 2. **A different fleet** — a YAML config: `eyvan up <config>` from a
    hand-written file (see `examples/fleet.yaml`, `examples/laptop.yaml`) or
-   a generated per-zone fleet (`eyvan up --region <r> --zone <z>
-   --preemptible`). Node types, runtime env, autoscaling knobs live in the
-   config, not in your callable.
-3. **A different cloud** — a provider package: one driver, one capability
-   entry, one transport, zero edits to the core. The contract, the
-   conformance suite, and the worked `aws-ec2` example are in
-   [providers](docs/providers.md).
+   a generated fleet (`eyvan up --region <region> --preemptible`, or
+   `eyvan up --quota-based --zone <zone> --preemptible`). Node types, runtime
+   env, and autoscaling knobs live in the config, not in your callable.
+3. **A different cloud** — a provider package with a driver and transport.
+   External plugins default to single-machine cells; multi-worker planning
+   also needs an in-tree capability entry and a supporting pool factory.
+   See [providers](docs/providers.md) for the ABI and conformance contract.
 4. **A different workflow** — composition: `can_submit_children=True` grants
    your job a submission capability under your identity (fan-out workers,
    coordinator patterns), and checkpointing hooks let long spot jobs survive
@@ -151,7 +167,7 @@ uv run pytest tests -m fast -q   # smoke subset for iteration, not a release gat
 uv run pytest tests -q -rs       # full suite; real PostgreSQL requires the test fixture setup
 uv run ruff check eyvan tests    # lint (line 121, py3.11)
 uv run eyvan-server --log-level info   # run the plane from source
-uv run eyvan-agent --port 8090 --log-level info   # and an agent
+uv run eyvan-agent --host 127.0.0.1 --port 8090 --allow-unauthenticated  # local dev only
 ```
 
 Verify the dashboard from a fresh checkout with the commands in
@@ -211,12 +227,10 @@ and the `aws` umbrella, `azure-vm` and the `azure` umbrella, `kubernetes`
 (an existing Cloud TPU VM attached with `eyvan gcp connect`; observed, never
 created or deleted).
 
-Breadth and qualification are different axes. Kubernetes runs on any
-conformant cluster but its evidence is one GKE run (P7); the on-premises
-path is code with no run against a real SSH host yet; GCP TPU is the
-substrate with the deepest receipts. A reader deciding where to deploy
-needs both facts per backend, not the flattering one — see
-[proofs](docs/proofs.md) for what is actually established where.
+Backend availability is not proof of qualification on your infrastructure.
+GCP TPU is the backend with live hardware runs; the on-premises SSH driver is
+code with no run against a real SSH host yet. See [proofs](docs/proofs.md) for
+evidence requirements and backend-specific limits.
 
 ## The docs map
 
@@ -241,9 +255,7 @@ the control plane, providers, operations, deployment, and an explicit Spot TPU e
 
 ## What is proven
 
-See [proofs](docs/proofs.md) — including the 2026-08-29 v5p zone race
-(us-central1-a granted in 409.7 s; us-east5-a no grant in 14 min;
-europe-west4-b refused at admission) and the known rough edges: a bare
-`eyvan-server` restart needs the runtime profile's secrets or it 401-loops
-against a running agent, and a crash mid-dispatch can leave a quarantined
-lease that needs a manual cancel.
+See [proofs](docs/proofs.md) for proof criteria and evidence limits. After a
+restart, use the intended durable state and matching credentials; inspect
+quarantined leases before intervening. See [operate](docs/operate.md) and
+[troubleshoot](docs/troubleshoot.md) for recovery procedures.

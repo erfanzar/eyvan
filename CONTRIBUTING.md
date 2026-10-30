@@ -21,10 +21,8 @@ EYVAN_REQUIRE_POSTGRES=1 uv run pytest tests -q -rs
 
 The `fast` marker selects eight explicit modules in `tests/conftest.py`:
 scheduler decisions and packing, configuration, provider boundaries, and
-session-security regressions. The measured local run passed 141 tests in
-4.11 seconds including collection (machine-dependent, not a CI timing
-promise). This is smoke coverage, not a substitute for focused tests of your
-change or the full suite.
+session-security regressions. This is smoke coverage, not a substitute for
+focused tests of your change or the full suite.
 
 The separate `slow` marker identifies integration-scale modules. Using
 `-m "not slow"` gives broader coverage than `-m fast`, but remains a
@@ -43,10 +41,12 @@ The deployment-grade path installs the hash-pinned exports instead — what
 CI, the Dockerfiles, and `eyvan head up` use:
 
 ```bash
-uv venv --python 3.13 && uv pip install --require-hashes -r requirements-docker.txt
-uv pip install --require-hashes -r requirements-dev.txt
-uv pip install --no-build-isolation --no-deps -e .
-EYVAN_REQUIRE_POSTGRES=1 pytest tests
+uv venv --python 3.13
+uv pip install --python .venv/bin/python --require-hashes -r requirements-docker.txt
+uv pip install --python .venv/bin/python --require-hashes -r requirements-dev.txt
+uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+uv pip install --python .venv/bin/python --no-build-isolation --no-deps -e .
+EYVAN_REQUIRE_POSTGRES=1 .venv/bin/python -m pytest tests
 ```
 
 ### Disposable PostgreSQL for the full gate

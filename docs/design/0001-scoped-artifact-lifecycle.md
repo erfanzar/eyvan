@@ -47,11 +47,10 @@ the dispatch path itself: a workload runs what an artifact row says.
 ## Client-side corollary
 
 The SDK store writes digest-named objects (`<sha256>.pkl`) with
-describe-then-`--no-clobber`. The 2026-08-29 zone race pinned the race
-window: concurrent identical submissions must treat the loser's 412 as "the
-object I was uploading exists — verify it and continue" (commit `e7abd59`),
-preserving the same principle at the client edge: a digest name that exists
-is evidence, not an error.
+describe-then-`--no-clobber`. On a create-precondition loss (HTTP 412), the
+submitter fetches and re-hashes the existing object and continues only on an
+exact digest match. Existence alone is neither proof of identity nor a reason
+to reject an identical submission.
 
 ## Maintenance, rollout, and rollback
 

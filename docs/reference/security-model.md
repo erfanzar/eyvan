@@ -160,11 +160,13 @@ or (less safely) bare project IDs. Untrusted projects are rejected. This is a
 code-execution trust decision, not sandboxing: trusted callable code and its
 imports must be treated as able to act with the worker/container’s authority.
 
-Callable signing is currently optional. The standalone HTTP submission path can
-send unsigned artifacts, and there is no controller-managed verifier/key
-forwarding path; a digest detects accidental/corrupt changes but is not caller
-authentication. Operators exposing callable submission over a network must
-restrict trusted projects and treat this as a known hardening limitation.
+Standalone SDK/API callables are unsigned: the submission boundary rejects
+caller signing keys and artifact signatures. Optional HMAC support belongs to
+the low-level callable protocol for custom integrations; the controller does
+not distribute a producer/verifier key. A digest detects corrupt bytes but is
+not caller authentication and does not make an untrusted callable safe.
+Operators must restrict trusted projects and protect the worker/container's
+authority.
 
 ## 9. Supply-chain controls
 

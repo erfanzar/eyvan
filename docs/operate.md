@@ -9,15 +9,13 @@ cross-scheduler comparison protocol.
 ## Production design contracts
 
 - **Durable state wins.** Cells, workloads, fleets, and leases live in the
-  plane's store. If the plane dies, restart it — everything reconciles. On
-  2026-08-29 the local plane died silently mid-dispatch; a restart recovered
-  the full world from `~/.eyvan/control-plane.json`, and only one workload
-  needed manual attention (a quarantined lease; see
-  [troubleshoot](troubleshoot.md)).
-- **Restart with credentials, or don't restart.** A bare `eyvan-server` comes
-  up without the runtime profile's secrets and 401-loops against a
-  still-running cell agent (cells flip `unavailable` in a reconcile/delete
-  loop). Start it with the profile's secrets:
+  plane's store. Restart with the intended durable state configuration and
+  matching credentials so the controller can reconcile its records. Inspect
+  quarantined leases before intervening; see [troubleshoot](troubleshoot.md).
+- **Restart with credentials, or don't restart.** The plane needs the agent's
+  shared secret to authenticate its requests; without it every call to a
+  still-running cell agent is rejected with 401. For a profiled local runtime,
+  restore it before starting the plane:
 
   ```bash
   if EYVAN_AGENT_SHARED_SECRET=$(python3 -c '
@@ -67,8 +65,8 @@ eyvan capacity launch-latency    # per-pool handover seconds, plane-recorded
 ```
 
 `quota --fits` prints free slices per zone and flags zones whose usage is
-*unknown* — treat those as unproven, not free (see the europe-west4-b receipt
-in [proofs](proofs.md): quota row present, queue admission refused).
+*unknown* — treat those as unproven, not free. Quota, queue-admission permission,
+and current supply are separate checks.
 
 ## Running a job on accelerators
 
@@ -105,20 +103,10 @@ def run():
 
 ## Choosing a zone: race it, don't guess
 
-On 2026-08-29 a one-probe-per-zone race (v5p-16 × 1, spot, trivial
-`jax.device_count()` callable) produced:
-
-| zone            | verdict                                                        |
-|-----------------|----------------------------------------------------------------|
-| us-central1-a   | granted + ready in **409.7 s** (plane-recorded; zone idle)     |
-| us-east5-a      | no grant in ~14 min (`WAITING_FOR_RESOURCES`; zone congested)   |
-| europe-west4-b  | refused at admission — no permission for v5p in that location  |
-
-`eyvan capacity launch-latency` is the machine-readable version of that
-table after the fact. Spot supply is a market: re-race before big spends, and
-prefer shapes with receipts (spot v6e-8 boots "in about two minutes,
-repeatedly"; larger spot slices have been accepted and reclaimed before a
-host finished booting).
+Compare `eyvan capacity launch-latency` samples with a small probe workload
+in each candidate zone. Check quota, queue-admission permission, readiness,
+and the callable's result separately. Historical launch timings do not
+predict current Spot supply. See [proofs](proofs.md) for proof criteria.
 
 ## When something is queued and not running
 
@@ -136,10 +124,12 @@ eyvan up --select research-us-central1-a --preemptible   # re-enable a generated
 eyvan down ~/.eyvan/autoscale/configs/research-us-central1-a.yaml -y   # drain it back
 ```
 
-`up --region <r> --zone <z> --preemptible` generates and applies a zone fleet
-from live quota. `down` takes the **config path**, not a fleet name, and
-drains every cell the fleet manages. An empty fleet holds no cell and costs
-nothing, but drains restore the state you found.
+`eyvan up --region <region> --preemptible` discovers zones and generates
+Spot TPU fleets from live quota, then applies the first one. To select a zone,
+use `eyvan up --quota-based --zone <zone> --preemptible` instead; `--region`
+and `--zone` cannot be combined. `down` takes the **config path**, not a fleet
+name, and drains every cell the fleet manages. An empty fleet holds no cell
+and costs nothing, but drains restore the state you found.
 
 ## Release, migration, and rollback sequence
 

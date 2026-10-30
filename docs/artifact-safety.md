@@ -66,13 +66,9 @@ first, then uploads with `--no-clobber`. Two consequences:
 
 - A pre-existing object under a digest name is **fetched and re-hashed**; a
   corrupted or foreign object is rejected, never trusted.
-- On 2026-08-29, three zones raced one identical probe callable at the same
-  instant: the first upload landed the object, and the losers — whose
-  `--no-clobber` copy answered `HTTPError 412` — **crashed in submission**
-  because "the object I was uploading now exists" was treated as failure
-  (commit `e7abd59` fixed it: the loser verifies the winner's digest and
-  continues). Identical callables are one object; none of their submitters
-  fails. Pinned by
+- A create-precondition loser (`HTTPError 412` from `--no-clobber`) fetches
+  the existing object and verifies its digest. Submission proceeds only on an
+  exact match; a foreign or corrupt object is refused. This invariant is pinned by
   `test_a_concurrent_upload_of_the_same_digest_wins_instead_of_crashing`,
   `test_a_precondition_loss_still_rejects_a_foreign_object`, and
   `test_any_other_upload_failure_still_names_itself` in
