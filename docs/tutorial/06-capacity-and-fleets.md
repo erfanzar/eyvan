@@ -118,7 +118,8 @@ expiry).
 - `hardware_catalog.py` is the authority for what a named shape *is*: kind, chips,
   quota units, per-host CPU and memory, topology where grounded, and the HTTPS
   source/version. It is **not** quota discovery — quota metrics say what is
-  available and join on type. GPU rows describe one VM; TPU quota units differ by
+  available and join on type. GPU rows describe one VM (a bare-metal row such as
+  `hgx-h200-8g` fixes only the device count and model); TPU quota units differ by
   generation (e.g. v4/v5p = 2 per schedulable TPU). Unknown hardware remains
   usable only with an explicit complete resource vector.
 

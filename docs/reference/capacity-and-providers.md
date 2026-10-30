@@ -184,7 +184,10 @@ authority for what a named shape *is*: kind, chips, quota units, per-host CPU
 and memory, backend, topology where grounded, and HTTPS source/version. It is
 not quota discovery: quota metrics say what is available and join on type.
 GPU rows describe one VM (`hosts=1`, exact device count, machine type and GPU
-model); TPU quota units differ by generation. Unknown hardware remains usable
+model); TPU quota units differ by generation. An operator-owned bare-metal GPU
+row (`capacity_backend: onprem-ssh`, today only `hgx-h200-8g`) records host
+CPU, memory and machine type as explicit `null`, since no vendor publishes
+them and non-GCP pools state their own vector. Unknown hardware remains usable
 only with an explicit complete resource vector. Catalog data is sourced
 provider documentation, not test execution.
 
