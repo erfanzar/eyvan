@@ -5,11 +5,8 @@
 
 """A pool whose capacity requests keep failing backs off, says so, and resets on success.
 
-2026-10-25: a Spot v5p-16 pool whose gcloud account could not bind native-worker
-secrets failed every ``capacity.apply`` in 11-15 s. Each failed cell was retired
-and replaced by a fresh cell with a clean availability belief, so the per-cell
-cooldown never outlived one incarnation and the planner minted cell after cell
-(past 0439) on the loop every other fleet shares.
+Backoff must span replacement cells: a fresh cell's clean availability belief
+must not reset the pool's repeated-failure history and allow unbounded churn.
 """
 
 from __future__ import annotations

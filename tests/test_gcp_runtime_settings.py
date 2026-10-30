@@ -42,10 +42,8 @@ def test_gcp_native_runtime_profile_maps_to_api_and_agent_settings(monkeypatch) 
 
     assert settings.agent_shared_secret == profile.agent_shared_secret
     assert settings.native_worker_root_secret == profile.native_worker_root_secret
-    # The profile-owned local agent shares a host with its control plane, so
-    # fleet state defaults to a local file: a bucket write on that cache's
-    # critical path once kept ACTIVE TPUs from ever becoming usable while they
-    # billed (2026-08-22). GCS remains one explicit env var away.
+    # The local agent shares a host with its control plane, so local fleet state
+    # avoids a bucket dependency on the readiness path. GCS remains an explicit opt-in.
     assert settings.fleet_state_uri == str(DEFAULT_GCP_NATIVE_FLEET_STATE_PATH)
     assert settings.artifact_store_uri == profile.artifact_root_uri
     assert settings.native_worker_package == profile.native_worker_wheel_uri
@@ -94,18 +92,7 @@ def test_profile_backed_cell_agent_passes_the_gcs_artifact_root_to_native_gcp_dr
 
 
 def test_the_profile_path_honours_the_callable_trust_allow_list(monkeypatch) -> None:
-    """Found live 2026-08-01: `EYVAN_TRUSTED_CALLABLE_PROJECTS` was inert here.
-
-    A runtime profile describes one operator's *GCP* runtime -- buckets, secrets,
-    a wheel. It has no notion of which projects may submit pickled Python, and it
-    should not: that is an operator policy decision, exactly like
-    ``fleet_state_uri``, which this constructor already reads from the
-    environment for the same reason.
-
-    Dropping it meant the whole `eyvan runtime` path refused every callable
-    submission outside the loopback development project, with the documented
-    environment variable set and no other way to grant trust.
-    """
+    """Read callable trust from operator settings because runtime profiles do not own submission policy."""
 
     monkeypatch.setenv("EYVAN_TRUSTED_CALLABLE_PROJECTS", "acme/research, acme/eval")
 
@@ -123,15 +110,7 @@ def test_callable_trust_stays_empty_when_the_operator_grants_nothing(monkeypatch
 
 
 def test_the_capabilities_probe_tolerates_an_agent_that_is_restarting() -> None:
-    """This probe runs *while* an agent is being replaced, so refusal is normal.
-
-    Regression for a self-inflicted break on 2026-08-01: routing the agent client
-    through one transport seam turned "connection refused" from a bare
-    `httpx.ConnectError` into a typed `CellAgentUnavailableError`. This handler
-    listed only httpx errors, so the typed one escaped and aborted
-    `eyvan runtime restart` with exactly the condition the probe exists to
-    tolerate -- the agent it was about to start not being up yet.
-    """
+    """Tolerate typed agent-unavailability errors while probing an agent during replacement."""
 
     import httpx
 
@@ -158,13 +137,7 @@ def test_the_capabilities_probe_tolerates_an_agent_that_is_restarting() -> None:
 
 
 def test_the_profile_path_honours_operator_settings_it_does_not_own(monkeypatch) -> None:
-    """Found live 2026-09-24: a twenty-zone Spot fleet raced one zone at a time.
-
-    ``EYVAN_CAPACITY_RACE_WIDTH=20`` was exported and the plane asked one zone
-    per reconcile, because this constructor built settings from bare defaults
-    and read back only the two variables someone had already been bitten by.
-    Exec was refused on the same fleet for the same reason.
-    """
+    """Preserve operator race-width and exec settings when constructing settings from a runtime profile."""
 
     monkeypatch.setenv("EYVAN_CAPACITY_RACE_WIDTH", "20")
     monkeypatch.setenv("EYVAN_CAPACITY_SUPPORTS_EXEC", "1")

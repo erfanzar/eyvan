@@ -664,20 +664,7 @@ async def test_a_multi_worker_workload_pinned_to_a_non_tpu_pool_cannot_stop_the_
 
 
 def test_cell_ids_do_not_repeat_across_control_plane_incarnations() -> None:
-    """Found live 2026-08-01: a fresh control plane collided with old tombstones.
-
-    The minter counts from ``len(managed) + 1`` and de-duplicates only against
-    cells the control plane currently holds. The agent keeps a durable tombstone
-    per released cell and permanently refuses any mutation at a generation not
-    newer than it -- by design, because that is what stops a resurrected cell
-    from being adopted.
-
-    So a control plane whose database is empty re-creates the pool, starts at
-    0001, and walks into the tombstones a previous one left on the same agent.
-    Observed: cells 0001..0006, twelve consecutive "generation 1 is not newer
-    than fenced cell ... generation 2" rejections, and a fleet that churned
-    forever without provisioning.
-    """
+    """Give new control-plane incarnations distinct cell IDs to avoid durable agent tombstones."""
 
     from eyvan.capacity.planning import pool_cell_id
 
@@ -753,18 +740,7 @@ def test_the_counter_is_never_truncated_away() -> None:
 
 
 def test_a_deleted_cell_never_gives_its_index_back() -> None:
-    """Found live on 2026-08-02, after it had burned Spot capacity all night.
-
-    The counter was ``len(live_cells) + 1``, so deleting a cell walked it
-    *backwards* and a churning pool handed the same id out twice. The second
-    holder then inherited whatever the first had left at the provider under that
-    name: a new cell 0007 found a ``v5p-128`` queued resource created hours
-    earlier wearing the name it had just been given.
-
-    Eyvan correctly refused to adopt a resource of the wrong shape -- and then
-    drained and retried forever against an ACTIVE, billing TPU it could never
-    accept. The earlier ``research-*`` v5p-128 orphan was the same mechanism.
-    """
+    """Never reuse a deleted cell's index, which could collide with a retained provider resource."""
 
     from eyvan.capacity.planning import next_pool_cell_index, pool_cell_id
 
@@ -916,10 +892,8 @@ def test_a_disabled_pool_does_not_take_its_leased_cell_out_of_the_snapshot() -> 
     is no longer supply cannot simply be dropped while something still runs on
     it.
 
-    Observed on a live fleet: `eyvan down` disabled a pool whose v5p-16
-    multislice still held a lease, and the plane spent every two seconds raising
-    out of this phase -- which carries the phases that observe, settle and
-    release -- while the accelerator went on billing.
+    Disabling a pool must therefore retain leased cells in the snapshot so
+    observation, settlement and release can continue.
     """
 
     pool = multislice_tpu_pool()
@@ -1046,13 +1020,7 @@ def test_a_workload_without_alternates_names_exactly_the_pool_it_always_did() ->
 
 
 def test_placement_leaves_a_cooling_zone_for_a_healthy_one() -> None:
-    """The whole point of alternates.
-
-    Without this a workload keeps asking the zone that has been reclaiming it
-    while a healthy zone sits idle beside it. On 2026-08-15 us-east5-b granted
-    and reclaimed a 2x v6e-8 allocation twice while us-central2-b held one long
-    enough to finish.
-    """
+    """Prefer a healthy alternate instead of repeatedly asking a cooling zone for capacity."""
 
     cold, warm = _shape_pool("research/zone-a"), _shape_pool("research/zone-b")
     workload = _pending_workload(alternates=warm.id)
@@ -1210,9 +1178,7 @@ def test_a_cell_whose_provider_request_has_not_started_is_never_timed_out() -> N
 
     The cost is not one wasted cell. The reaped cell's queued apply is discarded
     as stale, a replacement is launched, its apply joins the back of the same
-    queue, and the next timeout repeats it -- forever, while the zone stays
-    empty. Observed on 2026-08-21: cells living 1805s against a 1800s budget,
-    every one with ``provider_phase`` still None.
+    queue, and the next timeout repeats it while the zone stays empty.
 
     Once provisioning genuinely starts, the budget applies exactly as before.
     """
@@ -1341,11 +1307,7 @@ def _replaced_incarnations(pool, count: int, *, age_s: float, delivered_after: i
 
 
 def test_a_replacement_loop_trips_the_bound_even_though_each_cell_is_new() -> None:
-    """Found live on 2026-09-24: GCP failed every Spot v5litepod-8 queued resource in
-    us-west4-a ("tenant project creation"), and each failure minted a fresh cell with a
-    clean belief while the failed one was deleted -- fifteen cells in thirty minutes,
-    because the bound only read live cells and every live cell had failed at most twice.
-    """
+    """Bound repeated acquisition failures across replacement cells rather than resetting per incarnation."""
 
     pool = _shape_pool("research/zone-a")
     workload = _pending_workload()

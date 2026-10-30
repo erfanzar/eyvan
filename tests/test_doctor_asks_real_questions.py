@@ -243,13 +243,7 @@ def _cell(cell_id: str, *, prices: dict | None = None, state: str = "ready") -> 
 
 
 def test_a_fleet_where_nothing_is_priced_is_not_reported_as_healthy_pricing() -> None:
-    """Found on hardware: 32 live cells, 42,298 billed seconds, $0 reported.
-
-    "Every priced cell agrees with its pool" is vacuously true when no cell is
-    priced, so `doctor` passed while `eyvan capacity billing` reported a fleet
-    that had been running for hours as free. A check that passes because there
-    was nothing to check is the shape this repository keeps finding.
-    """
+    """Warn when no fleet cells are priced rather than treating a vacuous price-drift check as healthy."""
 
     client = _RecordingClient(_fleet_with([_cell("cell-a"), _cell("cell-b")]))
 

@@ -539,9 +539,7 @@ def test_native_worker_artifact_access_store_stops_before_provisioning_on_iam_fa
             reader_service_account="123456789012-compute@developer.gserviceaccount.com",
         )
 
-    # The provider's own words travel with the failure (README: "Diagnostics
-    # travel with failures"). Until 2026-09-24 they were dropped, so an etag race
-    # and a real permission gap produced the same sentence.
+    # Preserve provider diagnostics so an etag race and a permission gap remain distinguishable.
     assert "PERMISSION_DENIED" in str(error.value)
     assert "needs permission to grant roles/storage.objectViewer" in str(error.value)
     assert len(calls) == 1, "a real permission failure is not retried"
@@ -549,7 +547,7 @@ def test_native_worker_artifact_access_store_stops_before_provisioning_on_iam_fa
 
 
 def test_a_concurrent_bucket_policy_change_is_retried_not_reported_as_a_permission_gap() -> None:
-    """Reproduced live: three parallel grants on one bucket, two failed ``HTTPError 412``."""
+    """Retry bucket-policy precondition conflicts rather than report them as permission failures."""
 
     calls: list[tuple[str, ...]] = []
     sleeps: list[float] = []
@@ -718,9 +716,7 @@ def _provisioning_record():
 
 
 def test_an_insert_that_failed_after_the_create_call_returned_names_the_stockout() -> None:
-    """Found on the 2026-09-24 Spot campaign: the create waiter was interrupted,
-    GCE then failed the insert with ZONE_RESOURCE_POOL_EXHAUSTED, and the cell was
-    narrated only as "absent" -- the provider's sentence never reached anyone."""
+    """Surface the provider's stockout diagnostic when an asynchronous insert fails after create returns."""
 
     runner, calls = _absent_with_operations(
         [

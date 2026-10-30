@@ -16,7 +16,7 @@ from eyvan._internal.ssh import SshDestination, SshOptions
 from eyvan.capacity.providers.gcp.tpu_nodes import TpuApiError, TpuNodeParseError
 from eyvan.capacity.providers.gcp.tpu_ssh import SshTpuNodeReader, parse_host_identity
 
-# Captured from a real v5p-128 worker 0 (2026-10-24), identifiers replaced.
+# Representative v5p-128 worker metadata with neutral identifiers.
 _TPU_ENV = """project=other-project
 preemptible=FALSE
 ACCELERATOR_TYPE: 'v5p-128'

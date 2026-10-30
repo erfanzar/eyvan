@@ -189,10 +189,8 @@ def test_the_heartbeat_deadline_survives_a_model_load(monkeypatch) -> None:
     startup and the workload's own work happens afterwards -- weight download,
     conversion, first compile -- none of which heartbeats.
 
-    On 2026-08-01 an eSurge job on a two-host v5p-16 died with
-    "DEADLINE_EXCEEDED: the JAX distributed service detected fatal errors" while
-    one host was still loading a 0.6B model. Both ranks were killed and the
-    surviving message named neither the cause nor the host.
+    The default must allow cold model loading rather than mistake a busy host
+    for a failed distributed peer.
     """
 
     distributed = _FakeDistributed()
@@ -640,10 +638,7 @@ class _OlderJaxDistributed(_FakeDistributed):
 
 @pytest.mark.parametrize("detection", ["gcetpu", "explicit"])
 def test_a_jax_without_the_heartbeat_argument_still_forms_the_gang(monkeypatch, capsys, detection: str) -> None:
-    """Found on a two-slice Spot v6e-4 on 2026-09-24 (JAX 0.6.2): both ranks died with
-    ``initialize() got an unexpected keyword argument 'heartbeat_timeout_seconds'``
-    before any user code ran. A tuning argument this JAX does not name is dropped,
-    said so, and the gang forms; the identity arguments are never dropped."""
+    """Drop unsupported JAX tuning arguments with a diagnostic while retaining gang identity arguments."""
 
     distributed = _OlderJaxDistributed()
     monkeypatch.setenv("EYVAN_JAX_MULTIHOST", "1")

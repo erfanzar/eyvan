@@ -1091,13 +1091,7 @@ async def test_a_released_attempt_on_a_cell_that_outlived_it_reads_its_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An attached TPU is re-fenced, not destroyed, when a job releases it.
-
-    Seen live 2026-10-25: once the cell moved to its next generation, every
-    earlier job on it read as "cell ... is at generation 2, not the generation
-    1 this attempt was dispatched against" -- the archive was in storage, but
-    the reader still treated the released lease as a live member.
-    """
+    """Read a released attempt's archive after its attached cell advances to a newer generation."""
 
     from eyvan.records import LeaseState
 
@@ -1155,12 +1149,7 @@ async def test_rank_objects_archive_concurrently_within_the_configured_bound(
     width: int,
     concurrency: int,
 ) -> None:
-    """Settlement waits on this archive, so one-at-a-time made a wide slice look hung.
-
-    Seen live 2026-10-25: a 16-host v5p-128 spent 197 s archiving rank objects
-    one after another, and the finished job read as running for three minutes.
-    The bound is the operator's ``log_archive_concurrency``, never a constant.
-    """
+    """Archive rank objects concurrently within log_archive_concurrency so settlement scales to wide slices."""
 
     import dataclasses
 

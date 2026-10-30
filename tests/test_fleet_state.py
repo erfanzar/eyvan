@@ -317,18 +317,7 @@ def test_from_uri_rejects_unknown_schemes_and_selects_backends(tmp_path) -> None
 
 
 def test_a_write_that_timed_out_after_landing_is_not_reported_as_a_failure() -> None:
-    """Found live 2026-08-01 against a real GCS bucket over a slow link.
-
-    ``gcloud storage cp --if-generation-match`` timed out client-side at 30s
-    repeatedly. The timeout escaped ``_write`` uncaught, so the agent answered 500
-    for a mutation the object had already accepted. The control plane and the
-    agent then disagreed about the cell's generation, the next fenced command was
-    rejected as stale, and the control plane read that as a lost cell -- draining
-    a healthy v5p-16 Spot slice.
-
-    A conditional write that times out is indeterminate, not failed. Ask the
-    object which it was.
-    """
+    """Read back a timed-out conditional write to distinguish a committed mutation from failure."""
 
     class TimeoutAfterLandingGcs:
         def __init__(self):
@@ -406,19 +395,7 @@ def test_an_unreadable_store_does_not_claim_the_write_landed() -> None:
 
 
 def test_an_unreadable_body_is_not_an_empty_fleet() -> None:
-    """The root cause of a live churn loop on 2026-08-01.
-
-    ``describe`` establishes that the object exists at a real generation. If the
-    following ``cat`` then fails or comes back blank and the store answers with
-    an empty document, every caller believes the fleet has no cells:
-    ``state.get(cell_id)`` returns None, ``_ensure_owned`` concludes the cell no
-    longer belongs to its generation, the controller records a fence conflict,
-    and the autoscaler drains the capacity. One flaky read destroys every cell,
-    and the next destroys their replacements.
-
-    It burned six consecutive v5p-16 Spot requests before the diagnostic that
-    named it was plumbed through.
-    """
+    """Treat an unreadable existing object as unavailable, not an empty fleet that would invalidate ownership."""
 
     from eyvan.capacity.fleet_state import FleetStateUnavailableError
 
@@ -532,19 +509,7 @@ def test_same_fleet_scope_still_serializes_default_owned_stores(tmp_path) -> Non
 
 
 def test_two_stores_in_one_agent_are_one_writer(tmp_path) -> None:
-    """Found live on 2026-08-01: an agent deadlocked against its own lease.
-
-    Several stores are built over one document inside a single agent -- the GCP
-    driver alone builds two, and the agent service builds another. With a
-    per-instance identity each believed it was a rival agent, so the second to
-    ask was refused a lease the first held. The refusal lasts the full TTL: a
-    cell sat in `deleting` while `capacity.release` retried into "Eyvan fleet
-    mutation lease is busy", and the holder named in the document was the very
-    process being refused.
-
-    The durable lease exists to exclude *other agents*. Instances inside one
-    process are not that.
-    """
+    """Share lease identity across stores in one agent process while still excluding other agents."""
 
     path = tmp_path / "fleet.json"
     driver_store = FleetStateStore(LocalBackend(path))
@@ -598,14 +563,7 @@ def test_a_lease_on_another_host_is_never_assumed_dead(tmp_path) -> None:
 
 
 def test_a_transient_read_failure_is_retried_before_it_is_believed() -> None:
-    """One flaky read must not take out every route that reads fleet state.
-
-    Measured from one laptop on 2026-08-01, roughly 10-20% of
-    ``gcloud storage cat`` calls against a live object failed outright. Refusing
-    to treat that as an empty fleet is necessary but not sufficient: without a
-    retry, a single blip 500s the log fetch an operator needs to diagnose the
-    blip.
-    """
+    """Retry transient fleet-state reads so a single storage failure does not break every dependent route."""
 
     class FlakyThenGoodGcs:
         def __init__(self):

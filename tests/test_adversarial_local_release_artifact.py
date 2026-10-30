@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Adversarial local release-artifact regressions for writer 121."""
+"""Reject malformed, oversized or inconsistent local release artifacts."""
 
 from __future__ import annotations
 

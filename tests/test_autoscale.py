@@ -785,18 +785,9 @@ def test_a_hand_written_zero_is_still_warned_about(tmp_path) -> None:
 
 
 def test_a_declared_worker_python_reaches_the_generated_fleet() -> None:
-    """The refusal that could not fire from a generated fleet.
+    """Preserve a declared worker Python version so submission can reject incompatible callables.
 
-    ``submit_pool_callable`` refuses a callable pickled on an interpreter the
-    pool does not run, and has since a live multislice v5p-16 provisioned two
-    slices, dispatched to four ranks, and had every rank die on it. The check
-    reads ``pool.runtime.python``, and nothing in autoscale generation ever wrote
-    that field -- so on a generated fleet the mismatch was still discovered on
-    the accelerator, at the cost of a full provisioning cycle. It happened again
-    on 2026-08-21: Python 3.13 on the laptop, 3.11 in the image.
-
-    Declared, it reaches the fleet document. Undeclared, the document is exactly
-    what it was, so a fleet that says nothing behaves as it did.
+    An undeclared version must leave the generated fleet document unchanged.
     """
 
     from eyvan.capacity.autoscale.compiler import _fleet_document

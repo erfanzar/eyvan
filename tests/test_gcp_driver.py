@@ -915,14 +915,9 @@ def test_drain_fences_absent_incarnation_and_newer_generation_can_recreate(tmp_p
 def test_a_release_does_not_hold_the_fleet_lock_while_it_talks_to_the_provider(tmp_path) -> None:
     """Two cells release concurrently instead of one waiting out the other's deletes.
 
-    Releasing used to hold ``_mutation_lock`` and the durable fleet-state lease
-    across the provider deletes, so every cell sharing a fleet-state document
-    released strictly one at a time -- and each state mutation is a
-    compare-and-swap against object storage. Draining a fleet queued every
-    release behind every earlier one, the tail passed the cell agent's
-    700-second timeout, and the control plane retried work the agent had already
-    finished. Cells sat in ``deleting`` for hours on 2026-08-19 while the
-    provider held nothing.
+    Holding ``_mutation_lock`` and the durable fleet-state lease across provider
+    deletes serializes releases for all cells sharing the document. Provider I/O
+    must run outside those locks so a slow delete cannot delay unrelated cells.
 
     The property is asserted by making the first release block *inside* the
     provider call and requiring the second to finish anyway. Under the old code
@@ -1081,7 +1076,7 @@ def test_release_keeps_an_ingress_rule_another_native_cell_still_uses(monkeypatc
 def test_release_keeps_an_ingress_rule_a_public_attached_tpu_still_uses(
     monkeypatch, tmp_path, endpoint_mode, ssh_entry, kept
 ) -> None:
-    """Seen live 2026-10-25: releasing the last provisioned cell deleted the rule an attached v5p-8 used."""
+    """Retain shared ingress rules while a public attached TPU still uses them."""
 
     import eyvan.capacity.providers.gcp.native_worker_ingress as ingress_module
 
@@ -1323,14 +1318,10 @@ pytestmark = pytest.mark.slow
 
 @pytest.mark.parametrize("operation", ["apply", "reconcile"])
 def test_a_slow_provider_call_for_one_cell_does_not_stall_another(tmp_path, operation: str) -> None:
-    """The other half of the 2026-08-19 fix, found live on 2026-09-24.
+    """Keep slow provider ensure calls outside shared locks so other cells can apply or reconcile.
 
-    ``apply_capacity`` and ``reconcile`` held ``_mutation_lock`` and the fleet
-    lease across ``provider.ensure`` -- a ``gcloud ... create`` that waits minutes
-    on a Spot insert -- so one v5p-8 create in us-central1-a stalled v5p-16,
-    v5litepod-8 and v6e-4 requests of three other fleets. As in the release
-    test, the first call blocks *inside* the provider and the second must finish
-    anyway; the join timeout turns "still serialised" into a failure.
+    The first call blocks inside the provider while the second must finish;
+    a bounded join turns serialization into a failure instead of a hung suite.
     """
 
     import threading

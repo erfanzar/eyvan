@@ -357,20 +357,7 @@ def test_a_reclaimed_cell_that_is_gone_cannot_vouch_for_the_absence_of_a_cooldow
 
 
 def test_a_replacement_cell_backing_off_for_its_own_reasons_is_not_this_proof_s_business() -> None:
-    """Read off the live run of 2026-08-13, which failed on this and should not have.
-
-    The reclaimed cell recorded exactly what it should -- ``interruptions``, no
-    failure, no cooldown. Four minutes later its *replacement* hit a transient
-    ``could not describe TPU node``, was classified PROVIDER_ERROR, took the 15s
-    backoff, and recovered on the next pass. Scoped to the pool rather than to
-    the reclaimed cell, that unrelated and already-recovering backoff failed a
-    criterion about how the reclamation was classified.
-
-    This is the sibling of the unrelated-pool case below, one level down, and it
-    matters more: a replacement cell is churning *because* a reclamation just
-    happened, so this is the cooldown most likely to be present and least likely
-    to be about the claim.
-    """
+    """Scope preemption-classification evidence to the reclaimed cell, excluding unrelated replacement cooldowns."""
 
     result = evaluate_spot_preemption(
         _preempted(),
@@ -860,17 +847,7 @@ def test_a_real_verdict_passes_through_the_guard_unchanged() -> None:
 
 
 def test_released_unpriced_cells_do_not_block_a_measured_cost() -> None:
-    """Found by running P6 against a pool that had been rebuilt twice.
-
-    The pool's two earlier incarnations were released before it carried prices,
-    so `unpriced_cells` was 2 while the live cell was priced and had accrued real
-    cost. Treating any unpriced cell as disqualifying made the cost half
-    inconclusive on a run that had measured cost correctly -- the check refusing
-    to answer a question it had the answer to.
-
-    The rule is about the failure it exists to catch: a fleet reading as free
-    because nothing is priced. Cost above zero means that did not happen.
-    """
+    """Accept measured positive cost even when earlier released cell incarnations had no prices."""
 
     result = evaluate_warm_window(
         _warmth(active=True, floor=1, warm=1),
@@ -1250,8 +1227,7 @@ def test_p9_fails_a_workload_that_was_never_bound_to_a_pool() -> None:
 
 
 def test_a_secret_redelivered_to_a_second_attempt_passes() -> None:
-    """The documented P4 run: "across at least two attempts". Counting events over the
-    whole workload failed exactly this run with "expected exactly one; found 2"."""
+    """Validate secret issuance and reads per attempt so redelivery on retry remains valid."""
 
     result = evaluate_secret_delivery(
         [

@@ -3,19 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""How often a durable command retries while it is failing, and when that stops
-being routine.
+"""Back off and report durable commands whose transient failures persist.
 
-A transient failure gives its attempt back on purpose: an agent restarting
-mid-dispatch must not spend a workload's retry budget. Nothing else grew, so a
-condition that only *looked* transient retried once a second forever at an
-unchanged attempt number, with an identical warning each time.
-
-Watched live on 2026-08-12: a native worker answered 500 to every stop, the
-cancel retried that way for twenty minutes, four TPU VMs stayed leased, and
-nothing in the control plane ever said this had stopped being normal. The cause
-is fixed elsewhere; what is asserted here is that the next condition of that
-shape backs off and gets said out loud.
+Transient failures must not spend the workload's retry budget, but an unchanged
+attempt number must not permit once-per-second retries and identical warnings
+forever.
 """
 
 from __future__ import annotations

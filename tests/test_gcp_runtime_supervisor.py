@@ -1009,14 +1009,7 @@ def _plane_store(tmp_path: Path) -> GcpNativeRuntimeProfileStore:
 
 
 def test_the_agent_is_judged_against_the_serving_plane_not_the_calling_cli(monkeypatch, tmp_path: Path) -> None:
-    """Found live 2026-09-24: `eyvan up` from an edited tree split the runtime in two.
-
-    The CLI replaced the agent with its own build and reused the plane, which --
-    with the worker wheel it had staged -- stayed on the old one. The plane then
-    recycled a freshly granted Spot v6e-16 as stale, and would have recycled
-    every cell after it. The agent's reference is now the plane's build, and the
-    operator is told to move the runtime as one.
-    """
+    """Compare the agent with the serving plane's build so an edited CLI cannot split the runtime's identity."""
 
     from eyvan.capacity.providers.gcp.runtime import supervisor as supervisor_module
 

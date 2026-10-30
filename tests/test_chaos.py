@@ -636,21 +636,10 @@ async def test_a_healthy_workload_is_never_swept() -> None:
 
 @pytest.mark.asyncio
 async def test_an_unanswerable_agent_does_not_retire_queued_capacity() -> None:
-    """Reproduces a live incident on 2026-08-01 that cost a granted v5p-16 slice.
+    """Leave queued capacity unchanged when an agent cannot answer rather than infer provider failure.
 
-    The control plane's own host lost DNS for a moment while the agent was reading
-    its fleet state. The agent returned an unstructured 500, which the observation
-    path caught with a bare ``except Exception`` and recorded as
-    ``CapacityStatus.PROVIDER_ERROR``: a statement that the *provider* had failed.
-
-    Two expensive things follow from that one misclassification. The provider phase
-    clock restarts, so a cell that was legitimately queued gets retired on a
-    provisioning timeout the provider never caused. And the zone's ``CapacityBelief``
-    is fed a failure, biasing every future placement against a zone that did nothing
-    wrong.
-
-    Invariant: an agent that could not answer teaches the control plane nothing, so
-    the cell record is left exactly as it was and the next tick asks again.
+    Agent unavailability must not restart the provider phase clock or feed a
+    failure into the zone's capacity belief; the next tick should ask again.
     """
 
     from eyvan.capacity import CapacityStatus
@@ -716,9 +705,8 @@ async def test_a_rejected_fence_records_which_check_rejected_it() -> None:
     "cell-agent reconciliation rejected the current fence", which says only that
     a fence was rejected.
 
-    Live on 2026-08-01 that cost hours: diagnosing a churn loop meant reading the
-    agent's fleet-state document out of GCS by hand to recover a string the
-    control plane had already been told.
+    Preserve the specific rejection so operators can distinguish those causes
+    without inspecting the agent's state document.
     """
 
     from eyvan.capacity import CapacityStatus

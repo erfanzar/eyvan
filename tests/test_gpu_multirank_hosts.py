@@ -400,9 +400,8 @@ def test_the_layout_a_rank_environment_defaults_to_is_the_one_that_ships() -> No
 def test_the_two_layouts_disagree_about_processes_and_agree_about_hardware() -> None:
     """Opting in changes what a rank *is*, and must not change what it holds.
 
-    Stated as an explicit difference set so the semantic switch is visible: a
-    deployment that turns this on is choosing a process-counted ``WORLD_SIZE``,
-    and no reviewer should have to infer that from a diff.
+    An explicit difference set distinguishes process-counted ``WORLD_SIZE``
+    from the hardware allocation that both layouts share.
     """
 
     plan = plan_gpu_devices([8, 4], rank_hosts=["worker-a", "worker-b"])

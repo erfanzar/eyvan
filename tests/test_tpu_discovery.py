@@ -73,7 +73,9 @@ class FakeApi:
 def _account() -> FakeApi:
     return FakeApi(
         {
-            "example-spot-project": [_node("example-spot-project", "us-east5-a", "spot-train", spot=True, kind="v6e-16")],
+            "example-spot-project": [
+                _node("example-spot-project", "us-east5-a", "spot-train", spot=True, kind="v6e-16")
+            ],
             "example-research-project": [
                 _node("example-research-project", "us-central1-a", "lab_spot_m"),
                 _node("example-research-project", "us-central1-a", "v5p-trainer-1", kind="v5p-32"),

@@ -36,8 +36,8 @@ from eyvan.capacity.hardware_catalog import (
 )
 
 #: Provider-published per-TPU-VM resources, written as independent literals.
-#: Google Cloud's v5p and v6e pages (both versioned "Last updated 2026-08-04
-#: UTC") establish these CPU/RAM values and topology-dependent VM shapes.
+#: Google Cloud's v5p and v6e pages establish these CPU/RAM values and
+#: topology-dependent VM shapes.
 EXPECTED = {
     "v5p-8": {"chips": 4, "quota_units": 8, "hosts": 1, "cpu": 208, "memory_gib": 448, "source": "v5p"},
     "v5p-16": {"chips": 8, "quota_units": 16, "hosts": 2, "cpu": 208, "memory_gib": 448, "source": "v5p"},
@@ -851,10 +851,8 @@ def test_a_shape_with_no_recorded_host_count_keeps_the_provider_authoritative() 
 def test_autoscale_prefers_the_catalog_over_the_suffix_derivation(monkeypatch) -> None:
     """The branch is invisible today, which is exactly why it needs a test.
 
-    For every shape currently catalogued the derived answer and the catalog
-    answer agree -- that agreement is the parity this phase was built on. So
-    deleting the catalog branch changes nothing observable, and it would survive
-    review as dead code right up until the first shape whose host CPU is not 32.
+    Current catalog entries agree with the suffix-derived answer, so an unusual
+    host CPU count is needed to distinguish catalog lookup from fallback derivation.
 
     ``shape_for`` is patched, not the function under test: the branch's whole job
     is to consult the catalog, so substituting the catalog is what exercises it.

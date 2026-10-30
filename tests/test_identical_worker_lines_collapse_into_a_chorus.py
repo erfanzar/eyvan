@@ -57,12 +57,7 @@ BANNER = "(20:21:39 EasyDeL) please install `torch` (cpu) if you want to use `Au
 
 
 def test_four_ranks_saying_the_same_line_render_once_with_the_headcount() -> None:
-    """The live incident: a 4-host gang printed its banner four times.
-
-    Every host said it, so which hosts said it carries no information -- the
-    headcount is the whole fact, and one line with ``(4x Worker)`` is the
-    honest rendering of four identical voices.
-    """
+    """Collapse identical worker lines into one line carrying the contributing worker count."""
 
     lines = _render(
         tuple(
@@ -134,11 +129,9 @@ def test_a_page_without_rank_data_never_collapses() -> None:
 def test_a_straggler_keeps_its_own_order_and_the_chorus_stays_whole() -> None:
     """A rank saying something else first does not split everyone else's chorus.
 
-    The adjacency rule this replaced rendered this page as three lines -- two
-    half-choruses around the straggler -- and on a real 16-host page it chopped
-    one ``print`` into runs of 2x, 5x and single workers. What must hold is each
-    rank's own order: rank 3 said ``compiling`` before its banner, so it prints
-    first, and the banner all four ranks said is one line.
+    Preserve each rank's order without requiring identical lines to be adjacent:
+    rank 3's earlier ``compiling`` line comes first, and the shared banner stays
+    one line.
     """
 
     lines = _render(

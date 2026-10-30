@@ -5,10 +5,8 @@
 
 """A read answered with a retryable 503 is asked again, not reported as failure.
 
-Found live on 2026-09-24: a Spot head answered one ``GET /workloads/{id}`` with
-503 and ``Retry-After: 1`` for a PostgreSQL serialization conflict, and the
-client's ``wait()`` died with a traceback while the job ran on. Mutations were
-already retried on exactly these statuses; reads were not.
+Read retries must honor retryable statuses and ``Retry-After`` so a transient
+PostgreSQL conflict does not terminate workload polling.
 """
 
 from __future__ import annotations

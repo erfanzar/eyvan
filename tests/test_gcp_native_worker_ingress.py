@@ -341,12 +341,7 @@ class FailingPublicIpv4Resolver:
 
 
 def test_resolution_failure_keeps_an_existing_managed_rule_instead_of_failing() -> None:
-    """A bad minute at the discovery services must not strand reachable capacity.
-
-    Live on 2026-08-22: cells sat EXECUTION_CONNECTING while their TPUs billed
-    because api.ipify.org alone could not be reached and the reconciliation
-    raised instead of keeping the rule it had already written.
-    """
+    """Keep an existing ingress rule when public-IP discovery is unavailable rather than strand reachable capacity."""
 
     runner = FirewallRunner()
     _manager(runner).ensure(project="project-a", network="research", port=8100)

@@ -470,8 +470,7 @@ def test_ssh_invalid_destination_refused(harness, destination):
         # Script digests, not credentials.
         # pragma: allowlist nextline secret
         ("eyvan", "624d99879b51881e4175ae9bb70e662e9802eb47be4586088d66e3fdc0297965"),
-        # Changed 2026-10-25 on purpose: a local wheel is now force-reinstalled,
-        # because a same-version rebuild was otherwise silently kept out.
+        # Force-reinstall local wheels so same-version rebuilds replace installed bytes.
         # pragma: allowlist nextline secret
         ("/tmp/eyvan-1.0-py3-none-any.whl", "4df6f8fb8d1aba3b51a1ebda36a69d72d6903e964d4c1d906c306f46f00f66d5"),
     ],
@@ -803,7 +802,7 @@ def test_replaced_cells_end_the_wait(monkeypatch, harness):
 
 
 def test_dead_cells_from_an_earlier_attempt_are_ignored(monkeypatch, harness):
-    """A rerun under the same fleet name must not count the previous run's dead cells (2026-10-24)."""
+    """A rerun under the same fleet name must not count the previous run's dead cells."""
 
     history = [{"id": f"old-{index}", "state": "deleted", "unavailable_reason": "ABSENT"} for index in range(14)]
 

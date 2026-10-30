@@ -5,10 +5,8 @@
 
 """A project admin's grant listing stops at their own projects.
 
-``list_role_grants`` narrowed by organization only, so a PROJECT_ADMIN of one
-project received the subjects, roles and reasons of every sibling project in
-the same organization -- a staff directory of tenants they do not administer
-(BB-001, deferred from campaign 1, rechecked and fixed in campaign 2 round 013).
+``list_role_grants`` must not expose sibling projects' subjects, roles or
+reasons to a PROJECT_ADMIN who does not administer those projects.
 """
 
 from __future__ import annotations

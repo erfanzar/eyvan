@@ -5,13 +5,9 @@
 
 """Clients follow the runtime profile a loopback plane was deployed with.
 
-``eyvan runtime deploy --profile PATH`` starts a plane and agent under a
-profile other than ``~/.eyvan/gcp-native-runtime.json``. Before these tests,
-``eyvan.init()`` refused that plane ("running with a different runtime
-profile") and advised restarting it -- which would have replaced it with one
-bound to the default profile's project -- and ``eyvan doctor`` reported the
-default profile's project beside a plane serving another one. Found on the
-2026-09-24 Spot TPU campaign, whose plane was deployed with ``--profile``.
+When ``eyvan runtime deploy --profile PATH`` selects a nondefault profile,
+``eyvan.init()`` and ``eyvan doctor`` must use that serving profile rather than
+suggest a restart under, or report details from, the default profile.
 """
 
 from __future__ import annotations

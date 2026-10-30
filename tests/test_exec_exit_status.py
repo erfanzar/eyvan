@@ -5,9 +5,8 @@
 
 """``eyvan workload exec`` exits non-zero when any rank did not run the command.
 
-Found live on a Spot v6e-4 fleet (2026-09-24): every rank answered "this fleet
-does not permit exec" and the command still exited 0, so a script could not
-tell a refused diagnostic from a successful one without parsing the document.
+Scripts must be able to distinguish a refused diagnostic from a successful one
+without parsing the response document.
 """
 
 from __future__ import annotations

@@ -42,13 +42,7 @@ def _result(projects: tuple[str, ...]) -> RuntimeRestartResult:
 
 
 def test_a_restart_without_trust_warns_before_the_next_submission_fails() -> None:
-    """The observed failure: restart succeeded, then every callable 403'd.
-
-    On 2026-08-02 a restart onto a freshly staged wheel returned ``started`` for
-    both services and the next submission was refused with ``callable workloads
-    are not trusted for project eyvan-live/v5p16``. The 403 names the workload,
-    so the restart that dropped the trust is invisible from the error.
-    """
+    """Warn during restart when missing callable trust would cause the next submission to be refused."""
 
     warning = _result(()).callable_trust_warning
 

@@ -3,24 +3,10 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Where a checkpoint is written, and where a resume reads it from.
+"""Derive matching rank-specific checkpoint addresses for writes and resumes.
 
-Found on a live 2x v5p-16 on 2026-08-02, and only findable there. A batch
-training job was preempted by a production job; every step of the protocol
-worked -- plan, checkpoint hook, stop, capacity handed over, victim requeued as
-attempt 2 carrying its checkpoint URI. Then attempt 2 logged::
-
-    RESUME: reading gs://.../preempt-demo
-    RESUME: gs://.../preempt-demo is absent; starting from step 0
-
-The hook had written ``gs://.../preempt-demo/rank-0`` and ``/rank-1``. The write
-path rank-suffixes through ``_rank_checkpoint_uri``; the resume path passed the
-bare base URI. Nothing raised: the workload saw "no checkpoint", restarted from
-zero, and 252 completed training steps were silently discarded while every
-record said the resume had succeeded.
-
-The two addresses have to be derived the same way, so these tests assert they
-agree rather than asserting either one's shape.
+The two paths must agree so a resumed attempt does not silently start from zero
+when its checkpoint exists under a rank suffix.
 """
 
 from __future__ import annotations

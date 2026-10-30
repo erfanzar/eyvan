@@ -52,8 +52,7 @@ def test_safe_provider_diagnostic_matches_the_error_marker_case_insensitively(ma
     ),
 )
 def test_stockout_quota_and_preemption_causes_reach_the_user_verbatim(line: str) -> None:
-    """Compute's stockout code matched none of the gcloud markers, so every Compute
-    stockout was flattened into "inspect Eyvan controller logs" (2026-09-24)."""
+    """Preserve Compute stockout, quota and preemption diagnostics rather than replace them with generic guidance."""
 
     assert safe_provider_diagnostic(f"some progress noise\n{line}\n") == line
 

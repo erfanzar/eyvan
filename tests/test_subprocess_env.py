@@ -5,11 +5,8 @@
 
 """Coverage for interpreter-steering scrubbing at provider CLI boundaries.
 
-The behavior under test exists because of a live outage on 2026-08-22: a client
-process set a checkout-relative ``PYTHONPATH``, the cell agent inherited it,
-and every ``gcloud`` it spawned crashed at import time when macOS TCC refused
-the CLI's embedded Python a directory listing the invoking terminal was
-allowed. Cells that were ACTIVE and billing never reached READY.
+A client-supplied ``PYTHONPATH`` must not steer gcloud's embedded Python into
+checkout paths or trigger import-time failures in provider subprocesses.
 
 The behavioral tests below pin the runners behind the busiest boundaries; a
 source scan pins the invariant itself across every production gcloud spawn, so
@@ -118,13 +115,9 @@ def test_gcs_artifact_store_default_runner_scrubs_interpreter_steering(monkeypat
     assert "PYTHONPATH" not in env
 
 
-# Production gcloud spawn sites that still inherit the caller's interpreter
-# steering: places where the outage invariant does not hold yet. Each entry is
-# a live defect needing a production fix (route the spawn through
-# ``provider_cli_env``); the scan below fails as soon as one is fixed -- remove
-# its entry then -- and the moment any other gcloud boundary stops scrubbing.
-# (Empty as of the 2026-08-28 fix sweep: every gcloud boundary in the tree
-# scrubs interpreter steering.)
+# Track any production gcloud spawn sites that still inherit interpreter steering.
+# Each entry requires a fix routing the spawn through ``provider_cli_env``; the
+# scan rejects stale entries and any newly unscrubbed boundary.
 PENDING_UNSCRUBBED_GCLOUD_SPAWNS = frozenset()
 
 _SPAWN_CALL_NAMES = frozenset({"run", "Popen", "check_call", "check_output", "call"})
@@ -215,8 +208,8 @@ def test_source_scan_every_gcloud_spawn_scrubs_interpreter_steering() -> None:
 
     The behavioral tests pin individual runners; this scan pins the invariant
     itself, so a new gcloud boundary cannot land still inheriting the caller's
-    interpreter steering (the outage-58 regression class). Sources are parsed,
-    never executed: no network, no subprocesses.
+    interpreter steering. Sources are parsed, never executed: no network, no
+    subprocesses.
     """
 
     import eyvan

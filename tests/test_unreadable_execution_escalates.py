@@ -6,10 +6,9 @@
 """What happens when an execution's status can never be read.
 
 An INDETERMINATE observation is a statement about the observation, not about the
-workload, so the controller keeps polling rather than guessing. Polling forever
-was the other half of the 2026-08-02 incident: a workload sat in CANCELLING for
-forty minutes holding a 2x v5p-16 Multislice while every observation came back
-unreadable, and nothing escalated.
+workload, so the controller keeps polling rather than guessing. Persistently
+unreadable observations must eventually escalate instead of holding capacity
+indefinitely.
 
 The escalation drains the *cell* rather than settling the workload. Settling it
 would release the lease while the workload might still be running, letting a

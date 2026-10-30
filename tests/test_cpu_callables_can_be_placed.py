@@ -5,11 +5,8 @@
 
 """A callable that asked for a CPU can land on a CPU pool.
 
-``eyvan`` exports ``CpuConfig``, ``@execute`` accepts it, and a test asserts the
-decorator accepts every config the package ships -- while every such submission
-was refused with "is not a TPU pool", after the callable had been serialized and
-uploaded to the artifact store. Observed on a live fleet on 2026-08-13 against a
-healthy CPU pool.
+``eyvan`` exports ``CpuConfig`` and ``@execute`` accepts it; submission must
+therefore recognize CPU pools rather than refuse them as non-TPU pools.
 
 The branch that fixes it is deliberately narrow. ``cpu`` is the one accelerator
 type whose kind is knowable from the wire, because ``CpuConfig`` is the only
@@ -257,18 +254,7 @@ async def test_a_pool_carrying_a_tpu_is_refused_for_a_gpu_callable() -> None:
 
 
 def test_the_refusal_names_the_driver_and_not_placement() -> None:
-    """The reason changed on 2026-08-13 and the old one is now false.
-
-    A ``GpuConfig`` callable was serialized, uploaded, placed on a real
-    ``nvidia-tesla-p100`` spot cell, run, and returned its result -- so "Eyvan
-    cannot place a callable on a GPU pool" would be a lie. What it returned was
-    ``nvidia-smi`` failing to reach the driver, because the default GPU image
-    pins NVIDIA 580 and that branch dropped Pascal and Volta.
-
-    Asserted because the failure mode is a silent one: the job *succeeded*. If
-    someone later restores the old wording, or drops the refusal on the strength
-    of "placement works now", this is what should stop them.
-    """
+    """Name unsupported NVIDIA driver compatibility rather than incorrectly claiming GPU placement is unavailable."""
 
     from eyvan import GpuConfig
     from eyvan.sdk.execution import _refuse_unplaceable_config

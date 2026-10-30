@@ -720,14 +720,7 @@ def test_the_native_worker_builds_its_staging_executor_from_its_own_environment(
 
 
 def test_a_launch_the_worker_rejects_is_a_value_error_not_a_server_fault(tmp_path) -> None:
-    """Found live 2026-09-24: a rejected launch was a 500, which reads as transient.
-
-    The worker's validator refused an environment value with a newline; with no
-    handler that became a 500, the cell agent passed on another 500, and the
-    plane retried the dispatch for twenty minutes. The worker now answers 400
-    ``invalid_configuration`` and the client raises the ValueError it was, so the
-    agent's existing handler carries the verdict to the plane.
-    """
+    """Return invalid launches as typed configuration errors so the plane does not retry them as server faults."""
 
     from fastapi.testclient import TestClient
 

@@ -5,12 +5,10 @@
 
 """Clients of a head's HTTPS plane trust its private CA, and only by adding it.
 
-``eyvan head up`` could not produce a working head on 2026-09-24: a network
-bind refuses plaintext, and the head served neither TLS nor the opt-out. The
-head now issues itself a certificate under its own CA, so every client of that
-plane -- the SDK and CLI on the head, and a job's callbacks on a TPU host -- has
-to verify against that CA. These tests stand up a real HTTPS listener under a
-freshly generated CA and call it the ways Eyvan does.
+The head issues itself a certificate under its own CA, so every client of that
+plane -- the SDK and CLI on the head, and a job's callbacks on a TPU host -- must
+verify against that CA. These tests use a real HTTPS listener under a freshly
+generated CA and call it the ways Eyvan does.
 """
 
 from __future__ import annotations
@@ -403,12 +401,7 @@ def test_head_env_serves_https_under_its_own_ca() -> None:
 
 
 def test_the_ca_handed_to_a_job_survives_the_workers_environment_rules(monkeypatch, plane: tuple[str, Path]) -> None:
-    """Found live 2026-09-24: sent as PEM, every dispatch from a TLS head was refused.
-
-    systemd forbids a newline in an environment value, PEM is multi-line, and
-    the native worker answered each submit with a 500 that the plane retried
-    for ever. What the plane renders must pass the worker's own validator.
-    """
+    """Encode the job's CA without newlines so it passes the worker's systemd environment validator."""
 
     from eyvan.worker.runtime.systemd_transient import _environment
 

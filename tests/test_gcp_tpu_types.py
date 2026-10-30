@@ -54,18 +54,7 @@ def _spec_labels(uid: str = "uid-1", cell: str = "cell-a"):
 
 
 def test_an_unlabelled_active_queued_resource_is_not_declared_foreign() -> None:
-    """Cloud TPU does not echo labels or metadata back for a provisioned QR.
-
-    Verified against a live ACTIVE v5p-16 on 2026-08-02: the queued resource
-    returned no labels at any path, and the TPU node returned ``labels: null``
-    and ``metadata: {}`` -- even though the startup script from that same
-    metadata had demonstrably run.
-
-    Treating that silence as "someone else owns this" stranded ACTIVE, billing
-    capacity Eyvan had created itself, with the workload stuck pending. The id
-    was minted by Eyvan under a fence and recorded, which is the remaining
-    authority.
-    """
+    """Use the fenced recorded QR ID as ownership evidence when Cloud TPU omits labels and metadata."""
 
     from eyvan.capacity.providers.gcp.queued_resources import GcloudTpuProvider
 

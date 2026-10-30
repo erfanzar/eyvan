@@ -237,10 +237,7 @@ def test_the_capable_executor_set_is_stated_not_inferred() -> None:
     ),
 )
 def test_every_callback_refusal_is_settled_rather_than_retried(public_url, workload_spec, cell) -> None:
-    """Seen live on 2026-09-24: this refusal was a bare ``RuntimeError``, so the outbox
-    retried it with backoff while the lease held a Spot v6e-4 -- and, for a secret
-    workload, printed only "output suppressed for secret-bearing execution".
-    ``PermanentDispatchRefusal`` is the family the outbox settles, with its reason."""
+    """Settle unreachable-callback refusals permanently rather than retrying while holding a lease."""
 
     from eyvan.server.controller.workload_commands import PermanentDispatchRefusal
 

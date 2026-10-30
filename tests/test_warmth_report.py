@@ -252,12 +252,7 @@ async def test_pools_are_reported_in_a_stable_order() -> None:
 
 @pytest.mark.asyncio
 async def test_a_requested_cell_is_provisioning_not_warm() -> None:
-    """Found live 2026-09-24: a Spot floor read as held before its request reached GCP.
-
-    The planner rightly counts an in-flight request as supply so it does not
-    launch twice. Warmth is a different question -- whether capacity is serving
-    -- and a proof that reads it must not pass on a request still in the queue.
-    """
+    """Count in-flight requests as provisioning, not warm capacity, even when the planner counts them as supply."""
 
     service = await _service()
     pool = _pool(windows=(_workday_window(2),))

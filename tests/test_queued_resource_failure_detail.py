@@ -5,11 +5,8 @@
 
 """A FAILED queued resource carries GCP's own reason into the observation.
 
-On 2026-09-24 a Spot v5litepod-8 in us-west4-a ended ``FAILED`` with
-``failedData.error = {code: 10, message: "Failed to perform tenant project
-creation"}``. Eyvan replaced the cell correctly and said only "queued resource
-is terminal (SUSPENDING)", so nobody could tell a provider-side fault from a
-stockout or from something the operator could fix.
+Preserving ``failedData.error`` lets operators distinguish provider-side faults
+from stockouts or configuration problems even while the resource is suspending.
 """
 
 from __future__ import annotations

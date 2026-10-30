@@ -148,11 +148,9 @@ def test_cell_agent_client_preserves_typed_capacity_provider_failure() -> None:
 def test_an_unstructured_agent_500_is_distinguishable_from_a_provider_failure() -> None:
     """The agent failing is not the capacity failing.
 
-    Both used to arrive as a generic ``HTTPStatusError``, so the observation path
-    recorded an agent that could not answer as ``CapacityStatus.PROVIDER_ERROR``
-    -- restarting the provider phase clock and feeding the zone's belief a failure
-    the provider never caused. On 2026-08-01 that discarded a v5p-16 Spot
-    Multislice one transient DNS lookup after Google granted it.
+    An unavailable agent must not be recorded as ``CapacityStatus.PROVIDER_ERROR``:
+    doing so restarts the provider phase clock and feeds the zone's belief a
+    failure the provider never caused.
     """
 
     from eyvan.worker.agent.client import CellAgentUnavailableError
@@ -888,17 +886,10 @@ async def test_an_unsupported_capability_settles_the_command_instead_of_retrying
 
 
 def test_a_dropped_connection_is_unavailable_not_a_provider_failure() -> None:
-    """Observed live on 2026-08-01 while restarting the agent.
+    """Classify dropped connections as agent unavailability rather than provider failure.
 
-    A 5xx is a *response*, so `_raise_for_status` can classify it. A dropped
-    connection produces no response at all -- httpx raises before
-    `_raise_for_status` is reached -- so it escaped as a bare transport error,
-    was caught by the controller's `except Exception`, and recorded as
-    `CapacityStatus.PROVIDER_ERROR` against a healthy queued cell: "Server
-    disconnected without sending a response."
-
-    Same misclassification `CellAgentUnavailableError` exists to prevent,
-    arriving by a different door.
+    A dropped connection has no response for ``_raise_for_status`` to classify,
+    so transport errors need the same typed unavailability handling as agent 5xx responses.
     """
 
     from eyvan.worker.agent.client import CellAgentUnavailableError
@@ -953,18 +944,7 @@ def test_every_agent_call_goes_through_the_one_seam() -> None:
 
 
 def test_a_rejected_configuration_carries_the_agents_own_sentence() -> None:
-    """Observed 2026-08-01: a one-line YAML mistake read as "Internal Server Error".
-
-    The capacity drivers validate provider options by raising `ValueError` with a
-    message naming the exact contradiction -- "internal-only eyvan-native Compute
-    capacity cannot use bootstrap_egress=public-internet". With no handler for it,
-    FastAPI returned its default 500 body, the control plane stored
-    `last_error: "Internal Server Error"`, and the cell recorded
-    `unavailable_detail: None`.
-
-    Everything needed to fix it in one line had been written by the agent and
-    then thrown away.
-    """
+    """Preserve the agent's actionable configuration error instead of replacing it with a generic 500."""
 
     from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 
@@ -1005,17 +985,7 @@ def test_an_ordinary_400_is_not_mistaken_for_a_configuration_refusal() -> None:
 
 
 def test_an_agent_can_be_asked_what_it_holds(tmp_path) -> None:
-    """Found live on 2026-08-01: capacity resurrected from a deleted fleet.
-
-    An agent's state document outlives the control plane that wrote it. A control
-    plane whose database is replaced leaves its cells behind with
-    ``desired_state: up``, and the agent keeps re-ensuring them -- a v5p-128
-    queued resource was being recreated days after its fleet was gone.
-
-    Every other route is keyed by ``cell_id``, so the only way to discover that
-    was to read the state document out of object storage by hand. An inventory
-    that cannot be enumerated cannot be reconciled.
-    """
+    """Enumerate agent-held cells so stale desired-up records can be reconciled after database replacement."""
 
     agent, state = service(tmp_path)
     state.mutate_or_create_record(

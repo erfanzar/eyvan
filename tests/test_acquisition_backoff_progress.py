@@ -3,13 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""A pool that keeps refusing capacity is not narrated as a first request.
-
-2026-10-25: while a Spot v5p-16 pool failed hundreds of requests in a row, the
-progress route reported REQUESTING_CAPACITY for each fresh cell and the SDK
-printed "requesting one elastic cell", with no hint that every earlier attempt
-had been refused.
-"""
+"""Show acquisition backoff instead of presenting repeated refusals as a first request."""
 
 from __future__ import annotations
 

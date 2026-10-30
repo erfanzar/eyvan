@@ -3,18 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""The plane's own durability invariants, published rather than waited on.
-
-Every one of these could already be computed. Nothing computed them: `check_fleet`
-had exactly two callers, both HTTP routes, so an invariant was true or false only
-when a human thought to ask.
-
-On 2026-08-12 two were violated on a live fleet for twenty minutes -- I9 for a
-lease naming a cell the planner had dropped from its snapshot, I3 for the cancel
-that could not land behind it -- while four TPU VMs billed. The conditions were
-found by reading journald. Both are named invariants; the plane could have said
-so on any cycle.
-"""
+"""Publish durability invariant violations on each controller cycle without requiring a manual HTTP query."""
 
 from __future__ import annotations
 

@@ -543,12 +543,7 @@ def test_a_transport_failure_observing_one_rank_is_not_that_ranks_death() -> Non
 
 
 def test_a_rank_that_answers_succeeded_after_an_unreadable_poll_converges() -> None:
-    """The incident replay: unreadable, then completed, while peers still run.
-
-    The unreadable poll must not have settled anything; the poll that reaches
-    the rank again finds it exited 0, and a finished rank beside running ranks
-    converges instead of failing.
-    """
+    """Converge after an unreadable rank later reports success while its peers are still running."""
 
     polls: list[str] = []
 

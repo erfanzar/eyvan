@@ -167,7 +167,7 @@ class _RecordingIngress:
 def test_reconcile_re_ensures_the_profile_ingress_rule_of_a_public_claim(
     tmp_path, tagged, endpoint_mode, expected_calls
 ):
-    """Seen live 2026-10-25: the rule was deleted and nothing ever put it back."""
+    """Recreate a missing profile ingress rule when reconciling a tagged public attached TPU."""
 
     substrate = Substrate()
     substrate.document["networkConfig"] = {"network": "projects/project-a/global/networks/default"}

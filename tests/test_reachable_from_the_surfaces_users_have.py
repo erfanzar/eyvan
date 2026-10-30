@@ -563,18 +563,10 @@ _POOL_DERIVED = {
 
 
 def test_the_pool_schemas_carry_every_field_a_submitter_owns() -> None:
-    """The audit that found four of the defects above, kept as a test.
+    """Expose workload fields through pool request schemas unless explicitly plane-owned or pool-derived.
 
-    Each one was a field added to ``WorkloadDefinition`` and honoured by the
-    server whose request schema was never widened, so the feature worked
-    everywhere except where a user could ask for it. Adding a spec field and
-    running the suite should now say so.
-
-    A new field belongs in one of three places: settable on the pool path, listed
-    in ``_PLANE_OWNED`` because the plane writes it, or in ``_POOL_DERIVED``
-    because the pool dictates it. Adding a name to either set is a claim worth
-    arguing for in review -- which is the point of making it explicit rather than
-    letting the omission pass unnoticed.
+    Explicit exemptions make new spec fields fail this check when the request
+    schemas do not expose them.
     """
 
     from eyvan.records import WorkloadDefinition
@@ -805,18 +797,7 @@ def test_the_sync_client_sends_every_pool_field_it_accepts_on_a_callable() -> No
 
 
 def test_an_operator_can_turn_on_exec_for_a_gcp_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The comment beside the flag promised a control that did not exist.
-
-    `AgentCapabilities.supports_exec` is the *admission* gate and
-    `ExecCapableExecutionDriver` the *implementation* one, and the runtime has
-    implemented `exec_in_workload` all along -- `systemd_transient` provides it,
-    which is what GCP cells run. The GCP driver nonetheless declared the
-    capability a literal `False` under a comment reading "an operator turns this
-    on for a fleet they are willing to have diagnostics run on". Nothing could,
-    so `eyvan workload exec` was refused on every GCP fleet with a message
-    telling the operator to set a flag that was not settable. Observed against a
-    live v5p-16 on 2026-08-13.
-    """
+    """Expose the operator's explicit exec opt-in through the GCP driver's admission capabilities."""
 
     from eyvan.capacity.drivers.gcp import GcpTpuCapacityDriver
 

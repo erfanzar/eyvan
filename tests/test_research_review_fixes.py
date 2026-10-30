@@ -3,17 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Regressions for the round-4 research-mode review findings.
-
-Each test pins one confirmed defect: a plan reported stopped while its jobs
-still ran after the owner lost authority; a submit-only owner whose jobs the
-plane could not cancel; a revoked grant frozen into an approval; child
-workloads escaping the chip-hour budget; model-planned rounds adding secret
-mounts; a replica that lost leadership still stepping plans; an unbounded
-iteration call; a deferred late cancel orphaning a workload under a terminal
-plan; repeated notes flooding the plan's history; and shutdown closing the
-store under an in-flight assistant save.
-"""
+"""Enforce research-plan authority, budget, cancellation, iteration and shutdown boundaries."""
 
 from __future__ import annotations
 

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Route safety regressions for writer-068; no provider or external I/O."""
+"""Keep provider and external I/O outside route-level transactions."""
 
 from __future__ import annotations
 

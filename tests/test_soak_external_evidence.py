@@ -316,9 +316,8 @@ def test_a_sample_past_the_freshness_bound_reads_as_absent(tmp_path) -> None:
 def test_a_suspended_host_cannot_keep_a_stale_sample_fresh(tmp_path) -> None:
     """``CLOCK_MONOTONIC`` does not advance while a machine sleeps.
 
-    The terminated P8 run lost 31.5 wall-clock hours exactly that way, and a
-    freshness bound measured only on the monotonic clock would have called the
-    sample taken before the suspend a current measurement of the fleet after it.
+    Freshness must also use wall time so a sample taken before suspend cannot
+    remain a current measurement after the machine wakes.
     """
 
     clock = _StepClock()

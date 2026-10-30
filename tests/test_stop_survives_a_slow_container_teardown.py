@@ -3,27 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Stopping a workload whose container takes a moment to disappear.
+"""Wait for slow container teardown and allow a later stop to resolve an indeterminate record.
 
-Reconstructed from a live 2x v5p-16 Multislice on 2026-08-02. One host reported::
-
-    RuntimeError: Docker stop returned successfully but the native OCI container is still active
-    RuntimeError: cannot safely stop ambiguous systemd execution 'wl_645...-a1-g1'
-
-The container had in fact exited -- ``docker ps -a`` on the host showed no Eyvan
-container and its unit was already ``failed``. Two independent defects combined
-to hold a Multislice hostage to a process that was already dead:
-
-1. ``docker stop`` returns once the daemon has signalled the container, not once
-   it is gone. Eyvan runs workload containers with ``--rm``, so a container that
-   is stopping normally passes through ``removing`` -- a member of
-   ``_ACTIVE_CONTAINER_STATES``. A single inspection right after the command
-   therefore reads a successful stop as a refusal.
-
-2. That failure marked the durable record INDETERMINATE, and ``stop`` refused
-   outright on an INDETERMINATE record. The handler for "the stop failed" made
-   every future stop fail, so the first transient error became permanent and the
-   accelerator was never released.
+Containers using ``--rm`` can pass through the active ``removing`` state after
+``docker stop`` succeeds. A transient teardown error must not permanently block
+future stop attempts or release capacity while a container could still run.
 """
 
 from __future__ import annotations
@@ -126,7 +110,7 @@ def test_stop_is_retryable_after_an_earlier_stop_failed(tmp_path: Path, monkeypa
         executor.stop(remote_id, _context())
     assert executor.status(remote_id).status is ExecutionWorkloadStatus.INDETERMINATE
 
-    # The container finishes shutting down, exactly as the live one had.
+    # A later stop must succeed once the container finishes shutting down.
     daemon._remaining_removing = 0
     monkeypatch.setenv("EYVAN_CONTAINER_STOP_SETTLE_S", "5")
 
@@ -140,14 +124,7 @@ def test_stop_is_retryable_after_an_earlier_stop_failed(tmp_path: Path, monkeypa
 def test_a_record_poisoned_by_an_older_build_is_still_recoverable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upgrading into the fix must rescue records the old code already latched.
-
-    A build predating the recoverable flag wrote plain INDETERMINATE records, and
-    on the live cell ``stop`` then failed one gate later at ``cannot safely
-    verify``. A successful stop is direct evidence, so it must clear a stale
-    unknown no matter which build recorded it -- otherwise deploying the fix
-    still leaves the accelerator stranded.
-    """
+    """Allow successful stop evidence to resolve legacy INDETERMINATE records without a recoverable flag."""
 
     _fast_settle(monkeypatch)
     daemon = SlowTeardownDocker(removing_inspections=0, images={"registry.example/easydel:latest"})

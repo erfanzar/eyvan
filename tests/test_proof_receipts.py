@@ -479,18 +479,7 @@ def test_a_receipt_path_that_exists_stops_the_run_before_it_spends(tmp_path: Pat
 
 
 def test_an_output_directory_that_does_not_exist_is_refused_not_failed(tmp_path: Path) -> None:
-    """The P5 run of 2026-08-13, which reported a failure it had not had.
-
-    ``~/receipts`` did not exist on a freshly provisioned head. The proof polled
-    the plane, decided its verdict, and then died writing the evidence file --
-    and the escaping ``FileNotFoundError`` exited 1, which in this group means
-    the build failed a criterion. It had not; nothing had been evaluated wrongly
-    and the run was recoverable by making one directory.
-
-    Reporting a failed proof for a mistyped path is the precise thing the third
-    exit code exists to prevent, and it costs a whole hardware run to discover
-    the second time.
-    """
+    """Report a missing evidence directory as not-run rather than as a failed proof criterion."""
 
     result = CliRunner().invoke(
         proof,

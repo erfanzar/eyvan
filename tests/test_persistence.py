@@ -1051,12 +1051,10 @@ pytestmark = pytest.mark.slow
 
 @pytest.mark.asyncio
 async def test_a_rolled_back_write_into_a_nested_container_leaves_no_trace() -> None:
-    """Transactions share frozen records and copy only containers (2026-09-25).
+    """Isolate rolled-back nested-container writes while transactions share immutable records.
 
-    A deep copy of the whole state per transaction was the idle CPU cost of a
-    loopback plane. The replacement must still isolate a rolled-back session,
-    including writes that land in a nested container in place -- progress
-    reports are kept per workload, per rank.
+    Progress reports are nested by workload and rank, so container copies must
+    preserve rollback isolation without deep-copying the full state.
     """
 
     from eyvan.records import UserProgressReport

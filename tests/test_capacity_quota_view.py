@@ -712,10 +712,8 @@ def _record_refusal(cache_dir, *, zone: str = "us-central2-b", accelerator_type:
 def test_the_cli_never_lists_a_queue_that_refused_us_as_free_capacity(monkeypatch, tmp_path) -> None:
     """Quota is not access.
 
-    In example-spot-project on 2026-10-23, 1536 chips of Spot v6e quota sat in zones
-    whose queues answered every request with "User does not have permission to
-    submit requests into this queue". The provisioning path already records
-    that refusal locally; the quota view must use it rather than present the
+    The provisioning path records queue-admission refusals locally. The quota
+    view must use those refusals rather than present an inaccessible queue's
     limit as capacity somebody can take.
     """
 

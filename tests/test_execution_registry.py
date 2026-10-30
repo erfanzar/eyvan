@@ -29,21 +29,10 @@ def _observation(metadata: dict) -> CellObservation:
 
 
 def test_a_single_slice_multi_host_tpu_uses_gce_metadata_detection() -> None:
-    """The cause of every pods=1 inference failure on 2026-08-02.
+    """Use GCE metadata for internal JAX coordination even when a multi-host TPU has only one slice.
 
-    A single ``v5p-16`` is two hosts. Asking "is this multislice?" put it on the
-    explicit path, where the coordinator address is the worker's *management*
-    endpoint -- the address the control plane reaches the worker on, which for a
-    public-routed cell is external. The hosts then tried to coordinate over the
-    public internet on port 12345, which no firewall rule permits, and every
-    rank died in ``RegisterTask`` with DEADLINE_EXCEEDED having never joined --
-    while sitting healthy on one subnet with ``default-allow-internal`` covering
-    everything they actually needed.
-
-    Two addresses were conflated: management (control plane to worker, may be
-    public) and coordination (host to host, must be internal). GCE metadata
-    gives JAX the second directly, which is why the pods=2 job succeeded the
-    same day: only multislice reached that branch.
+    The public management endpoint is for control-plane access, not host-to-host
+    coordination; metadata discovery provides the internal addresses.
     """
 
     assert _uses_gce_tpu_cluster_detection(_observation({"tpu_config": {"node_count": 1}})) is True
@@ -72,17 +61,7 @@ def test_a_malformed_node_count_is_still_refused() -> None:
 
 
 def test_submitting_brings_up_a_fleet_that_is_not_serving(tmp_path) -> None:
-    """One command has to be the whole workflow.
-
-    Without this, submitting to a fleet that is applied-but-drained produces a
-    placement refusal, and the fix is `eyvan autoscale generate` then `eyvan up
-    --select` -- neither of which the failure names. On 2026-08-21 a single job
-    cost five commands and two script edits. Ray is `ray job submit`; a second
-    command here is a defect, not a prerequisite.
-
-    A fleet already serving must be left alone: this only ever adds capacity a
-    generated config already describes.
-    """
+    """Bring up an applied-but-drained fleet on submission while leaving an already-serving fleet unchanged."""
 
     from eyvan.sdk.execution import _ensure_fleet_applied
 

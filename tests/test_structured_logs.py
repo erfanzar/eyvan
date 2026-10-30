@@ -337,8 +337,7 @@ def test_a_long_line_reaches_the_follower_whole(tmp_path, length: int) -> None:
 
     The fake below behaves the way journalctl does rather than being told what
     to return, so the test fails for any read that omits the flag, whatever the
-    line is. Seen live 2026-10-25: ``print(jax.devices())`` on a v5p-128 is
-    4302 characters, and the blocking wait showed ``start`` and nothing after.
+    line is; long device listings must reach the follower without being nulled.
     """
 
     import subprocess

@@ -3,28 +3,12 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Placing a workload again after the cell it was running on was reclaimed.
+"""Allow replacement placement when the predecessor's capacity is definitively lost.
 
-Read off a live v5p-16 in ``us-central1-a`` on 2026-08-13, during the run that
-qualifies P5. GCP reclaimed the slice, Eyvan classified the loss correctly,
-replaced the capacity, and then could not use it::
-
-    POST /api/v1/cells/research-v5p-16-b59987-0002/workloads -> 500
-    RuntimeError: cell 'research-v5p-16-b59987-0001' has no agent endpoint
-                  for remote retirement
-
-The two cells in that message are different: the submit went to the *healthy
-replacement*, and the error is about the *reclaimed predecessor*. Supersession
-retires the previous placement before the next one may run, the reclaimed host
-has no agent left to answer, and the raise escaped the successor's submit -- so
-the workload retried every 90 seconds against a cell that was ready for it, and
-``eyvan proof preemption`` held ``workload-survived`` inconclusive throughout.
-
-What retirement is *for* is the reason this is safe to skip and not safe to skip
-blindly: it fences the predecessor so two generations cannot run at once. A host
-whose capacity is definitively lost is not running anything, so the fence is
-already satisfied. A host that still exists but cannot be reached may well be
-running, and that one must still fail.
+Retirement fences the predecessor so two generations cannot run at once. A host
+whose capacity is definitively lost cannot still run the workload, so that fence
+is already satisfied. An unreachable host that still exists may still be
+running and must continue to block replacement.
 """
 
 from __future__ import annotations

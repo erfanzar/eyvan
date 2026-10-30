@@ -110,11 +110,7 @@ def test_an_unreadable_record_summarises_to_nothing_rather_than_guessing() -> No
 
 
 def test_a_cross_zone_request_is_not_reported_as_its_first_choice() -> None:
-    """Found live 2026-09-24: "placed on europe-west4-b" for a job in us-central1-a.
-
-    With alternates the first-choice pool is where the request starts, and its
-    region binds nothing; the scheduler may lease any candidate.
-    """
+    """Do not describe a cross-zone request's first-choice region as its actual placement."""
 
     record = {
         "id": "wl-x",

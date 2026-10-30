@@ -43,9 +43,8 @@ from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMembe
 
 #: Provider-published GPU host shapes, written as independent literals rather
 #: than read back out of the file under test. Google's accelerator-optimized
-#: machine families page (versioned "Last updated 2026-08-07 UTC") establishes
-#: vCPU, instance memory and attached GPU count; the GPU machine types page
-#: ("Last updated 2026-08-05 UTC") establishes the accelerator names.
+#: machine families page establishes vCPU, instance memory and attached GPU
+#: count; the GPU machine types page establishes the accelerator names.
 EXPECTED_GPU = {
     "a3-highgpu-8g": {"devices": 8, "cpu": 208, "memory_gib": 1872, "model": "nvidia-h100-80gb"},
     "a2-highgpu-1g": {"devices": 1, "cpu": 12, "memory_gib": 85, "model": "nvidia-tesla-a100"},

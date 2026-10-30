@@ -3,14 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Telling a broken GPU host from a CPU host, using the two real ones.
-
-Both device layouts below were read off live cells on 2026-08-13, and the point
-of the module under test is that nothing else in this package could tell them
-apart: the catalog, ``CellAccelerator`` and the rank layout all describe a cell
-from its declaration, and the declaration was the same for the working host and
-the broken one.
-"""
+"""Distinguish a broken GPU host from a CPU host using observed devices rather than declared hardware."""
 
 from __future__ import annotations
 

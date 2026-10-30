@@ -385,21 +385,7 @@ def test_native_worker_module_can_be_imported_without_ray() -> None:
 
 
 def test_a_rebuilt_wheel_replaces_the_installed_package() -> None:
-    """Found live 2026-08-01 on a v5p-16 host, and it fails silently.
-
-    The bootstrap writes ``sitecustomize.py`` from a heredoc on every run, but
-    installs the package with ``pip install --upgrade <path>``, which
-    short-circuits when that exact version is already present. The wheel *URI* is
-    content-addressed; its filename and version are not. So a rebuilt wheel at an
-    unchanged version leaves the old ``eyvan.worker.runtime._multihost_site`` staged as
-    ``eyvan_multihost.py`` underneath a freshly written sitecustomize that imports
-    a symbol it does not have.
-
-    Python swallows sitecustomize exceptions, so the only trace is a one-line
-    "Error in sitecustomize" and a host whose distributed-topology scrub and
-    coordinator initialization never ran -- a silently half-configured JAX
-    cluster, which is the failure mode this staging exists to prevent.
-    """
+    """Force-reinstall a rebuilt wheel so unchanged package versions cannot retain stale bootstrap modules."""
 
     script = build_native_worker_startup_script(
         package="gs://artifacts/eyvan/runtime/wheels/abc/eyvan-0.1.0-py3-none-any.whl",
@@ -413,11 +399,7 @@ def test_a_rebuilt_wheel_replaces_the_installed_package() -> None:
 
 
 def test_a_rebuilt_local_wheel_replaces_the_installed_package() -> None:
-    """The same defect for a wheel copied to the host, which `eyvan gcp connect` does.
-
-    Seen live 2026-10-25: a reconnect copied a new build to all 16 hosts of a
-    v5p-128, reported the worker installed, and left yesterday's files in place.
-    """
+    """Force-reinstall local wheel paths copied by gcp connect without reinstalling their dependencies."""
 
     script = build_native_worker_startup_script(
         package="/var/lib/eyvan/attach/eyvan-0.0.1-py3-none-any.whl",
@@ -458,18 +440,10 @@ def test_the_forced_reinstall_does_not_rebuild_the_dependency_tree() -> None:
 
 
 def test_a_failed_venv_install_does_not_abort_before_eyvans_own_message(tmp_path: Path) -> None:
-    """The diagnostic written for this failure was unreachable when it happened.
+    """Reach Eyvan's actionable venv diagnostic when apt fails under shell fail-fast settings.
 
-    On a GPU cell on 2026-08-13 the install exited 100 with apt's "Package
-    'python3-venv' has no installation candidate". Being a bare command under
-    ``set -euo pipefail``, it killed the script on that line, so the next check --
-    which exists precisely to say ``Eyvan native worker could not install Python
-    venv support`` and exit 1 -- never ran. The operator got apt's sentence, which
-    names neither Eyvan nor the cell nor what to do.
-
-    Runs the generated conditional rather than asserting on its text, and locates
-    it by a literal the assertions also pin, so a restructure fails here loudly
-    instead of quietly testing nothing.
+    Execute the generated conditional, locating it by a pinned literal so a
+    restructure cannot silently bypass the behavior under test.
     """
 
     fake_apt = tmp_path / "apt-get"
@@ -512,19 +486,10 @@ def test_a_failed_venv_install_does_not_abort_before_eyvans_own_message(tmp_path
 
 
 def test_a_python_without_ensurepip_falls_back_to_one_that_has_it(tmp_path: Path) -> None:
-    """apt is the last resort, not the first, and on 2026-08-13 it cost a slice.
+    """Try installed versioned interpreters with ensurepip before falling back to apt.
 
-    The TPU image that motivated this ships `python3` as 3.10 without ensurepip
-    *and* /usr/bin/python3.11 with it. The bootstrap asked only `python3`, went to
-    apt, and apt could not get the dpkg lock because `unattended-upgrade` had
-    wedged holding it -- thirty minutes after boot, stopped on a resolver error,
-    with no dpkg transaction since. `DPkg::Lock::Timeout` cannot help with a
-    holder that never finishes, so the cell registered as capacity, took a lease
-    and never ran anything. A usable interpreter was on the host the whole time.
-
-    Runs the generated selection against stub interpreters rather than asserting
-    on its text: one that fails ensurepip named `python3`, one that succeeds named
-    like a versioned sibling.
+    Execute the generated selection with a failing ``python3`` and a working
+    versioned sibling so the check covers behavior rather than script text alone.
     """
 
     stub_dir = tmp_path / "bin"
@@ -721,10 +686,7 @@ pytestmark = pytest.mark.slow
 
 
 def test_the_per_job_dependency_cache_is_created_for_the_workload_user() -> None:
-    """Jobs run as ``eyvan-workload``; a root-owned (or absent) cache made every job
-    fall back to its own working directory and reinstall its packages from scratch.
-    Seen on a Spot v6e-4 on 2026-09-24: ``/var/lib/eyvan/runtime-envs is not writable``.
-    """
+    """Create a writable eyvan-workload dependency cache so jobs can reuse installed packages."""
 
     from eyvan.worker.runtime.dependency_entry import DEFAULT_CACHE_ROOT
 

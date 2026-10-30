@@ -5,12 +5,8 @@
 
 """An elastic pack runs one JAX world per cell, not one across all of them.
 
-Measured on live v5p-16 slices on 2026-08-31: a pods=6 elastic pack over a
-warm 4-slice cell plus a 2-slice deficit cell dispatched all twelve worker
-processes into one coordination group with one coordinator, and every rank
-died with ``DEADLINE_EXCEEDED`` on ``/tensorflow.CoordinationService/
-RegisterTask``. The cells are two separate GCP queued resources -- islands
-with no interconnect between them -- so a single world can never form.
+Separate GCP queued resources have no shared interconnect, so ranks in an
+elastic pack must not be dispatched into one coordination group across cells.
 
 The gang executor's default is still one gang-wide world: correct when the
 member cells share a fabric, which is what a GPU gang and a pod group over

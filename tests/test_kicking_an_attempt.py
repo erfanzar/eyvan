@@ -13,9 +13,7 @@ accelerator busy doing nothing until it fires.
 The whole question is which budget pays for it, and getting it wrong is not a
 cosmetic accounting error. A capacity loss is charged against ``max_retries``,
 which a spot job sets to **0** precisely because it expects to be interrupted --
-so a kick charged there ends the job the operator was trying to move. That is
-the shape of the defect the 2026-08-13 P5 run spent a day on, arriving from the
-other direction.
+so a kick charged there ends the job the operator was trying to move.
 """
 
 from __future__ import annotations

@@ -1507,13 +1507,7 @@ def test_settle_script_checks_both_units(tmp_path, plane_state, agent_state, res
 
 
 def test_a_unit_that_restarts_between_checks_is_not_reported_running() -> None:
-    """Found live 2026-09-24: `head up` said a crash-looping head was active.
-
-    `eyvan-server` exited at every start, refusing a plaintext network bind, and
-    `Restart=always` brought it back each time, so a single `systemctl
-    is-active` read "active" between crashes. The settle check reads the
-    restart counters on both sides of a wait; on that head they went 47 -> 50.
-    """
+    """Reject crash-looping units by comparing restart counters across a settle interval."""
 
     spec = _spec()
     gcloud = FakeGcloud(
@@ -1719,9 +1713,8 @@ def test_the_cli_is_on_path_after_a_head_comes_up() -> None:
 def test_a_head_built_without_a_dashboard_says_so_instead_of_promising_one() -> None:
     """A wheel carries no Node build tree, and the head must not claim otherwise.
 
-    Observed live: `GET /` returned 404 on a real head while `eyvan dashboard`
-    opened that URL anyway. Reporting `serves_dashboard=False` is what lets the
-    CLI tell an operator which half is missing.
+    Reporting ``serves_dashboard=False`` lets the CLI explain a missing
+    dashboard rather than open a URL that returns 404.
     """
 
     spec = _spec()

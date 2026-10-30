@@ -5,12 +5,8 @@
 
 """Asking several zones for capacity at once.
 
-A workload's candidate pools were tried one per reconcile interval: ask the
-best zone, wait, and if it will not grant, ask the next one. That is the
-opposite of how spot capacity behaves. On 2026-08-15 us-east5-b granted a
-2x v6e-8 allocation and reclaimed it before boot, twice, while us-central2-b
-held one long enough to finish -- a serial search spends both of those attempts
-before reaching the zone that works.
+Parallel candidate requests avoid waiting through each unavailable zone before
+trying one that can grant usable Spot capacity.
 
 Racing costs money in every zone until one wins, so it is off by default and
 bounded twice: by the operator's declared width, and by the workload's own
@@ -195,8 +191,7 @@ def test_racing_never_asks_a_pool_that_is_not_a_candidate(width: int) -> None:
 
 
 def test_a_race_never_re_asks_a_zone_that_denied_the_workload() -> None:
-    """Found live on 2026-09-24: with width 3, us-central1-a had denied queue admission
-    and the race spent a slot asking it again instead of asking us-central1-c."""
+    """Use race slots for unasked alternates rather than re-requesting a zone that denied admission."""
 
     pools = tuple(_pool(zone) for zone in ZONES)
     workload = _workload(alternates=(f"pool-{ZONES[0]}", f"pool-{ZONES[2]}"))
@@ -262,9 +257,7 @@ def test_a_race_never_asks_a_pool_past_the_acquisition_bound() -> None:
 
 
 def test_a_workload_naming_no_pool_is_not_offered_a_zone_that_denied_it() -> None:
-    """Found live on 2026-09-24: a raw `submit-batch` task named no pool, so it took
-    the generic branch, which offered every pool on every pass -- and us-south1-c,
-    which had denied queue admission, was asked four times running."""
+    """Exclude denied zones from generic pool selection even when the workload names no pool."""
 
     from eyvan.capacity.drivers.base import CapacityProviderFailureCode
     from eyvan.records import CellState, utcnow
@@ -306,13 +299,7 @@ def test_a_workload_naming_no_pool_is_not_offered_a_zone_that_denied_it() -> Non
 
 
 def test_a_request_the_provider_refused_holds_no_race_slot_and_is_not_asked_again() -> None:
-    """Found live on 2026-09-25: twenty stocked-out v5e zones held every race slot.
-
-    A Compute create answers a stockout at once, but the failed cell still counts
-    as supply until its provisioning timeout, so it was also counted as racing:
-    six zones went unasked for the whole window. Stalled pools are neither
-    re-asked nor counted against the width.
-    """
+    """Free race slots after provider refusal without re-requesting the stalled pools."""
 
     from eyvan.capacity.drivers.base import CapacityProviderFailureCode
     from eyvan.records import CellState, utcnow

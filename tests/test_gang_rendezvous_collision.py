@@ -9,9 +9,8 @@ A gang's ranks meet at ``<coordinator host>:<port>``. The coordinator is the
 lexicographically first of the gang's leased cells, and both ports are fixed
 constants -- 12345 for the JAX coordinator, 12346 for GPU collectives -- because
 a deployment's firewall has to be able to open them once and keep working.
-``worker/runtime/registry.py`` records what the alternative costs: on 2026-08-02
-every rank of every ``pods=1`` run died in ``RegisterTask`` with
-DEADLINE_EXCEEDED against an address no rule permitted.
+Choosing arbitrary ports instead could route coordination to an address the
+deployment's firewall does not permit.
 
 Fixed ports mean two gangs whose coordinators land on one machine are handed the
 *same* socket, and a rank of one gang can register with the other gang's

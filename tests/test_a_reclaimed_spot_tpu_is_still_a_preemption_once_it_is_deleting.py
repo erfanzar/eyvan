@@ -3,27 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Classifying a spot reclamation Eyvan looked at a moment too late.
+"""Charge a reclaimed Spot node to the preemption budget even after it enters DELETING.
 
-Both v5p-16 cells of the 2026-08-13 P5 run were reclaimed by GCP the same way,
-and only the first was charged to the preemption budget. The difference was
-timing. ``PREEMPTED`` is transient -- GCP deletes the node it reclaimed -- and
-reconciles ran ~48s apart, so the second cell was already ``DELETING`` when
-Eyvan looked::
-
-    18:04:05  event=lost  previous=ready/HEALTHY  capacity_class=spot
-              reason="TPU VM is terminal (DELETING)"
-    workload -> failed: "execution cell capacity is NEEDS_RECREATE"
-              failure_count=0  preemption_count=1 (unchanged)  capacity_loss_count=0
-
-Untyped, the loss is read as a generic capacity loss and charged to
-``max_retries``. A spot job sets that to 0 *because* it expects to be reclaimed
--- P5 says so in as many words -- so the job was killed while the preemption
-budget it was given went unspent, and neither counter recorded why.
-
-Reaching this classification at all means ``desired_state`` is still "up": Eyvan
-wants the cell and did not ask for it to go away. On spot, a node dying anyway
-is a reclamation.
+``PREEMPTED`` is transient because GCP deletes reclaimed nodes. A reconciliation
+that first observes ``DELETING`` must not charge that loss to ordinary retries
+when the cell is still desired up.
 """
 
 from __future__ import annotations

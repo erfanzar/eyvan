@@ -91,12 +91,7 @@ def test_without_a_sink_nothing_is_written_and_transitions_are_unchanged() -> No
 
 
 def test_a_runtime_probe_failure_on_healthy_capacity_is_not_a_preemption() -> None:
-    """Found live 2026-09-24: an agent restart logged two v6e-4 cells as preempted.
-
-    Their VMs never stopped. The provider still reported HEALTHY; only Eyvan's
-    runtime probe had not answered yet. A preemption is the provider taking
-    the machine, so it needs the provider to say so.
-    """
+    """Require provider evidence of capacity loss before classifying a runtime probe failure as preemption."""
 
     ready = _cell(CellState.READY).model_copy(update={"provider_phase": CapacityStatus.HEALTHY})
     probe_failed = ready.model_copy(update={"state": CellState.REGISTERING})

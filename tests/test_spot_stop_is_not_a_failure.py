@@ -5,12 +5,9 @@
 
 """A Spot VM seen stopping on its way to a preemption is not a provider failure.
 
-Found live on 2026-09-24 by P5 on a Spot v5p-8: the instance went RUNNING ->
-STOPPING -> TERMINATED. The TERMINATED observation was classified as a
-preemption, but the STOPPING one, reported as DRAINING with no reason, had
-already been scored as a provider error -- two consecutive failures and a
-cooldown on a zone that had just delivered capacity -- and the proof's
-no-cooldown check failed.
+For a Spot instance moving from RUNNING through STOPPING to TERMINATED, the
+intermediate DRAINING observation must not add provider failures or a cooldown
+to a zone that delivered capacity.
 """
 
 from __future__ import annotations

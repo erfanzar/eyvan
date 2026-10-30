@@ -1349,9 +1349,8 @@ async def test_an_undispatched_cell_is_not_drained_by_the_provisioning_timeout()
 
     ``capacity.apply`` is durable in the outbox; until it runs there is no
     provider request, so charging the cell for a slow queue destroys the very
-    cell the pending apply belongs to and launches another behind it. On
-    2026-08-21 that ran unbounded: cells living 1805s against a 1800s budget,
-    every one with ``provider_phase`` still None and nothing in the zone.
+    cell the pending apply belongs to and launches another behind it. The
+    provisioning timeout must start only after the provider request is dispatched.
     """
 
     repository = InMemoryRepository()
@@ -1683,21 +1682,10 @@ async def test_the_idle_sweep_does_not_clobber_capacity_that_arrived_concurrentl
 
 @pytest.mark.asyncio
 async def test_a_cell_reclaimed_after_it_served_records_no_stockout() -> None:
-    """The case the READY check could not see, found by P5 on real hardware.
+    """Do not record stockout for a reclaimed cell that previously delivered capacity.
 
-    The guard asked whether the cell is READY *now*. A reclaimed spot cell is
-    draining or NEEDS_RECREATE by then, so one that served a workload for twenty
-    minutes and was then preempted looked identical to one that never delivered,
-    and a STOCKOUT was written against a zone that had just proven it had
-    capacity.
-
-    On the live run the same cell carried both `interruptions=1.9` from the
-    correct preemption classification and `consecutive_failures=1` with a
-    cooldown from this path -- two sites disagreeing about the same event.
-
-    ``provision_latencies_s`` is the discriminator because it is appended only on
-    the SUCCESS transition into READY. The preempted cell read `[1427.8]`; the
-    replacement that never came up read `[]`.
+    Current state alone cannot distinguish that cell from one that never became
+    ready; ``provision_latencies_s`` records its successful READY transition.
     """
 
     repository = InMemoryRepository()

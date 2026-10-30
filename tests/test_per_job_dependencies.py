@@ -143,7 +143,7 @@ def _fake_uv(directory: Path, *, exit_code: int) -> Path:
 
 @pytest.mark.parametrize(("exit_code", "uses_uv"), [(0, True), (1, False)])
 def test_a_uv_that_cannot_run_falls_back_to_the_interpreters_own_pip(tmp_path, monkeypatch, exit_code, uses_uv) -> None:
-    """Seen live: a snap-packaged uv is on PATH but cannot start inside the workload sandbox."""
+    """Fall back to interpreter-owned pip when uv exists on PATH but cannot run in the sandbox."""
 
     uv = _fake_uv(tmp_path / "bin", exit_code=exit_code)
     monkeypatch.setenv("PATH", str(uv.parent))
@@ -319,11 +319,8 @@ def _run_through_host_shell(tmp_path: Path, entrypoint: str) -> str:
     return (tmp_path / "seen.txt").read_text(encoding="utf-8")
 
 
-#: Every line must run with the packages it declared. Seen live on a v5p-32 on
-#: 2026-10-29: a rendered EasyDeL launch script was appended unquoted after the
-#: wrapper's `--`, so only its first line (`set -e`, a builtin execvp cannot
-#: find) went through the wrapper and the rest ran on the bare worker Python
-#: with `No module named 'easydel'`.
+#: Every line of a compound command must run inside its declared dependency
+#: environment, including shell builtins and lines following the first one.
 _COMPOUND_COMMANDS = (
     'set -e\necho "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt\necho "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
     'echo "a=${INSIDE_DEPENDENCIES:-no}" > seen.txt && echo "b=${INSIDE_DEPENDENCIES:-no}" >> seen.txt',
@@ -370,14 +367,10 @@ if os.environ.get("EYVAN_JAX_MULTIHOST") == "1":
 
 
 def test_the_multihost_join_runs_in_the_job_not_in_the_dependency_wrapper(tmp_path) -> None:
-    """Seen live on a v5p-32 on 2026-10-29: no job declaring ``dependencies`` ever joined its gang.
+    """Defer multihost sitecustomize initialization to the job interpreter, not the dependency wrapper.
 
-    The wrapper is itself a Python interpreter on the job's ``PYTHONPATH``, so
-    Eyvan's multi-host ``sitecustomize`` ran *there*: it consumed
-    ``EYVAN_JAX_MULTIHOST`` and died on ``import jax`` (the worker venv has
-    none, printing "Error in sitecustomize"), and the job it then exec'd found
-    no marker and never joined. Real interpreter, real ``sitecustomize``, real
-    dependency entry over a prepared environment.
+    The wrapper must not consume ``EYVAN_JAX_MULTIHOST`` before the job enters
+    its prepared environment and can import JAX.
     """
 
     import subprocess
@@ -607,14 +600,10 @@ def test_an_explicit_runtime_env_dir_wins_over_both(tmp_path, monkeypatch) -> No
 
 
 def test_a_real_job_environment_can_import_eyvan_and_the_parent_environment(tmp_path, monkeypatch) -> None:
-    """Found on a real Spot v6e-4 on 2026-09-24: every job declaring ``dependencies``
-    died at dispatch with ``No module named 'eyvan'``.
+    """Expose the worker's virtual-environment packages to a real per-job dependency environment.
 
-    The native worker runs from a virtual environment, and
-    ``--system-site-packages`` exposes only the *base* interpreter's packages, so
-    Eyvan, JAX and libtpu were all invisible to the job. Every other test here
-    fakes the commands, which is how that shipped; this one builds the real
-    environment and asks its own interpreter what it can import.
+    ``--system-site-packages`` alone exposes only the base interpreter's packages,
+    so query the prepared environment's interpreter to verify the inherited imports.
     """
 
     import subprocess

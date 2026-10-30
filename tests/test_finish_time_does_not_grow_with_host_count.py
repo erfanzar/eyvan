@@ -5,10 +5,8 @@
 
 """Observing and finishing a job must not cost the sum of its hosts.
 
-Seen live 2026-10-25 on a 16-host v5p-128: terminal settlement archived each
-rank's output one after another inside the observation pass (197 s), and every
-other workload waited behind it. These tests pin the shape that fixed it, at
-widths larger than the TPU it was found on, so a wider slice cannot regress.
+Archive rank output concurrently so terminal settlement does not block other
+workloads for the sum of per-host latencies, including on wide slices.
 """
 
 from __future__ import annotations
@@ -236,7 +234,7 @@ async def test_a_background_phase_does_not_hold_the_cycle_and_never_overlaps_its
 
 @pytest.mark.asyncio
 async def test_one_slow_cell_observation_does_not_hold_the_observe_cells_phase() -> None:
-    """Seen live: one attached TPU whose worker port was closed cost ~6 s every cycle."""
+    """Keep a slow cell's runtime probe from blocking the observation phase for other cells."""
 
     interval = 0.05
     controller, _service, agent, _admin, _workload = await _dispatched(interval)

@@ -88,23 +88,12 @@ def test_an_unreachable_api_falls_back_instead_of_failing_the_mutation() -> None
     with pytest.raises(RuntimeError, match="subprocess path reached"):
         backend._write_fast({"schema": "eyvan.fleet-state", "version": 1, "cells": {}}, 7)
     assert calls, "the fallback was never attempted"
-    # The reader is kept. Dropping it meant one aged-out token pinned every
-    # later mutation onto the subprocess for the life of the process, which is
-    # how a broken `gcloud` stranded a live TPU.
+    # Keep the reader so one aged-out token cannot permanently force later mutations onto gcloud.
     assert backend._rest is rest
 
 
 def test_one_api_failure_does_not_pin_every_later_call_onto_the_subprocess() -> None:
-    """The failure that stranded a live TPU.
-
-    The fast path used to disable itself for the life of the process on any
-    error. A Google access token lasts about an hour, so a long-running agent
-    reliably hit one -- and from then on every fleet-state mutation went through
-    `gcloud`. On 2026-08-21 that `gcloud` could not start, so every reconcile
-    500'd, no cell could reach ready, and a TPU sat ACTIVE and unusable.
-
-    One failure is a blip or an aged-out token, not a verdict about the network.
-    """
+    """Retry the REST fast path after a transient API failure rather than permanently forcing subprocess fallback."""
 
     class _Flaky:
         def __init__(self) -> None:

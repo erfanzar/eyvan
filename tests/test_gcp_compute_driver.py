@@ -784,8 +784,6 @@ def test_repeated_same_generation_reconciles_are_replays_not_fence_conflicts(tmp
     the autoscaler would drain live capacity on the second poll -- which on a
     Spot TPU means losing a slice that took an hour to be granted.
 
-    Written while isolating a live churn loop on 2026-08-01: this rules out the
-    steady-state poll as its cause, which is worth keeping pinned either way.
     """
 
     state = FleetStateStore(LocalBackend(tmp_path / "fleet.json"))
@@ -813,15 +811,7 @@ def _native_driver(tmp_path, package: str) -> GcpTpuCapacityDriver:
 
 
 def test_restaging_a_wheel_invalidates_the_host_bootstrap(tmp_path) -> None:
-    """The reason a verified fix twice failed to reach the machine.
-
-    The startup script bakes in the staged worker wheel, and the bootstrap was
-    treated as current whenever the *provider generation* was unchanged.
-    Re-staging a wheel does not change the generation, so ``eyvan runtime init``
-    published new code that reached no existing cell -- and nothing said so.
-    Live on 2026-08-01: TPU hosts ran a three-day-old wheel for a full day while
-    the package under test contained the fix.
-    """
+    """Invalidate host bootstrap when its staged wheel changes even if the provider generation stays fixed."""
 
     record = FleetCellRecord(name="tpu-cell", project="project-a", zone="us-central2-b", provider_generation=1)
 

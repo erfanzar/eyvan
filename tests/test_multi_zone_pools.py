@@ -3,18 +3,10 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""One pool, several zones.
+"""Expand one pool declaration across zones into interchangeable submission alternates.
 
-Racing zones is what actually wins spot capacity: on 2026-08-15 us-east5-b
-granted and reclaimed twice while us-central2-b held. The scheduler already
-knew how to treat interchangeable pools of one shape as cross-zone alternates.
-What was missing was a way to say it -- declaring the same eight lines once per
-zone, with three different names and an explicit shape on each, is a
-transcription exercise, and transcription is where the mistake gets made.
-
-The property that matters is at the end: pools written this way must come out
-interchangeable, because that is the exact condition the submission path
-requires before it will offer one as an alternate for another.
+The shorthand must preserve the shape and template compatibility required for
+cross-zone placement without repeated per-zone configuration.
 """
 
 from __future__ import annotations
@@ -320,14 +312,7 @@ def _placed(service, workload, cell) -> bool:
 
 @pytest.mark.asyncio
 async def test_a_cross_zone_workload_can_be_placed_in_every_zone_it_names() -> None:
-    """Found live on 2026-09-24: a four-zone Spot v6e-4 fleet launched nothing.
-
-    Submission recorded the alternates list and the first choice's pool and
-    template as *required* labels, matched by equality. No cell carries the
-    alternates list, so the workload fit no cell anywhere -- not even in its
-    first-choice zone -- and an alternate zone's cells could never have matched
-    the first choice's template either. The test above only checked the record.
-    """
+    """Allow placement in every named alternate without requiring first-choice-only labels on each cell."""
 
     service, pools, workload = await _submitted_cross_zone_workload("[us-east5-a, us-east5-b, us-central2-b]")
 
@@ -389,9 +374,7 @@ async def test_a_raced_cross_zone_workload_creates_demand_in_every_raced_zone() 
 
 @pytest.mark.asyncio
 async def test_a_cross_zone_workload_can_race_into_another_region() -> None:
-    """The first-choice pool's *region* was also a required label, so an alternate in
-    another region was refused -- found live on 2026-09-24 when a europe-west4-a
-    first choice could never race us-east1-b."""
+    """Do not pin an alternate-region workload to its first-choice pool's region label."""
 
     from eyvan.records import CapacityPoolRecord
 

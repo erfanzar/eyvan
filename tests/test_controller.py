@@ -1938,14 +1938,7 @@ async def test_remote_program_failure_remains_terminal_with_capacity_retry_budge
 
 @pytest.mark.asyncio
 async def test_a_failed_workload_records_why_it_failed() -> None:
-    """Found live 2026-08-01: `state: failed`, `failure_reason: None`.
-
-    The executor's diagnostic is in scope at the terminal-failure branch and is
-    already used one branch below for LOST, but the FAILED path dropped it. The
-    only account of why the job died then lived in journald on a cell the
-    autoscaler is about to release -- so by the time an operator looks, the
-    evidence is gone with the capacity.
-    """
+    """Persist the executor's failure reason before the cell and its local diagnostics can be released."""
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
@@ -4306,22 +4299,7 @@ async def _done() -> None:
 
 @pytest.mark.asyncio
 async def test_a_plain_http_plane_settles_the_attempt_instead_of_holding_the_accelerator(tmp_path) -> None:
-    """The defect that burned two live TPUs, reproduced without one.
-
-    `eyvan head up` writes an `http://` EYVAN_PUBLIC_URL and terminates no TLS,
-    and dev auth is impossible on its network bind -- so every managed-artifact
-    callable was refused. The refusal was a bare RuntimeError rather than a
-    PermanentDispatchRefusal, so the outbox retried it forever with a capped
-    backoff while the lease held its accelerator and the accelerator billed.
-
-    Observed live: ten attempts over twenty-one minutes, the workload stuck
-    `leased`, a v5p-16 and a v6e-8 held, and no diagnostic on any surface. The
-    class docstring on PermanentDispatchRefusal describes exactly this outcome;
-    this site simply did not use it.
-
-    The sibling test above covers the loopback development shape, which takes the
-    other branch -- which is why nothing caught this.
-    """
+    """Settle a non-loopback plaintext callback refusal instead of retrying while holding an accelerator."""
 
     repository = InMemoryRepository()
     service = ControlPlaneService(
@@ -4840,9 +4818,8 @@ async def _submit_denied_callable(service, fleet: str, key: str):
 async def test_an_unrelated_fleets_identical_pool_does_not_keep_a_denied_workload_waiting() -> None:
     """A workload pinned to fleet A's pool can never use fleet B's.
 
-    Judging "is there an alternative" by any enabled pool of the same shape and
-    region kept this workload PENDING forever beside another fleet's pool, and
-    the provider's refusal never reached the user as a verdict (2026-09-24).
+    Alternative pools must be usable by this workload, not merely match its
+    shape and region, so an unrelated fleet cannot suppress the refusal verdict.
     """
 
     repository, service, controller, agent = _denial_harness()
@@ -4929,9 +4906,7 @@ async def _live_zones(repository) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_race_keeps_its_width_while_the_first_zone_is_still_only_a_request() -> None:
-    """Found live on 2026-09-24 racing v6e-4 across fifteen zones at width 20: once one
-    zone accepted the *request*, the workload was placed on that still-acquiring cell and
-    the race stopped, so zones were tried one at a time as each was refused."""
+    """Keep the configured race width until a zone grants capacity, not merely accepts a request."""
 
     zones = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
     repository, service, controller, agent = _racing_harness(3, denied_zones=frozenset({"us-central1-b"}))
@@ -4961,14 +4936,7 @@ async def test_a_race_keeps_its_width_while_the_first_zone_is_still_only_a_reque
 
 @pytest.mark.asyncio
 async def test_a_launch_the_cell_rejects_as_invalid_fails_the_attempt_with_its_reason() -> None:
-    """Found live 2026-09-24 on a Spot head: a submit the worker could never accept.
-
-    The worker refused every launch ("... must not contain a newline") with a
-    500, the agent passed on a 500, and the plane retried the dispatch as
-    transient for twenty minutes while the lease held its v6e-4. A validation
-    verdict does not change on a retry, so it now fails the attempt with the
-    worker's sentence and gives the capacity back.
-    """
+    """Fail an invalid launch with the worker's reason and release its lease rather than retry validation."""
 
     from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 

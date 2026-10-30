@@ -10,8 +10,7 @@ default transfer runner (every artifact cp/cat/rm the server-side store runs,
 via ``managed_artifact_store_from_uri``) and the inventory token helper's
 ambient ``gcloud auth print-access-token`` fallback. Both may run inside a
 process that inherited a client's ``PYTHONPATH``, so both must start gcloud
-with a scrubbed environment; see ``eyvan._internal.subprocess_env`` for the
-outage that motivates it. Sibling coverage lives in
+with a scrubbed environment via ``eyvan._internal.subprocess_env``. Sibling coverage lives in
 ``tests/test_subprocess_env.py`` for the other module-level runners.
 """
 

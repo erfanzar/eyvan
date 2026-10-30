@@ -3,22 +3,10 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""The multi-worker contract, enforced where a spec is built.
+"""Reject unsupported multi-worker specifications before capacity is requested.
 
-``WorkloadDefinition`` carried this contract in a ``@model_validator``. At some
-point the validator's body was left stranded *after* a ``return`` inside the
-``capacity_class_portfolio`` property, so every line of it became unreachable
-and nothing enforced any of it.
-
-The multislice ceiling survived elsewhere (``CellRecord``, and the callable
-submit path), so the hole was bounded rather than total. But a direct HTTP or
-CLI submit with ``worker_count > 1`` and a GPU gang, a non-GCP provider, or more
-than one cell group was accepted at the spec boundary and only failed much
-later, when a cell was built -- the worst place to learn about it, because by
-then capacity has been requested.
-
-Ruff's selected rules (``A,B,E,F,I,NPY,RUF,UP,W``) contain no unreachable-code
-check, which is why this survived review and CI.
+Direct HTTP and CLI submissions must enforce the same worker-count, provider,
+accelerator and cell-group constraints as the callable and cell paths.
 """
 
 from __future__ import annotations

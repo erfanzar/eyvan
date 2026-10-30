@@ -5,10 +5,8 @@
 
 """A commit on the local store must not freeze the event loop or block readers.
 
-Measured on a real 9.3 MB plane (2026-10-28): one commit held the event loop for
-1.1 s, re-dumped and re-validated the whole state once per schema version, and
-every request -- authentication included -- queued behind it on the transaction
-lock, so assistant streams arrived seconds late. These pin the three fixes.
+Serialize and validate state without blocking the event loop, repeating work
+per schema version, or holding readers behind the transaction lock.
 """
 
 from __future__ import annotations

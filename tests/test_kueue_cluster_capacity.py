@@ -10,8 +10,8 @@ changes nothing -- never full, never empty.** The failure this guards against is
 not a crash, it is a plausible number. A ClusterQueue whose ``status`` has not
 been populated yet, read carelessly, reports an entire saturated cluster as
 free; an RBAC refusal, read carelessly, reports it as full and strands the pool.
-Both are silent, both survive review, and both are the reason the reading has a
-state instead of just a number.
+The reading needs an explicit state rather than only a number to distinguish
+those cases from known capacity.
 
 The fake API server is ``httpx.MockTransport``, the same substitute
 ``test_kubernetes_transport.py`` uses. It proves what Eyvan does with a given

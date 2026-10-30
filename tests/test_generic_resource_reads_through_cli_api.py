@@ -39,8 +39,8 @@ class _Api:
 
 @pytest.fixture
 def resource_api(monkeypatch, tmp_path):
-    # Build identity is unrelated to the read contract; avoid hashing a shared
-    # tree while other repair writers are active. No listener/lifespan is run.
+    # Build identity is unrelated to the read contract; skip source-tree hashing.
+    # No listener or lifespan is run.
     monkeypatch.setattr(app_module, "build_identity", lambda: None)
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)

@@ -1353,11 +1353,7 @@ def test_a_failed_worker_names_a_non_traceback_last_word_too(tmp_path: Path) -> 
 
 
 def test_systemds_own_closing_lines_are_never_the_reason(tmp_path: Path) -> None:
-    """Journal of the real failure on a Spot v6e-4, 2026-09-24, verbatim in shape.
-
-    Python's launcher named the cause mid-line and systemd appended two lines of
-    its own; the verdict quoted systemd's "Failed with result 'exit-code'".
-    """
+    """Prefer the launcher's diagnostic over systemd's generic closing lines when reporting failure."""
 
     systemd = FakeSystemd()
     executor = SystemdTransientServiceExecutor(tmp_path, command_runner=systemd, boot_id_reader=lambda: "boot-a")
@@ -1413,14 +1409,7 @@ def test_a_jobs_own_starting_line_is_not_mistaken_for_systemd(tmp_path: Path) ->
 
 
 def test_a_retired_execution_is_launched_again_when_submitted_again(tmp_path: Path) -> None:
-    """Found live 2026-09-24 on a Spot v6e-16 gang.
-
-    One host dropped the first submission, so the gang retired the ranks it had
-    already started. The dispatch retry used the same submission ID, and those
-    hosts answered it as a replay of the launch Eyvan had just stopped: two of
-    four ranks were already STOPPED when the gang was first observed, and it was
-    declared lost. A retired record is Eyvan's own stop, so it is relaunched.
-    """
+    """Relaunch an explicitly retired submission on retry rather than replay its stopped execution."""
 
     systemd = FakeSystemd()
     executor = SystemdTransientServiceExecutor(

@@ -998,11 +998,8 @@ def _two_zone_fleet() -> JsonObject:
 def test_one_fleet_may_hold_the_same_tpu_shape_in_two_zones() -> None:
     """A pool's name and its accelerator shape are allowed to differ.
 
-    While the mapping key *was* the shape, one fleet could hold a shape once,
-    and a fleet is scoped to a zone -- so a workload could only ever wait on the
-    zone it was submitted against. Racing zones is what actually wins spot
-    capacity: on 2026-08-15 us-east5-b granted and reclaimed twice while
-    us-central2-b held.
+    Distinct mapping keys let a fleet offer the same accelerator shape in
+    different zones so workloads can race or alternate between them.
     """
 
     config = EyvanFleetConfig.model_validate(_two_zone_fleet())
@@ -1045,14 +1042,7 @@ def test_a_pool_without_an_explicit_shape_still_takes_its_name() -> None:
 def test_a_single_vm_tpu_can_opt_into_compute_capacity(
     accelerator_type: str, machine_type: str, tpu_type: str, chips: int
 ) -> None:
-    """Found live 2026-09-24: v5e could not be had here through the TPU queue.
-
-    Every zone of the TRC project denied the queue or did not queue v5litepod
-    types, while Compute Engine Spot VMs of the same machine family were
-    available -- v5p-8 had been won exactly that way. The catalog rows lacked the
-    Compute TPU identity, so opting a v5e pool into `gcp-compute` produced a spec
-    the Compute provider refused. The queue stays the default; Compute is opt-in.
-    """
+    """Carry the Compute TPU identity for explicit gcp-compute opt-in while retaining the TPU queue default."""
 
     from eyvan.capacity.providers.gcp.compute_instances import normalize_compute_config
 

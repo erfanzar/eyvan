@@ -100,11 +100,8 @@ def _parse_time(value: str) -> datetime:
 def test_an_idle_quota_keeps_its_last_usage_point_weeks_after_it_was_written() -> None:
     """Monitoring writes a usage point when usage changes, not while it stays put.
 
-    In example-spot-project on 2026-10-23 the newest Spot v5p/v6e points were from
-    2026-10-01, all zero, because nothing had run since. A two-day window found
-    no point at all, so every zone was reported ``usage_unknown`` although the
-    provider held a valid reading. The peer below honours the requested
-    interval exactly as Cloud Monitoring does.
+    A short query window can omit a valid older reading from an idle quota.
+    The peer below honours the requested interval as Cloud Monitoring does.
     """
 
     stored = _series(location="us-east5-b", points=[_point("0", "2026-10-01T10:28:03Z")])

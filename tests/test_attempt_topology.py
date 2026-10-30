@@ -1015,8 +1015,7 @@ async def topology_repository(request, tmp_path) -> tp.AsyncIterator[tp.Any]:
     """Every durable backend a control plane can be configured with, bar one.
 
     The frozen rank space is only useful if it survives; a backend that quietly
-    drops it turns every attempt on that deployment into one with an unknown
-    topology, which is the same outage the record was written to prevent.
+    drops it leaves attempts on that deployment with an unknown topology.
 
     PostgreSQL is the deliberate omission *here* and is covered in
     ``test_postgres_semantics.py`` instead, which is where this package keeps

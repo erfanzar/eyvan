@@ -3,22 +3,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""`eyvan workload exec` could not reach a rank of a multi-host slice.
+"""Fan workload exec out to every rank of a multi-host slice.
 
-Two gates stand between the command and a host. The *admission* gate is
-``AgentCapabilities.supports_exec``, which the GCP driver declared a literal
-``False`` under a comment promising operator control -- fixed separately. The
-*implementation* gate is ``ExecCapableExecutionDriver``, and this is that half.
-
-``exec_in_workload`` existed once, on the local systemd driver, so a single-host
-cell could exec while a TPU slice could not: the slice is driven over each host's
-native worker HTTP API, and that API exposed no exec route. Measured on a live
-v5p-16 on 2026-08-13, where the refusal read *"execution backend 'eyvan-native'
-cannot exec beside a workload"* with a trainer running on both hosts.
-
-The fan-out reports an unreachable rank in place rather than returning the hosts
-it could reach, which is the same rule ``process_status`` and the structured-log
-fan-out follow, and the rule P2 qualified against the same day.
+The native worker HTTP API must implement ``ExecCapableExecutionDriver`` for
+multi-host execution. Fan-out reports an unreachable rank in place rather than
+silently returning only reachable hosts, matching process-status and log fan-out.
 """
 
 from __future__ import annotations

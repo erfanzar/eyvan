@@ -814,8 +814,7 @@ def test_callable_progress_wait_short_circuits_progress_polling_on_a_terminal_ob
 def test_an_elastic_job_is_never_narrated_as_one_atomic_allocation(
     phase: WorkloadProgressPhase, cells: int, requesting: int, provisioning: int, expected: str
 ) -> None:
-    """Found on the 2026-09-24 Spot campaign: the receipt said ``allocation elastic``
-    and the very next line said ``requesting one atomic allocation``."""
+    """Describe elastic cell requests consistently without calling them an atomic allocation."""
 
     from eyvan.records import PlacementMode
     from eyvan.sdk.client.callables import _CallableProgressRenderer

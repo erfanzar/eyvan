@@ -608,8 +608,7 @@ async def test_workload_progress_counts_every_cell_of_a_running_elastic_pack() -
 
 @pytest.mark.asyncio
 async def test_a_cell_lost_after_a_successful_apply_narrates_its_own_provider_cause() -> None:
-    """2026-09-24, us-central1-a: the Spot insert failed after ``create`` returned,
-    so the apply command held no error and the user saw ``hard_constraint``."""
+    """Show a cell's asynchronous provider failure even when its earlier apply command succeeded."""
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -692,8 +691,7 @@ async def test_a_commands_own_diagnostic_still_wins_over_a_cell_detail() -> None
 
 @pytest.mark.asyncio
 async def test_a_workload_the_planner_stopped_acquiring_for_does_not_say_requesting() -> None:
-    """2026-09-24: a v5e pool GCP failed sixteen times tripped the acquisition bound,
-    and the SDK went on printing "requesting one elastic cell" beneath it."""
+    """Report exhausted acquisition as provider failure rather than an active capacity request."""
 
     from eyvan.records import ACQUISITION_EXHAUSTED_SCHEDULING_REASON
 
@@ -717,8 +715,7 @@ async def test_a_workload_the_planner_stopped_acquiring_for_does_not_say_request
 
 @pytest.mark.asyncio
 async def test_a_denial_in_one_zone_does_not_hide_another_zone_provisioning() -> None:
-    """2026-09-24: us-east1-b denied a cross-zone v5e workload and the progress route kept
-    saying so while us-south1-a was provisioning the job's capacity."""
+    """Prefer active provisioning progress over a denial from a different candidate zone."""
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository)
@@ -751,7 +748,7 @@ async def test_a_denial_with_nothing_else_in_flight_is_still_reported() -> None:
 
 @pytest.mark.asyncio
 async def test_a_raced_workload_names_the_zone_building_its_capacity() -> None:
-    """2026-09-24: "provisioning | v5litepod-8 | europe-west4-a" while us-south1-a built the cell."""
+    """Name the zone actually provisioning capacity rather than the request's first-choice zone."""
 
     from eyvan.records import POOL_ALTERNATE_TEMPLATES_LABEL, POOL_ALTERNATES_LABEL
 
