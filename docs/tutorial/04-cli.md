@@ -75,7 +75,9 @@ worker**, an onprem-ssh agent with SSH access and matching worker authentication
 and an absolute worker state directory writable by that SSH user are prerequisites.
 It does not install software, distribute GCP credentials, or create firewall rules.
 The CLI checks worker liveness; agent authentication and the fenced claim are
-established during fleet readiness. Declare real resources using `--cpus` and
+established during fleet readiness; with `EYVAN_NATIVE_WORKER_ROOT_SECRET` set the agent
+pushes the per-cell worker token over SSH before each start (unit and pool setup in
+`docs/reference/capacity-and-providers.md`). Declare real resources using `--cpus` and
 `--memory-gib`; capacity defaults to `reserved` (`--capacity-class on_demand` is
 also supported, never Spot), and `--region` defaults to `onprem`.
 

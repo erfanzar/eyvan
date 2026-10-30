@@ -14,6 +14,7 @@ exactly that reason.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import typing as tp
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.capacity.drivers.onprem_ssh import (
     MARKER_SCRIPT,
+    WORKER_SECRET_FILE,
     OnPremSshCapacityDriver,
     RemoteResult,
     RemoteTransportError,
@@ -40,6 +42,7 @@ from eyvan.capacity.drivers.onprem_ssh import (
 from eyvan.capacity.drivers.registry import DEFAULT_CAPACITY_BACKENDS
 from eyvan.capacity.fleet_state import FleetStateStore, LocalBackend
 from eyvan.config import EyvanSettings
+from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
 
 HOSTS = ("eyvan@rack-a", "eyvan@rack-b")
 
@@ -70,6 +73,15 @@ class FakeSshFleet:
 
     def __init__(self) -> None:
         self.markers: dict[str, str] = {}
+        #: ``eyvan-cell.marker.started``: the identity each worker was last
+        #: started under, or ``"pending"``.
+        self.started: dict[str, str] = {}
+        #: ``{state_dir}/worker-secret`` on each host.
+        self.secrets: dict[str, str] = {}
+        #: Every token push, in order, as ``(host, token)``.
+        self.secret_pushes: list[tuple[str, str]] = []
+        #: Every argv any host was asked to run, for the never-in-argv check.
+        self.argvs: list[tuple[str, ...]] = []
         self.lifecycle_commands: list[tuple[str, tuple[str, ...]]] = []
         self.unreachable = False
         self.refuse_claims = False
@@ -88,10 +100,11 @@ class FakeSshFleet:
         del timeout_s
         if self.unreachable:
             raise RemoteTransportError(f"connection to {host} refused")
+        self.argvs.append(tuple(argv))
         if tuple(argv[:3]) != ("sh", "-s", "--"):
             self.lifecycle_commands.append((host, tuple(argv)))
             return RemoteResult(exit_code=self.lifecycle_exit_code, stdout="", stderr="")
-        assert stdin == MARKER_SCRIPT, "the marker protocol must ship the audited script, not a built command"
+        secret = self._preamble(stdin)
         action, _path, cell, uid, generation, fence = argv[3:9]
         command = tuple(argv[9:])
         current = self.markers.get(host)
@@ -99,19 +112,35 @@ class FakeSshFleet:
             if current is None:
                 return RemoteResult(exit_code=4, stdout="", stderr="")
             return RemoteResult(exit_code=0, stdout=current, stderr="")
-        if action == "claim":
+        if action in ("claim", "reclaim"):
             if self.refuse_claims:
                 return RemoteResult(exit_code=3, stdout="", stderr="host is claimed elsewhere")
             if current is not None and not self._supersedable(current, cell, uid, generation, fence):
                 return RemoteResult(exit_code=3, stdout="", stderr="host is claimed elsewhere")
             payload = _marker(cell, uid, int(generation), fence)
+            identity = f"{cell} {uid} {generation} {fence}"
+            changed = current != payload
+            if host in self.started:
+                changed = self.started[host] != identity
             self.markers[host] = payload
-            if command:
-                self.lifecycle_commands.append((host, command))
-                if self.lifecycle_exit_code:
-                    return RemoteResult(
-                        exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
-                    )
+            if action == "claim":
+                start = bool(secret or command)
+            else:
+                start = changed
+            if start:
+                self.started[host] = "pending"
+                if secret:
+                    self.secrets[host] = secret
+                    self.secret_pushes.append((host, secret))
+                if command:
+                    self.lifecycle_commands.append((host, command))
+                    if self.lifecycle_exit_code:
+                        return RemoteResult(
+                            exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
+                        )
+                self.started[host] = identity
+            elif changed:
+                self.started[host] = "pending"
             return RemoteResult(exit_code=0, stdout=payload, stderr="")
         if action == "release":
             if current is not None:
@@ -124,9 +153,22 @@ class FakeSshFleet:
                         return RemoteResult(
                             exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
                         )
+                self.started.pop(host, None)
                 self.markers.pop(host)
             return RemoteResult(exit_code=0, stdout="", stderr="")
         return RemoteResult(exit_code=6, stdout="", stderr="unknown action")
+
+    @staticmethod
+    def _preamble(stdin: str) -> str:
+        """Return the pushed token, requiring the audited script after it."""
+
+        assert stdin.endswith(MARKER_SCRIPT), "the marker protocol must ship the audited script, not a built command"
+        preamble = stdin[: len(stdin) - len(MARKER_SCRIPT)]
+        if not preamble:
+            return ""
+        match = re.fullmatch(r"worker_secret=([0-9a-f]{64})\n", preamble)
+        assert match is not None, f"only the token assignment may precede the script, got {preamble!r}"
+        return match.group(1)
 
     @staticmethod
     def _supersedable(current: str, cell: str, uid: str, generation: str, fence: str) -> bool:
@@ -382,16 +424,193 @@ def test_a_stale_fencing_token_cannot_release_the_rack(tmp_path) -> None:
     assert set(fleet.markers) == set(HOSTS)
 
 
-def test_management_uid_is_derived_so_worker_tokens_stay_stable(tmp_path) -> None:
-    """A random UID would rotate the per-cell token and lock out live workers."""
+ROOT_SECRET = "root-secret-for-onprem-tests-0123456789"
+
+
+def _secret_driver(tmp_path: Path) -> tuple[OnPremSshCapacityDriver, FakeSshFleet, dict]:
+    driver, fleet, desired = _driver(tmp_path)
+    driver.shared_secret = ROOT_SECRET
+    return driver, fleet, desired
+
+
+def _agent_token(observation) -> str:
+    """Derive the bearer the agent will present, exactly as its registry does."""
+
+    token = derive_native_worker_token(
+        ROOT_SECRET,
+        observation.metadata["management_uid"],
+        provider_generation=observation.metadata["provider_generation"],
+    )
+    assert token is not None
+    return token
+
+
+def _starts(fleet: FakeSshFleet) -> list[str]:
+    return [host for host, command in fleet.lifecycle_commands if command[-1] == "start"]
+
+
+def test_management_uid_is_derived_but_the_worker_token_follows_the_incarnation(tmp_path) -> None:
+    """The UID is stable; the token is not, and the host is told every time it moves.
+
+    The token is ``HMAC(root, management_uid, provider_generation)``. A replay
+    keeps it, a reconcile under the same fence keeps it, and each of a new
+    accepted apply, a reconcile under a new fence, and a replacement cell
+    changes it -- which is only safe because each of those also pushes the
+    new token to every host and restarts the worker.
+    """
 
     first, _, desired = _driver(tmp_path / "a")
     second, _, _ = _driver(tmp_path / "b")
+    assert (
+        first.apply_capacity("cell-a", desired, _context("apply")).metadata["management_uid"]
+        == second.apply_capacity("cell-a", desired, _context("apply")).metadata["management_uid"]
+    )
 
-    left = first.apply_capacity("cell-a", desired, _context("apply"))
-    right = second.apply_capacity("cell-a", desired, _context("apply"))
+    driver, fleet, desired = _secret_driver(tmp_path / "c")
+    applied = driver.apply_capacity("cell-a", desired, _context("apply"))
+    first_token = _agent_token(applied)
+    assert fleet.secrets == {host: first_token for host in HOSTS}
 
-    assert left.metadata["management_uid"] == right.metadata["management_uid"]
+    replayed = driver.apply_capacity("cell-a", desired, _context("apply"))
+    assert _agent_token(replayed) == first_token
+    same_fence = driver.reconcile("cell-a", _context("reconcile"))
+    assert _agent_token(same_fence) == first_token
+
+    reapplied = driver.apply_capacity("cell-a", desired, _context("apply-again"))
+    second_token = _agent_token(reapplied)
+    assert second_token != first_token
+    assert fleet.secrets == {host: second_token for host in HOSTS}
+
+    moved = driver.reconcile("cell-a", _context("reconcile-2", generation=2, token="fence-2"))
+    third_token = _agent_token(moved)
+    assert moved.state is CapacityStatus.HEALTHY
+    assert third_token not in (first_token, second_token)
+    assert fleet.secrets == {host: third_token for host in HOSTS}
+
+
+def test_apply_pushes_the_agents_token_to_every_host_before_starting(tmp_path) -> None:
+    """The file the worker reads holds exactly what the agent will present."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+
+    observation = driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    token = _agent_token(observation)
+    assert fleet.secret_pushes == [(host, token) for host in HOSTS]
+    assert _starts(fleet) == list(HOSTS)
+    assert all(fleet.started[host].startswith("cell-a ") for host in HOSTS)
+
+
+def test_apply_pushes_the_token_even_without_a_start_command(tmp_path) -> None:
+    """A unit with Restart=always picks the token up on its own next start."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    desired["provider_options"].pop("start_command")
+
+    observation = driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    assert fleet.secrets == {host: _agent_token(observation) for host in HOSTS}
+    assert _starts(fleet) == []
+
+
+def test_reconcile_with_an_unchanged_identity_pushes_and_restarts_nothing(tmp_path) -> None:
+    """A reconcile interval must never bounce a worker that is running a workload."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+    pushes, commands = list(fleet.secret_pushes), list(fleet.lifecycle_commands)
+
+    for index in range(3):
+        assert driver.reconcile("cell-a", _context(f"reconcile-{index}")).state is CapacityStatus.HEALTHY
+
+    assert fleet.secret_pushes == pushes
+    assert fleet.lifecycle_commands == commands
+
+
+def test_a_replacement_cell_that_claims_through_reconcile_pushes_and_starts(tmp_path) -> None:
+    """The live failure: the replacement's apply raced the release, reconcile took the host.
+
+    Before this, reconcile re-claimed without ``start_command``; the worker kept
+    the predecessor's token, answered the agent with 401, and the cell stayed
+    ``registering``.
+    """
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    driver.apply_capacity("cell-0001", desired, _context("apply-1"))
+    with pytest.raises(CapacityProviderError) as raised:
+        driver.apply_capacity("cell-0002", desired, _context("apply-2"))
+    assert raised.value.code is CapacityProviderFailureCode.CONFIGURATION
+    driver.release("cell-0001", _context("release-1", generation=2))
+    fleet.lifecycle_commands.clear()
+    fleet.secret_pushes.clear()
+
+    reconciled = driver.reconcile("cell-0002", _context("reconcile-2"))
+
+    assert reconciled.state is CapacityStatus.HEALTHY
+    token = _agent_token(reconciled)
+    assert fleet.secret_pushes == [(host, token) for host in HOSTS]
+    assert _starts(fleet) == list(HOSTS)
+
+
+def test_reconcile_finishes_an_apply_whose_start_failed(tmp_path) -> None:
+    """A claim that never started is recorded pending, not mistaken for a running worker."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    fleet.lifecycle_exit_code = 2
+    with pytest.raises(CapacityProviderError):
+        driver.apply_capacity("cell-a", desired, _context("apply"))
+    assert fleet.started[HOSTS[0]] == "pending"
+    fleet.lifecycle_exit_code = 0
+    fleet.lifecycle_commands.clear()
+
+    reconciled = driver.reconcile("cell-a", _context("reconcile"))
+
+    assert reconciled.state is CapacityStatus.HEALTHY
+    assert _starts(fleet) == list(HOSTS)
+    assert fleet.secrets == {host: _agent_token(reconciled) for host in HOSTS}
+
+
+def test_reconcile_never_pushes_or_starts_on_a_foreign_host(tmp_path) -> None:
+    """The ownership check still precedes everything the host is asked to do."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+    fleet.markers[HOSTS[0]] = _marker("someone-elses-cell", "uid", 9, "e" * 32)
+    fleet.started[HOSTS[0]] = "someone-elses-cell uid 9 " + "e" * 32
+    pushes, commands = list(fleet.secret_pushes), list(fleet.lifecycle_commands)
+
+    with pytest.raises(CapacityProviderError) as raised:
+        driver.reconcile("cell-a", _context("reconcile", generation=2, token="fence-2"))
+
+    assert raised.value.code is CapacityProviderFailureCode.CONFIGURATION
+    assert fleet.secret_pushes == pushes
+    assert fleet.lifecycle_commands == commands
+    assert _field(fleet.markers[HOSTS[0]], "cell_id") == "someone-elses-cell"
+
+
+def test_neither_the_token_nor_the_root_secret_is_ever_in_argv(tmp_path) -> None:
+    """argv is visible to every user on the host through /proc; stdin is not."""
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    applied = driver.apply_capacity("cell-a", desired, _context("apply"))
+    driver.reconcile("cell-a", _context("reconcile", generation=2, token="fence-2"))
+    driver.release("cell-a", _context("release", generation=3, token="fence-3"))
+
+    secrets = {ROOT_SECRET, _agent_token(applied), *fleet.secrets.values()}
+    assert fleet.secret_pushes
+    for argv in fleet.argvs:
+        assert not any(secret in part for part in argv for secret in secrets), argv
+
+
+def test_without_a_root_secret_nothing_is_pushed(tmp_path) -> None:
+    """``None`` is an answer: the operator delivers the token another way."""
+
+    driver, fleet, desired = _driver(tmp_path)
+
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    assert fleet.secret_pushes == []
+    assert _starts(fleet) == list(HOSTS)
 
 
 def test_a_start_command_failure_is_conclusive_not_a_retry_loop(tmp_path) -> None:
@@ -448,17 +667,35 @@ def test_the_registry_builds_the_on_premises_driver_from_settings(tmp_path) -> N
 
     assert isinstance(driver, OnPremSshCapacityDriver)
     assert driver.native_worker_port == 9100
+    assert driver.shared_secret is None
+
+    secured = DEFAULT_CAPACITY_BACKENDS.create(
+        "onprem-ssh",
+        state=state,
+        settings=EyvanSettings(capacity_backend="onprem-ssh", native_worker_root_secret=ROOT_SECRET),
+    )
+
+    assert tp.cast(OnPremSshCapacityDriver, secured).shared_secret == ROOT_SECRET
 
 
 # --------------------------------------------------------------------------- the real script
 
 
-def _sh(marker: Path, action: str, cell: str, generation: int, fence: str = "f" * 32) -> subprocess.CompletedProcess:
+def _sh(
+    marker: Path,
+    action: str,
+    cell: str,
+    generation: int,
+    fence: str = "f" * 32,
+    *,
+    command: tp.Sequence[str] = (),
+    secret: str | None = None,
+) -> subprocess.CompletedProcess:
     """Run the shipped marker script through a real POSIX shell."""
 
     return subprocess.run(
-        ["sh", "-s", "--", action, str(marker), cell, "uid-1", str(generation), fence],
-        input=MARKER_SCRIPT,
+        ["sh", "-s", "--", action, str(marker), cell, "uid-1", str(generation), fence, *command],
+        input=OnPremSshCapacityDriver._marker_stdin(secret),
         capture_output=True,
         text=True,
         check=False,
@@ -522,3 +759,81 @@ def test_the_marker_script_reports_an_unknown_action(tmp_path) -> None:
     """A protocol mismatch is an error, never a silent success."""
 
     assert _sh(tmp_path / "eyvan-cell.marker", "destroy", "cell-a", 1).returncode == 6
+
+
+def _launcher(tmp_path: Path) -> tuple[list[str], Path]:
+    """A start command that records each run and what the environment exposed."""
+
+    log = tmp_path / "starts.log"
+    launcher = tmp_path / "start-worker"
+    launcher.write_text('#!/bin/sh\nprintf "%s\\n" "${worker_secret:-unset}" >> "$1"\n')
+    launcher.chmod(0o700)
+    return [str(launcher), str(log)], log
+
+
+def _runs(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_the_marker_script_writes_the_pushed_token_root_only_before_starting(tmp_path) -> None:
+    """0600 from creation, replaced atomically, and never exported to the launcher."""
+
+    marker = tmp_path / "state" / "eyvan-cell.marker"
+    command, log = _launcher(tmp_path)
+    token = "a" * 64
+
+    claimed = _sh(marker, "claim", "cell-a", 1, command=command, secret=token)
+
+    assert claimed.returncode == 0, claimed.stderr
+    secret = marker.parent / WORKER_SECRET_FILE
+    assert secret.read_text() == token
+    assert secret.stat().st_mode & 0o777 == 0o600
+    assert _runs(log) == ["unset"]
+    assert marker.with_name("eyvan-cell.marker.started").read_text().split() == ["cell-a", "uid-1", "1", "f" * 32]
+    assert sorted(path.name for path in marker.parent.iterdir()) == [
+        "eyvan-cell.marker",
+        "eyvan-cell.marker.started",
+        WORKER_SECRET_FILE,
+    ]
+
+
+def test_the_marker_script_reclaims_without_restarting_an_unchanged_worker(tmp_path) -> None:
+    """Same identity: no push and no start. A new one: both, after the marker check."""
+
+    marker = tmp_path / "eyvan-cell.marker"
+    command, log = _launcher(tmp_path)
+    assert _sh(marker, "claim", "cell-a", 1, command=command, secret="a" * 64).returncode == 0
+
+    assert _sh(marker, "reclaim", "cell-a", 1, command=command, secret="b" * 64).returncode == 0
+    assert _runs(log) == ["unset"]
+    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "a" * 64
+
+    assert _sh(marker, "reclaim", "cell-a", 2, "e" * 32, command=command, secret="c" * 64).returncode == 0
+    assert _runs(log) == ["unset", "unset"]
+    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "c" * 64
+
+    assert _sh(marker, "reclaim", "cell-b", 9, command=command, secret="d" * 64).returncode == 3
+    assert _runs(log) == ["unset", "unset"]
+    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "c" * 64
+
+
+def test_the_marker_script_finishes_a_pending_start_and_spares_a_legacy_claim(tmp_path) -> None:
+    """An arbitration-only claim is pending; a claim from before the record is not restarted."""
+
+    marker = tmp_path / "eyvan-cell.marker"
+    command, log = _launcher(tmp_path)
+
+    assert _sh(marker, "claim", "cell-a", 1).returncode == 0
+    assert marker.with_name("eyvan-cell.marker.started").read_text() == "pending\n"
+    assert _sh(marker, "reclaim", "cell-a", 1, command=command).returncode == 0
+    assert _runs(log) == ["unset"]
+
+    marker.with_name("eyvan-cell.marker.started").unlink()
+    assert _sh(marker, "reclaim", "cell-a", 1, command=command).returncode == 0
+    assert _runs(log) == ["unset"]
+
+    assert _sh(marker, "release", "cell-a", 1).returncode == 0
+    assert not marker.exists()
+    assert not marker.with_name("eyvan-cell.marker.started").exists()
+    assert _sh(marker, "reclaim", "cell-a", 1, command=command).returncode == 0
+    assert _runs(log) == ["unset", "unset"]

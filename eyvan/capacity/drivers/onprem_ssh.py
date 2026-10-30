@@ -37,6 +37,33 @@ own. Claim publication and lifecycle commands share a host-local marker lock;
 stop/removal requires the exact cell, management UID, provider generation and
 fence. A foreign, unreadable or missing marker never authorizes a stop.
 
+**The worker credential.** The agent authenticates to each worker with
+``HMAC(root secret, management_uid, provider_generation)`` -- so the token a
+worker must accept changes whenever the incarnation does: an accepted apply, a
+reconcile under a new fence, a replacement cell. When the driver is built with
+the native-worker root secret it derives that token and pushes it on SSH
+*stdin* (never argv) into ``{state_dir}/worker-secret``, mode 0600 from
+creation and replaced atomically, inside the same marker lock and after the
+same ownership check that guards ``start_command``. The host's unit copies that
+persistent file into its private runtime directory before every start, exactly
+as Eyvan's own bootstrapped unit does, because the worker deletes the file it
+reads. A host whose worker was never told the current token answers every
+agent call with 401 and the cell never leaves ``registering``; that is the
+failure this push exists to prevent.
+
+**When the worker is (re)started.** Apply always pushes the token and runs
+``start_command``. Reconcile re-asserts the claim and pushes and restarts
+*only* when the identity it writes is not the one the worker was last started
+under -- a new cell, a new provider generation, a new fence, or a rebuilt
+host. The host records that identity in ``eyvan-cell.marker.started`` after
+``start_command`` succeeds; a claim that changed the marker without starting
+records ``pending``, so an apply interrupted between claim and start is
+finished by the next reconcile rather than left with a stale worker. A host
+with no record at all (a claim from before this file existed) is judged by its
+marker alone, so upgrading Eyvan does not restart workers that already hold the
+right token. The comparison runs inside the lock, after the marker check, so a
+foreign, older or unreadable marker still refuses before anything starts.
+
 **Replacement and crash recovery.** Live host inventories and ``state_dir``
 cannot be replaced: explicitly release the cell before applying a different
 inventory. Interrupted incarnation changes retain exact predecessor cleanup
@@ -117,11 +144,25 @@ _EXIT_USAGE = 6
 _EXIT_BUSY = 7
 _EXIT_LIFECYCLE = 8
 
+#: Where the pushed per-cell worker token lives, relative to ``state_dir``. A
+#: persistent file rather than the runtime directory: the worker deletes the
+#: file it reads, so the unit copies this one in before every start, and a
+#: reboot or ``Restart=always`` finds it still there.
+WORKER_SECRET_FILE = "worker-secret"
+
+#: The one line the driver may prepend to ``MARKER_SCRIPT`` on stdin. A shell
+#: assignment of a value checked to be lowercase hex, never exported, so the
+#: token reaches neither a process's argv nor the lifecycle command's
+#: environment; ``printf`` is a builtin in every POSIX ``sh`` this runs under.
+_WORKER_SECRET_PREAMBLE = "worker_secret={token}\n"
+
 #: The whole remote protocol. Sent on stdin to ``sh -s`` so no value is ever
 #: interpolated into a command string, and shipped as one constant so the
-#: semantics an operator audits are the semantics that run.
+#: semantics an operator audits are the semantics that run. The only thing
+#: ever placed before it is ``_WORKER_SECRET_PREAMBLE``.
 MARKER_SCRIPT = r"""
 set -u
+worker_secret=${worker_secret:-}
 action=$1
 marker=$2
 cell=$3
@@ -130,13 +171,15 @@ generation=$5
 fence=$6
 shift 6
 directory=$(dirname "$marker")
+started="$marker.started"
+identity="$cell $uid $generation $fence"
 
 # mkdir is the host-local arbitration primitive, independent of fleet stores.
 # Never expire/steal a lock: an old SSH command or its child may still be alive.
 # SIGKILL/host failure leaves the lock fail-closed. An operator may remove it
 # only after quiescing all marker commands and lifecycle children on this host.
 case "$action" in
-  claim|release)
+  claim|reclaim|release)
     mkdir -p "$directory" || exit 5
     lock="$marker.lock"
     mkdir "$lock" 2>/dev/null || exit 7
@@ -156,6 +199,12 @@ emit() {
   printf 'cell_id=%s\nmanagement_uid=%s\nprovider_generation=%s\nfence=%s\n' "$1" "$2" "$3" "$4"
 }
 
+# The identity the worker was last started under, or "pending" when a claim
+# changed the marker without starting it. Replaced atomically like the marker.
+stamp() {
+  printf '%s\n' "$1" > "$started.$$" && mv -f "$started.$$" "$started"
+}
+
 case "$action" in
   observe)
     [ -f "$marker" ] || exit 4
@@ -165,7 +214,8 @@ case "$action" in
     observed_fence=$(field fence "$marker")
     emit "$observed_cell" "$observed_uid" "$observed_generation" "$observed_fence"
     ;;
-  claim)
+  claim|reclaim)
+    changed=1
     if [ -f "$marker" ]; then
       current_cell=$(field cell_id "$marker")
       current_generation=$(field provider_generation "$marker")
@@ -178,13 +228,39 @@ case "$action" in
       [ "$current_generation" -le "$generation" ] || exit 3
       if [ "$current_generation" -eq "$generation" ]; then
         [ "$current_fence" = "$fence" ] || exit 3
+        changed=0
       fi
+    fi
+    # The start record, when present, is the better witness: it survives a
+    # marker removed by hand and names a claim whose start never finished.
+    if [ -f "$started" ]; then
+      if [ "$(cat "$started" 2>/dev/null)" = "$identity" ]; then changed=0; else changed=1; fi
     fi
     temporary="$marker.claim.$$"
     emit "$cell" "$uid" "$generation" "$fence" > "$temporary" || exit 5
     mv "$temporary" "$marker" || exit 5
-    if [ "$#" -gt 0 ]; then
-      "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
+    # claim starts whenever it carries something to start with; reclaim only
+    # when this identity is not the one the worker was last started under.
+    start=0
+    if [ "$action" = claim ]; then
+      if [ -n "$worker_secret" ] || [ "$#" -gt 0 ]; then start=1; fi
+    elif [ "$changed" -eq 1 ]; then
+      start=1
+    fi
+    if [ "$start" -eq 1 ]; then
+      stamp pending || exit 5
+      if [ -n "$worker_secret" ]; then
+        # 0600 from creation, then an atomic rename: never a readable window.
+        secret="$directory/worker-secret"
+        (umask 077 && printf '%s' "$worker_secret" > "$secret.$$") || { rm -f "$secret.$$"; exit 5; }
+        mv -f "$secret.$$" "$secret" || { rm -f "$secret.$$"; exit 5; }
+      fi
+      if [ "$#" -gt 0 ]; then
+        "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
+      fi
+      stamp "$identity" || exit 5
+    elif [ "$changed" -eq 1 ]; then
+      stamp pending || exit 5
     fi
     emit "$cell" "$uid" "$generation" "$fence"
     ;;
@@ -200,7 +276,7 @@ case "$action" in
       if [ "$#" -gt 0 ]; then
         "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
       fi
-      rm -f "$marker" || exit 5
+      rm -f "$started" "$marker" || exit 5
     fi
     ;;
   *)
@@ -376,12 +452,17 @@ class OnPremSshCapacityDriver:
         native_worker_port: int = 8100,
         native_worker_state_dir: str = "/var/lib/eyvan/native-worker",
         command_timeout_s: float = 30.0,
+        shared_secret: str | None = None,
     ):
         self.state = state or FleetStateStore.from_uri(None)
         self.runner = runner or OpenSshCommandRunner()
         self.native_worker_port = native_worker_port
         self.native_worker_state_dir = native_worker_state_dir.rstrip("/") or "/var/lib/eyvan/native-worker"
         self.command_timeout_s = command_timeout_s
+        #: The native-worker root secret, as the Kubernetes driver holds it.
+        #: ``None`` means hosts are never told a token -- the operator delivers
+        #: one by hand, or runs unauthenticated workers -- and is not an error.
+        self.shared_secret = shared_secret
         self._mutation_lock = RLock()
 
     def capabilities(self) -> CellCapabilities:
@@ -616,6 +697,38 @@ class OnPremSshCapacityDriver:
     def _marker_path(self, state_dir: str) -> str:
         return f"{state_dir}/eyvan-cell.marker"
 
+    def _worker_token(self, management_uid: str, provider_generation: int) -> str | None:
+        """Derive the token the agent will present to this incarnation's workers.
+
+        The same derivation the agent's execution registry performs from the
+        observation's ``management_uid`` and ``provider_generation``, so the
+        file a host holds and the bearer the agent sends cannot drift apart.
+        ``None`` when the driver was given no root secret.
+        """
+
+        if self.shared_secret is None:
+            return None
+        from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
+
+        token = derive_native_worker_token(
+            self.shared_secret,
+            management_uid,
+            provider_generation=provider_generation,
+        )
+        # Checked rather than assumed: this value is about to become a line of
+        # shell, and only an alphabet that cannot quote or substitute may.
+        if token is None or len(token) != 64 or any(character not in "0123456789abcdef" for character in token):
+            raise self._configuration("on-premises worker token derivation produced an unexpected value")
+        return token
+
+    @staticmethod
+    def _marker_stdin(worker_token: str | None) -> str:
+        """Return the script, preceded by the token assignment when there is one."""
+
+        if worker_token is None:
+            return MARKER_SCRIPT
+        return _WORKER_SECRET_PREAMBLE.format(token=worker_token) + MARKER_SCRIPT
+
     def _run_marker(
         self,
         host: str,
@@ -627,8 +740,13 @@ class OnPremSshCapacityDriver:
         provider_generation: int,
         fence: str,
         command: tp.Sequence[str] = (),
+        worker_token: str | None = None,
     ) -> RemoteResult:
-        """Run ownership arbitration and any lifecycle action in one host lock."""
+        """Run ownership arbitration and any lifecycle action in one host lock.
+
+        ``worker_token`` travels only on stdin, ahead of the script; argv holds
+        the marker identity and the operator's own command, nothing secret.
+        """
 
         argv = (
             "sh",
@@ -643,7 +761,9 @@ class OnPremSshCapacityDriver:
             *command,
         )
         try:
-            result = self.runner.run(host, argv, stdin=MARKER_SCRIPT, timeout_s=self.command_timeout_s)
+            result = self.runner.run(
+                host, argv, stdin=self._marker_stdin(worker_token), timeout_s=self.command_timeout_s
+            )
             if result.exit_code == _EXIT_BUSY:
                 raise self._unavailable(
                     f"on-premises host {host} has an active or abandoned marker lock; "
@@ -670,18 +790,30 @@ class OnPremSshCapacityDriver:
         provider_generation: int,
         fence: str,
         command: tp.Sequence[str] = (),
+        worker_token: str | None = None,
+        only_if_changed: bool = False,
     ) -> HostMarker:
-        """Claim one host and optionally start its worker under the same lock."""
+        """Claim one host and optionally start its worker under the same lock.
+
+        With a ``command`` or a ``worker_token`` the host writes the token to
+        ``{state_dir}/worker-secret`` and runs the command, both after the
+        marker check. ``only_if_changed`` (the ``reclaim`` action) does either
+        only when the identity written is not the one the worker was last
+        started under -- which is what lets reconcile run every interval
+        without restarting a healthy worker, and still restart one whose cell,
+        generation or fence moved underneath it.
+        """
 
         result = self._run_marker(
             host,
-            "claim",
+            "reclaim" if only_if_changed else "claim",
             state_dir=state_dir,
             cell_id=cell_id,
             management_uid=management_uid,
             provider_generation=provider_generation,
             fence=fence,
             command=command,
+            worker_token=worker_token,
         )
         if result.exit_code == _EXIT_CLAIMED_ELSEWHERE:
             raise self._configuration(
@@ -1010,9 +1142,13 @@ class OnPremSshCapacityDriver:
                     record.metadata["stop_command"] = validated["stop_command"]
                     # Host identity survives a drain changing the durable fence.
                     record.metadata["claim_fence"] = marker_fingerprint(context.fencing_token)
-                    # Derived, not random: re-applying the same cell reproduces
-                    # the same UID so the per-cell worker token stays stable and
-                    # already-running workers keep authenticating.
+                    # Derived, not random: a replay or a second store applying
+                    # the same cell reproduces the same UID. The worker token
+                    # also folds in provider_generation, which this accepted
+                    # apply just advanced, so the token *does* change here --
+                    # and on a reconcile under a new fence, and for a
+                    # replacement cell id. Every one of those pushes the new
+                    # token and (re)starts the worker; see ``_claim``.
                     record.metadata["management_uid"] = stable_id("onprem-ssh", cell_id)
                     self._stamp(record, context)
                     captured["provider_generation"] = record.provider_generation
@@ -1024,6 +1160,7 @@ class OnPremSshCapacityDriver:
                 provider_generation = captured.get("provider_generation", record.provider_generation)
                 management_uid = self._record_string(record, "management_uid", stable_id("onprem-ssh", cell_id))
                 fence = marker_fingerprint(context.fencing_token)
+                worker_token = self._worker_token(management_uid, provider_generation)
 
                 def revalidate(phase: str) -> None:
                     self._revalidate_record_owner(
@@ -1047,9 +1184,10 @@ class OnPremSshCapacityDriver:
                     revalidate(f"after claiming {host}")
                 for host in self._record_hosts(record):
                     revalidate(f"before starting the worker on {host}")
-                    # Recheck the marker and start within the same remote lock:
-                    # durable revalidation alone cannot protect a reused host.
-                    if start_command:
+                    # Recheck the marker, push the token, and start within the
+                    # same remote lock: durable revalidation alone cannot
+                    # protect a reused host.
+                    if start_command or worker_token is not None:
                         self._claim(
                             host,
                             state_dir=state_dir,
@@ -1058,6 +1196,7 @@ class OnPremSshCapacityDriver:
                             provider_generation=provider_generation,
                             fence=fence,
                             command=start_command,
+                            worker_token=worker_token,
                         )
                     revalidate(f"after starting the worker on {host}")
                 revalidate("before the final on-premises observation")
@@ -1076,6 +1215,16 @@ class OnPremSshCapacityDriver:
         was rebuilt, or whose marker was removed by a well-meaning cleanup: the
         cell converges back to HEALTHY instead of sitting in NEEDS_RECREATE with
         working hardware underneath it.
+
+        It is also where a replacement cell usually takes a host: its apply
+        raced the predecessor's release and was refused, and the claim lands
+        here once the host is free. So the re-claim carries the token and
+        ``start_command`` and the host runs them when -- and only when -- the
+        identity it writes is not the one its worker was last started under.
+        Restarting is right in exactly that case: the agent now derives a token
+        from the new identity, and a worker holding the old one would answer it
+        with 401 forever. With the identity unchanged nothing is pushed or
+        restarted, so a reconcile interval never interrupts a running workload.
         """
 
         try:
@@ -1120,6 +1269,10 @@ class OnPremSshCapacityDriver:
                 management_uid = self._record_string(record, "management_uid", stable_id("onprem-ssh", cell_id))
                 provider_generation = record.provider_generation
                 fence = marker_fingerprint(fencing_token)
+                start_command = tuple(
+                    part for part in tp.cast(list, record.metadata.get("start_command", [])) if isinstance(part, str)
+                )
+                worker_token = self._worker_token(management_uid, provider_generation)
 
                 def revalidate(phase: str) -> None:
                     self._revalidate_record_owner(
@@ -1139,6 +1292,9 @@ class OnPremSshCapacityDriver:
                         management_uid=management_uid,
                         provider_generation=provider_generation,
                         fence=fence,
+                        command=start_command,
+                        worker_token=worker_token,
+                        only_if_changed=True,
                     )
                     revalidate(f"after re-claiming {host}")
                 revalidate("before the on-premises reconcile observation")
@@ -1386,6 +1542,7 @@ class OnPremSshCapacityDriver:
 __all__ = (
     "MARKER_SCRIPT",
     "MAX_HOSTS",
+    "WORKER_SECRET_FILE",
     "HostMarker",
     "OnPremSshCapacityDriver",
     "OpenSshCommandRunner",

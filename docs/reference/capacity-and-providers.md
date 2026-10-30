@@ -96,7 +96,73 @@ unknown/inconclusive, not absent.
   management UID, provider generation, and fence. A foreign/old marker yields
   `NEEDS_RECREATE`; an unreachable host is `UNOBSERVED`, not gone. Eyvan owns
   the claim and marker, while the operator owns software installation and
-  normally worker startup.
+  normally worker startup. Eyvan also owns the worker *credential*: see below.
+
+### Setting up an on-prem SSH host
+
+The agent authenticates to each worker with a per-cell token,
+`HMAC(EYVAN_NATIVE_WORKER_ROOT_SECRET, management_uid, provider_generation)`.
+It changes whenever the incarnation does — an accepted apply, a reconcile under
+a new fence, a replacement cell after an upgrade — so it cannot be installed
+once by hand. When the `onprem-ssh` agent has `EYVAN_NATIVE_WORKER_ROOT_SECRET`
+set, the driver derives the token and, inside the host's marker lock and after
+the ownership check:
+
+1. writes it to `{state_dir}/worker-secret` — sent on SSH **stdin**, never argv;
+   created mode `0600` and renamed into place atomically, owned by the SSH user
+   (SSH as `root` for a root-only file);
+2. runs `start_command`, if one is declared;
+3. records the identity it started under in `{state_dir}/eyvan-cell.marker.started`.
+
+Apply always does this. Reconcile does it only when the identity it writes
+differs from the one recorded (a new cell, generation or fence, a rebuilt host,
+or an apply whose start failed), so a healthy worker is never bounced by a
+reconcile interval, and a foreign, older or unreadable marker still refuses
+before anything is written or started. Without the root secret nothing is
+pushed and the worker must be given its token another way.
+
+The worker deletes the secret file it reads, so the unit copies the persistent
+file into its private runtime directory before **every** start — the same
+pattern as Eyvan's own bootstrapped unit:
+
+```ini
+# /etc/systemd/system/eyvan-native-worker.service
+[Unit]
+Description=Eyvan native worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=eyvan-native
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/install -o root -g root -m 0600 /var/lib/eyvan/native-worker/worker-secret /run/eyvan-native/worker-secret
+ExecStart=/opt/eyvan-native/venv/bin/python -m eyvan.worker.runtime.native_worker \
+  --host 0.0.0.0 --port 8100 --state-dir /var/lib/eyvan/native-worker \
+  --secret-file /run/eyvan-native/worker-secret --systemd-transient
+KillMode=control-group
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```yaml
+pools:
+  gpu:
+    capacity_backend: onprem-ssh
+    provider_options:
+      hosts: [root@gpu-01, root@gpu-02]
+      state_dir: /var/lib/eyvan/native-worker   # must match --state-dir and the ExecStartPre source
+      worker_port: 8100
+      # Synchronous: `systemctl restart` returns once the unit has started.
+      start_command: [systemctl, restart, eyvan-native-worker]
+      stop_command: [systemctl, stop, eyvan-native-worker]
+```
+
+Declare `start_command`: without it the token file is still refreshed, but a
+running worker keeps the old token until something restarts it.
 
 ## 4. Provider clients
 
