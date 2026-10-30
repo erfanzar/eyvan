@@ -235,6 +235,31 @@ def test_the_worker_reports_a_full_host_as_ready(tmp_path: Path, monkeypatch: py
     assert body["observed_devices"] == 8
 
 
+def test_a_sliced_worker_requires_its_own_gpus_even_on_a_full_count_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Eight nodes, but not the one this slice owns: the catalog count is met,
+    # the slice is not.
+    root = _dev(tmp_path, "nvidia0", "nvidia1", "nvidia2", "nvidia3", "nvidia4", "nvidia5", "nvidia6", "nvidia8")
+    monkeypatch.setattr(
+        native_worker,
+        "check_gpu_readiness",
+        functools.partial(check_gpu_readiness, dev_root=root),
+    )
+    app = native_worker.create_native_worker_app(
+        state_dir=tmp_path / "state", secret="worker-secret", systemd_transient=True, gpu_devices=(6, 7)
+    )
+
+    body = TestClient(app).get(
+        "/api/v1/accelerators",
+        params={"expected_gpu_devices": 8},
+        headers={"Authorization": "Bearer worker-secret"},
+    ).json()
+
+    assert body["ready"] is False
+    assert "/dev/nvidia7" in body["detail"]
+
+
 def test_the_accelerator_route_requires_the_worker_credential(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client = _worker(tmp_path, monkeypatch, *EIGHT)
 

@@ -414,14 +414,21 @@ def create_native_worker_app(
         The agent passes the count; the worker is the only process that can look
         at ``/dev``. Device access is checked for the workload user on the native
         systemd path only -- the container path opens devices as root through
-        Docker. See ``eyvan.worker.runtime.host_accelerators``.
+        Docker. A worker started with ``--gpu-devices`` also requires each of its
+        slice's ``/dev/nvidiaN`` nodes, so a slice whose GPU is gone is not ready
+        even while the host still shows the catalog count. See
+        ``eyvan.worker.runtime.host_accelerators``.
         """
 
         if expected_gpu_devices is not None and expected_gpu_devices < 0:
             raise HTTPException(status_code=422, detail="expected_gpu_devices must be non-negative")
         executor = app.state.executor
         workload_user = executor.workload_user if isinstance(executor, SystemdTransientServiceExecutor) else None
-        verdict = check_gpu_readiness(expected_gpu_devices, workload_user=workload_user)
+        verdict = check_gpu_readiness(
+            expected_gpu_devices,
+            required_indices=gpu_devices or (),
+            workload_user=workload_user,
+        )
         return NativeWorkerAccelerators(
             ready=verdict.ready,
             detail=verdict.detail,
