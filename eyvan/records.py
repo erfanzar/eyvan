@@ -341,6 +341,19 @@ class NativeContainerConfig(EyvanModel):
     #: it: a size that silently does nothing is worse than no size at all.
     shm_size: str | None = None
 
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # A container block that states neither serializes exactly as it did
+        # before they existed. The block travels to native workers in their
+        # container-runtime file and in capacity metadata, and an older worker
+        # validates it with extra="forbid": a null it has never heard of would
+        # refuse the whole runtime and leave the worker unable to start.
+        document = handler(self)
+        for name in ("ipc", "shm_size"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        return document
+
     @model_validator(mode="after")
     def validate_container(self) -> NativeContainerConfig:
         image = self.image

@@ -779,3 +779,15 @@ def test_container_config_refuses_a_shm_size_beside_host_ipc() -> None:
 
     accepted = NativeContainerConfig(image="registry.example/easydel:latest", ipc="private", shm_size="512m")
     assert (accepted.ipc, accepted.shm_size) == ("private", "512m")
+
+
+def test_container_config_without_ipc_settings_serializes_as_before_they_existed() -> None:
+    """Older workers validate the container block with extra="forbid"."""
+
+    plain = NativeContainerConfig(image="registry.example/easydel:latest")
+    assert set(plain.model_dump(mode="json")) == {"image", "pull_policy", "working_dir", "privileged", "mounts"}
+
+    stated = NativeContainerConfig(image="registry.example/easydel:latest", ipc="private", shm_size="8g")
+    document = stated.model_dump(mode="json")
+    assert (document["ipc"], document["shm_size"]) == ("private", "8g")
+    assert NativeContainerConfig.model_validate(document) == stated
