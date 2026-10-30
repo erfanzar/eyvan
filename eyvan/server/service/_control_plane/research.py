@@ -31,7 +31,6 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
-from eyvan._internal.training_metrics import extract_loss
 from eyvan.records import (
     MAX_RESEARCH_JOBS,
     MAX_RESEARCH_NOTE_CHARS,
@@ -68,6 +67,7 @@ from eyvan.server.service._control_plane.shared import (
     utcnow,
 )
 from eyvan.server.service.errors import EyvanServiceError
+from eyvan.server.service.research_losses import ResearchLogReader, read_research_losses
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,6 @@ _OPEN_STATES = frozenset({"proposed", *RESEARCH_PLAN_ACTIVE_STATES})
 ResearchIterator: tp.TypeAlias = tp.Callable[
     [ResearchPlanRecord, Principal, list[dict[str, tp.Any]]], tp.Awaitable[dict[str, tp.Any] | None]
 ]
-#: ``workload_id -> its printed output``; supplied by the runner (the service has no transport).
-ResearchLogReader: tp.TypeAlias = tp.Callable[[str], tp.Awaitable[str]]
 
 
 def _aware(moment: datetime) -> datetime:
@@ -519,48 +517,6 @@ class ResearchPlansMixin:
             return "over_budget", f"wall-clock budget of {plan.budget.max_wall_seconds}s reached"
         return None
 
-    async def _research_losses(
-        self,
-        plan: ResearchPlanRecord,
-        observed: dict[str, _Observed],
-        read_logs: ResearchLogReader | None,
-        now: datetime,
-        notes: list[ResearchNote],
-    ) -> dict[int, ResearchLoss]:
-        """Read each newly final job's output once and keep the training loss it printed.
-
-        Outside any transaction. An unreadable output is retried next step;
-        output read with no loss in it is recorded as such and never re-read.
-        """
-
-        found: dict[int, ResearchLoss] = {}
-        for item in plan.submitted if read_logs is not None else ():
-            seen = observed.get(item.workload_id or "")
-            if item.loss is not None or seen is None or seen.workload is None:
-                continue
-            if seen.workload.state not in TERMINAL_WORKLOAD_STATES:
-                continue
-            try:
-                curve = extract_loss(await read_logs(seen.workload.id))  # type: ignore[misc]
-            except Exception as exc:
-                logger.warning("research plan %s: output of %s unreadable: %s", plan.id, seen.workload.id, exc)
-                continue
-            name = plan.jobs[item.job_index].name
-            if curve is None:
-                found[item.job_index] = ResearchLoss()
-                notes.append(_note(now, "loss", f"job {item.job_index} {name!r} printed no training loss"))
-                continue
-            found[item.job_index] = ResearchLoss(
-                final=curve["final"],
-                last_step=curve["last_step"],
-                total_steps=curve["total_steps"],
-                points=tuple(curve["points"]),
-            )
-            where = "" if curve["last_step"] is None else f" at step {curve['last_step']}"
-            where += f"/{curve['total_steps']}" if where and curve["total_steps"] else ""
-            notes.append(_note(now, "loss", f"job {item.job_index} {name!r} final loss {curve['final']:g}{where}"))
-        return found
-
     async def _advance_research_plan(
         self,
         plan: ResearchPlanRecord,
@@ -575,7 +531,8 @@ class ResearchPlansMixin:
         if plan.state == "approved":
             notes.append(_note(now, "started", f"running as {plan.subject}"))
         observed = await self._observe_research(plan, now)
-        losses = await self._research_losses(plan, observed, read_logs, now, notes)
+        waiting_losses: set[int] = set()
+        losses = await read_research_losses(plan, observed, read_logs, now, notes, waiting_losses)
         if losses:
             # The iteration model (same step) compares jobs on these.
             plan = plan.model_copy(
@@ -606,7 +563,9 @@ class ResearchPlansMixin:
             target, why = stop
             update.update(state="stopping", stop_target=target, stop_reason=why)
             notes.append(_note(now, target, why))
-        else:
+        elif not waiting_losses:
+            # A round is only judged once every final job's loss is read (or its
+            # grace has run out): finishing first would lose the comparison.
             update.update(
                 await self._research_round_outcome(
                     plan, principal, now, submissions, observed, chip_hours, notes, iterate

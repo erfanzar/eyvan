@@ -140,19 +140,53 @@ def test_the_runner_records_each_final_jobs_loss_once_and_the_plan_view_shows_it
         assert any("'lr-1e-3' final loss 9.81 at step 20/20" in text for text in texts)
         assert any("'quiet' printed no training loss" in text for text in texts)
 
-        # Every job is final, so this same step also finished the plan. A known
-        # limit: the output that was unreadable at that moment is never retried,
-        # because a terminal plan is not stepped again. The document every surface
-        # (API, CLI, dashboard) reads says so by omitting that job's loss.
-        assert current.state == "finished"
+        # Every job is final, but one output was unreadable: the plan waits for
+        # it rather than finishing without the comparison it exists for.
+        assert current.state == "running"
         document = plan_document(current, {})
         rows = {row["workload_id"]: row for row in document["jobs"]}
         assert rows[ids[0]]["loss"]["final"] == 9.81 and rows[ids[0]]["loss"]["points"][-1] == [20, 9.81]
         assert "loss" not in rows[ids[1]] and rows[ids[2]]["loss"]["final"] is None
 
-        before = list(reads)
+        failing.clear()
         await service.step_research_plans(t0 + timedelta(seconds=30), read_logs=read_logs)
+        current = await service.get_research_plan(ADMIN, plan.id)
+        assert current.state == "finished"
+        late = {item.workload_id: item.loss for item in current.submitted}[ids[1]]
+        assert late is not None and late.final == 8.88 and late.last_step == 20
+        # Only the once-unreadable output was read again; recorded ones never are.
+        assert reads.count(ids[0]) == 1 and reads.count(ids[2]) == 1 and reads.count(ids[1]) == 2
+
+        before = list(reads)
+        await service.step_research_plans(t0 + timedelta(seconds=45), read_logs=read_logs)
         assert reads == before  # a terminal plan is never stepped, so nothing is re-read
+
+    asyncio.run(run())
+
+
+def test_a_never_readable_output_holds_the_plan_only_for_the_grace_period() -> None:
+    from eyvan.server.service.research_losses import LOSS_READ_GRACE_S
+
+    async def run() -> None:
+        service = _service()
+        plan = await _approved(service)
+        t0 = utcnow()
+
+        async def read_logs(workload_id: str) -> str:
+            raise RuntimeError("cell agent unreachable")
+
+        await service.step_research_plans(t0, read_logs=read_logs)
+        async with service.repository.transaction() as tx:
+            for workload in await tx.list_workloads(org_id=ORG, project_id=PROJECT):
+                await tx.put_workload(workload.model_copy(update={"state": WorkloadState.SUCCEEDED}))
+        await service.step_research_plans(t0 + timedelta(seconds=15), read_logs=read_logs)
+        assert (await service.get_research_plan(ADMIN, plan.id)).state == "running"
+        await service.step_research_plans(t0 + timedelta(seconds=LOSS_READ_GRACE_S + 60), read_logs=read_logs)
+        current = await service.get_research_plan(ADMIN, plan.id)
+        assert current.state == "finished"
+        assert all(item.loss is None for item in current.submitted)
+        unreadable = [note.text for note in current.notes if note.kind == "loss"]
+        assert len(unreadable) == 3 and all("still unreadable" in text for text in unreadable)
 
     asyncio.run(run())
 
