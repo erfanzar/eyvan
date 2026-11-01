@@ -80,6 +80,9 @@ export const mockDiscoveredTpus: DiscoveredTpus = {
       state: "READY",
       hosts: 1,
       connected: true,
+      cell_state: "ready",
+      last_error: null,
+      next_attempt_at: null,
     },
     {
       fleet: "tpu-spot-b-5e6f7a8b",

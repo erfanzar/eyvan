@@ -295,6 +295,53 @@ describe("Add TPU", () => {
     expect(panel.querySelector('[role="alert"]')).toBeNull();
   });
 
+  it("shows a connected TPU's real cell state, with the error and automatic retry when it is failing", async () => {
+    const [ready] = mockDiscoveredTpus.tpus;
+    const api: AttachmentClient = {
+      ...client(),
+      listDiscoveredTpus: vi.fn(async () => ({
+        ...mockDiscoveredTpus,
+        tpus: [
+          ready,
+          {
+            ...ready,
+            fleet: "tpu-broken-9f9f9f9f",
+            name: "broken",
+            cell_state: "failing" as const,
+            last_error: "could not read attached TPU node (HTTP 403)",
+            next_attempt_at: "2026-11-01T12:10:00Z",
+          },
+        ],
+      })),
+    };
+    render(
+      <FleetPage
+        cells={[]}
+        leases={[]}
+        onRefresh={async () => {}}
+        loadWarmth={async () => ({ observed_at: "", pools: [] })}
+        loadBilling={async () => ({
+          observed_at: "",
+          accrued_cost: 0,
+          idle_cost: 0,
+          cells: 0,
+          billed_seconds: 0,
+          idle_seconds: 0,
+          unpriced_cells: 0,
+        })}
+        loadLaunchLatency={async () => ({ observed_at: "", pools: [] })}
+        attachmentClient={api}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "TPUs in your Google Cloud" });
+    await waitFor(() => expect(panel.textContent).toContain("tpu-broken-9f9f9f9f"));
+    expect(panel.textContent).toContain("Ready");
+    expect(panel.textContent).toContain("Failing");
+    expect(panel.textContent).toContain("could not read attached TPU node (HTTP 403)");
+    expect(panel.textContent).toContain("Retrying automatically after");
+    expect(panel.textContent).not.toContain("Connected");
+  });
+
   it("keeps the last discovered list and names the error when a refresh fails", async () => {
     const api: AttachmentClient = {
       ...client(),

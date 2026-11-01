@@ -54,6 +54,30 @@ interface FleetPageProps {
   initScriptClient?: FleetInitScriptClient;
 }
 
+const CELL_STATE_BADGE = {
+  ready: { label: "Ready", tone: "healthy" },
+  connecting: { label: "Connecting", tone: "starting" },
+  failing: { label: "Failing", tone: "degraded" },
+  waiting: { label: "No cell yet", tone: "maintenance" },
+} as const;
+
+/** The connected fleet's real cell state: ready, connecting, failing (with why and when it retries) or waiting. */
+function DiscoveredCellState({ tpu }: { tpu: DiscoveredTpus["tpus"][number] }) {
+  const badge = tpu.cell_state ? CELL_STATE_BADGE[tpu.cell_state] : null;
+  if (!badge) return <StatusBadge value="connected" tone="healthy" />;
+  return (
+    <div>
+      <StatusBadge value={badge.label} tone={badge.tone} />
+      {tpu.cell_state === "failing" && (
+        <p className="panel-note">
+          {tpu.last_error ?? "The last capacity request failed."}
+          {tpu.next_attempt_at ? ` Retrying automatically after ${formatDateTime(tpu.next_attempt_at)}.` : ""}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function FleetPage({
   cells,
   leases,
@@ -621,7 +645,7 @@ export function FleetPage({
                       <td>{tpu.state}</td>
                       <td>
                         {tpu.connected ? (
-                          <StatusBadge value="connected" tone="healthy" />
+                          <DiscoveredCellState tpu={tpu} />
                         ) : (
                           <button
                             className="button button-secondary"

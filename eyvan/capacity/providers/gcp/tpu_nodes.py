@@ -20,6 +20,7 @@ import hashlib
 import ipaddress
 import re
 import threading
+import time
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -48,7 +49,15 @@ ENDPOINT_MODES = ("public", "internal", "tunnel")
 
 REQUEST_TIMEOUT_S = 30.0
 PAGE_SIZE = 500
-_AUTH_RETRY = frozenset({401})
+#: Statuses retried once with a freshly minted token. 403 is included because the
+#: usual cause on an operator's machine is the gcloud account having changed (or
+#: been fixed) since the token was cached; without a re-mint the process keeps
+#: presenting the old account until it restarts.
+_AUTH_RETRY = frozenset({401, 403})
+#: A 403 also answers "this account may not read that project", which discovery
+#: meets for every locked project on every pass. Re-mint on a 403 at most this
+#: often per reader, so a listing does not start one gcloud process per project.
+_FORBIDDEN_REMINT_INTERVAL_S = 60.0
 _RETRYABLE = frozenset({408, 429, 500, 502, 503, 504})
 
 _TPU_NODES = "https://tpu.googleapis.com/v2/projects/{project}/locations/{zone}/nodes"
@@ -294,6 +303,19 @@ class TpuNodeApi:
     transport: tp.Any = None
     _token: str | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _forbidden_remint_at: float = field(default=float("-inf"), init=False, repr=False)
+
+    def _may_remint(self, status: int) -> bool:
+        """Return whether a ``status`` answer should be retried with a fresh token."""
+
+        if status != 403:
+            return status in _AUTH_RETRY
+        with self._lock:
+            now = time.monotonic()
+            if now - self._forbidden_remint_at < _FORBIDDEN_REMINT_INTERVAL_S:
+                return False
+            self._forbidden_remint_at = now
+            return True
 
     def _client(self) -> tp.Any:
         import httpx
@@ -319,7 +341,7 @@ class TpuNodeApi:
         try:
             with self._client() as client:
                 response = client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
-                if response.status_code in _AUTH_RETRY:
+                if self._may_remint(response.status_code):
                     token = self._bearer(token)
                     response = client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
         except httpx.HTTPError as exc:

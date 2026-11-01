@@ -44,6 +44,10 @@ export interface DiscoveredTpu {
   state: string;
   hosts: number;
   connected: boolean;
+  /** What the connected fleet's cells are doing; null when the TPU is not connected. */
+  cell_state?: "ready" | "connecting" | "failing" | "waiting" | null;
+  last_error?: string | null;
+  next_attempt_at?: string | null;
 }
 
 export interface DiscoveredTpus {

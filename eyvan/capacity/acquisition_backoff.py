@@ -32,7 +32,7 @@ import typing as tp
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from eyvan.capacity.drivers.base import CapacityProviderFailureCode, provision_outcome
+from eyvan.capacity.drivers.base import CapacityProviderFailureCode, backend_capabilities, provision_outcome
 from eyvan.records import CapacityPoolRecord, CellRecord, WorkloadRecord, candidate_pool_templates
 from eyvan.secrets import redact_secret_material
 
@@ -46,6 +46,12 @@ ACQUISITION_BACKOFF_SCHEDULING_REASON_PREFIX = "capacity acquisition is backing 
 #: and how long an expired streak still describes the pool for reporting. The
 #: same hour the planner's acquisition bound remembers deleted failures for.
 ACQUISITION_BACKOFF_MEMORY_S = 3600.0
+
+#: Ceiling for pools of hardware that already exists (attached TPUs, manual
+#: hosts). Re-reading an existing machine costs nothing and buys nothing by
+#: waiting, while the usual causes -- a credential or firewall fixed on the
+#: host -- should be picked up within minutes, not after an hour.
+EXISTING_HARDWARE_MAX_BACKOFF_S = 300.0
 
 #: Provider prose shown to an operator, after redaction. Long enough for a
 #: gcloud remedy line; short enough for a log line and a status row.
@@ -111,7 +117,10 @@ def _streak_backoff_s(newest: CellRecord, failed_attempts: int) -> float:
     policy = newest.availability_policy
     outcome = provision_outcome(newest.provider_failure_code, newest.provider_phase)
     base = policy.backoff_base_s.get(outcome.value, policy.default_backoff_s)
-    return float(min(policy.max_backoff_s, base * (2 ** min(failed_attempts - 2, 30))))
+    ceiling = float(policy.max_backoff_s)
+    if backend_capabilities(newest.capacity_backend).existing_hardware:
+        ceiling = min(ceiling, EXISTING_HARDWARE_MAX_BACKOFF_S)
+    return float(min(ceiling, base * (2 ** min(failed_attempts - 2, 30))))
 
 
 def pool_acquisition_backoffs(
@@ -247,6 +256,7 @@ def is_acquisition_backoff_reason(reason: str | None) -> bool:
 __all__ = (
     "ACQUISITION_BACKOFF_MEMORY_S",
     "ACQUISITION_BACKOFF_SCHEDULING_REASON_PREFIX",
+    "EXISTING_HARDWARE_MAX_BACKOFF_S",
     "PoolAcquisitionBackoff",
     "acquisition_backoff_reason",
     "is_acquisition_backoff_reason",

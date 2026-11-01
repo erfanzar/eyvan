@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi import Path as ApiPath
 
 from eyvan.config import EyvanSettings
-from eyvan.records import Permission, Principal
+from eyvan.records import CapacityPoolRecord, CellRecord, CellState, Permission, Principal, utcnow
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.local.attach_job import JOB_ID_PATTERN, AttachmentJobs, AttachmentRequest, run_plan
@@ -25,6 +25,49 @@ from eyvan.server.service import ControlPlaneService
 
 _Principal = tp.Annotated[Principal, Depends(authenticated_principal)]
 _JobId = tp.Annotated[str, ApiPath(pattern=JOB_ID_PATTERN)]
+
+
+def _fleet_cell_states(
+    pools: tp.Sequence[CapacityPoolRecord], cells: tp.Sequence[CellRecord]
+) -> dict[str, dict[str, tp.Any]]:
+    """Return what each connected fleet's cells are actually doing, keyed by fleet name.
+
+    ``ready`` means a cell can take work now; ``connecting`` means a cell exists
+    but is not ready yet; ``failing`` means the newest attempts failed and the
+    pool is retrying (with the last error and when it retries); ``waiting``
+    means the pool exists but has no live cell and no recent failure.
+    """
+
+    from eyvan.capacity.acquisition_backoff import pool_acquisition_backoffs
+
+    now = utcnow()
+    pool_fleet = {pool.id: pool.fleet_name for pool in pools}
+    backoffs = pool_acquisition_backoffs(pools, (cell for cell in cells if cell.pool_id in pool_fleet), now)
+    states: dict[str, dict[str, tp.Any]] = {}
+    for fleet in set(pool_fleet.values()):
+        fleet_cells = [cell for cell in cells if pool_fleet.get(cell.pool_id or "") == fleet]
+        live = [cell for cell in fleet_cells if cell.state is not CellState.DELETED]
+        streaks = [
+            streak for pool_id, streak in backoffs.items() if pool_fleet.get(pool_id) == fleet and streak.recent(now)
+        ]
+        streak = min(streaks, key=lambda s: s.next_attempt_at) if streaks else None
+        if any(cell.state is CellState.READY for cell in live):
+            state = "ready"
+        elif streak is not None and not any(
+            cell.state is CellState.REGISTERING and not cell.availability.consecutive_failures for cell in live
+        ):
+            state = "failing"
+        elif live:
+            state = "connecting"
+        else:
+            state = "waiting"
+        failing = state == "failing" and streak is not None
+        states[fleet] = {
+            "cell_state": state,
+            "last_error": streak.last_error if failing and streak is not None else None,
+            "next_attempt_at": (streak.next_attempt_at.isoformat() if failing and streak is not None else None),
+        }
+    return states
 
 
 def _summary(plan: dict[str, tp.Any]) -> dict[str, tp.Any]:
@@ -122,12 +165,17 @@ def register_attachment_routes(
         snapshot = await asyncio.to_thread(index.load)
         if getattr(request.app.state, "discovery_refresh", True):
             await asyncio.to_thread(refresh_in_background, index)
-        connected = {pool.fleet_name for pool in await service.list_capacity_pools(principal) if pool.enabled}
+        pools = [pool for pool in await service.list_capacity_pools(principal) if pool.enabled]
         if snapshot is None:
             return {"discovered_at": None, "tpus": [], "skipped": {}, "projects": []}
+        states = _fleet_cell_states(pools, await service.list_cells(principal))
         document = snapshot.as_document()
         for tpu in document["tpus"]:
-            tpu["connected"] = tpu["fleet"] in connected
+            state = states.get(tpu["fleet"])
+            tpu["connected"] = state is not None
+            tpu["cell_state"] = None if state is None else state["cell_state"]
+            tpu["last_error"] = None if state is None else state["last_error"]
+            tpu["next_attempt_at"] = None if state is None else state["next_attempt_at"]
         document.pop("version", None)
         return document
 
