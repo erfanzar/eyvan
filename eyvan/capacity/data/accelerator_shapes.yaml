@@ -35,13 +35,17 @@
 # same L4 and differ by 24x in vCPU and 8x in attached devices -- and no pool in
 # this repository puts a machine type in `accelerator_type`, so adding these
 # rows cannot change what an existing pool means. `gpu_model` records which
-# accelerator is attached, using the provider's own accelerator name.
+# accelerator is attached, using the provider's own accelerator name. The one
+# exception is an operator-owned bare-metal host, which has no machine type; see
+# the "operator-owned GPU hosts" section at the end.
 #
 # NOTHING BELOW IS HARDWARE-QUALIFIED FOR GPU. No GPU has ever executed an Eyvan
 # workload. A GPU row is a reviewable transcription of a published machine
 # shape, not evidence that a run on that shape works.
 #
-# CPU and RAM are mandatory because both participate in admission. Values below
+# CPU and RAM are mandatory because both participate in admission -- except on
+# an operator-owned GPU row, where admission never reads them (non-GCP pools
+# state their own complete vector) and no vendor publishes them. Values below
 # are per TPU VM, not totals across a multi-host slice. Google labels the RAM
 # column "GB" in these TPU VM tables; Eyvan retains Google's published machine
 # shape number in its historical `memory_gib` admission unit, consistently with
@@ -49,7 +53,7 @@
 # exact provider page/version reviewed so future edits do not become guesses.
 
 catalog_version: 3
-revision: "2026-09-24.1"
+revision: "2026-10-30.1"
 
 # Multi-host slice rules, and why they are not more hand-written rows.
 #
@@ -391,3 +395,45 @@ shapes:
     machine_type: g2-standard-48
     source_url: https://cloud.google.com/compute/docs/accelerator-optimized-machines
     source_version: "Last updated 2026-08-07 UTC"
+
+  # ------------------------------------------------- operator-owned GPU hosts
+  #
+  # A bare-metal node adopted through `onprem-ssh` or `manual` has no provider
+  # machine type, so these rows are keyed by the GPU vendor's platform name
+  # instead: `hgx-h200-8g` is an NVIDIA HGX H200 baseboard carrying eight SXM
+  # H200s. The vendor publishes the device count, the per-device memory and the
+  # form factor; it does not publish a host CPU or memory figure, because HGX
+  # ships inside servers from many system vendors. Those three fields are
+  # therefore an explicit `null` -- not omitted, so a typo cannot quietly
+  # produce one -- and a pool on such a host states its own complete resource
+  # vector, which admission requires of every non-GCP provider anyway.
+  #
+  # The row exists so a cell on that host is described: `devices_per_host` is
+  # what per-rank device assignment and the worker's GPU readiness probe hold
+  # the host to. An H200 NVL (PCIe, NVLink bridged in pairs or fours) host is a
+  # different shape and does not belong under this key.
+  #
+  # `gpu_model` reuses the name Google gives the same part (A3 Ultra,
+  # `nvidia-h200-141gb`) so one accelerator is not spelled two ways in one
+  # catalog.
+  #
+  # NOT QUALIFIED. No Eyvan workload has run on an H200. This is a transcription
+  # of NVIDIA's product page, not evidence that a run on such a node works.
+
+  - accelerator_type: hgx-h200-8g
+    kind: gpu
+    generation: hgx-h200
+    chips: 8
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 8
+    host_cpu: null
+    host_memory_gib: null
+    capacity_backend: onprem-ssh
+    multislice_capable: false
+    gpu_model: nvidia-h200-141gb
+    machine_type: null
+    # The page carries no "last updated" stamp, so the retrieval date is the
+    # version. It states 141GB per H200 and HGX H200 systems "with 4 or 8 GPUs".
+    source_url: https://www.nvidia.com/en-us/data-center/h200/
+    source_version: "Retrieved 2026-10-30"

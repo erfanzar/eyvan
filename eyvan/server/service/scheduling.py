@@ -307,7 +307,10 @@ def to_core_cell(record: CellRecord) -> CapacityCell:
         ),
         exclusive_workloads=record.executor in {"native-local", "eyvan-native"},
         autoscale_request_workload_id=record.autoscale_request_workload_id,
-        enabled=record.state is CellState.READY,
+        # A cell held for build skew is READY -- its agent answers -- but runs
+        # code this plane does not stage; placing on it would only meet the
+        # dispatch guard's refusal. It returns once its build matches again.
+        enabled=record.state is CellState.READY and record.build_skew is None,
         worker_count=record.worker_count,
     )
 

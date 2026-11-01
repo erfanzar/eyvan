@@ -241,6 +241,9 @@ def _onprem_ssh_factory(name: str, *, state: FleetStateStore, settings: EyvanSet
         state,
         native_worker_port=settings.native_worker_port,
         native_worker_state_dir=settings.native_worker_state_dir,
+        # Without it the driver cannot tell a host the per-cell token the agent
+        # derives, and every replaced cell sits in ``registering`` behind 401s.
+        shared_secret=settings.native_worker_root_secret,
     )
 
 

@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from eyvan._internal.compat import StrEnum
+from eyvan.capacity.drivers.base import validate_host_runtime_write_boundary
 from eyvan.capacity.hardware_catalog import validate_accelerator_write_boundary
 from eyvan.capacity.providers.gcp.quota_discovery import TpuQuotaAvailability
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
@@ -444,6 +445,11 @@ class CapacityPoolUpsertRequest(ApiModel):
             capacity=self.capacity,
             allocatable=self.allocatable,
             boundary="accelerator pool",
+        )
+        validate_host_runtime_write_boundary(
+            capacity_backend=self.capacity_backend,
+            runtime=self.runtime,
+            boundary=f"capacity pool {self.id!r}",
         )
         return self
 

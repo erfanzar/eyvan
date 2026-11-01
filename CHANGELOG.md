@@ -46,6 +46,9 @@ Changes planned for the first public release.
   `aws` umbrella, `azure-vm` and the `azure` umbrella, `kubernetes` (`k8s`),
   `manual`, and `onprem-ssh`. Nothing that decides names a provider; the
   boundary is enforced by a test.
+- Hardware catalog row `hgx-h200-8g` for an operator-owned 8x H200 (141 GB)
+  node. It fixes the device count and GPU model only; host CPU and memory are
+  explicit `null` and the pool states its own vector. Not hardware-qualified.
 - A single sourced hardware catalog drives accelerator shapes, per-host CPU /
   memory / TPU resources, and TPU profiles; v6e and v5p slice-size coverage was
   corrected against it.
@@ -115,6 +118,17 @@ Changes planned for the first public release.
 
 #### Packaging and deployment
 
+- `--gpu-devices` (or `EYVAN_NATIVE_WORKER_GPU_DEVICES`) on the native worker
+  slices one host's GPUs between cells: a container gets only those devices, a
+  native unit is denied every other GPU, and a job cannot select outside the
+  slice.
+- Container blocks can take a workload off the host network (`network:
+  bridge` or `none`) and publish chosen `ports`, on loopback unless an address
+  is stated; and can run it as a numeric `user`, with a `read_only` root,
+  `tmpfs` scratch, all capabilities dropped (`drop_capabilities`) and `init`.
+  Unset, a block launches and serializes exactly as before.
+- A sliced container cell names its GPU device nodes with `--device`, so a
+  host `systemctl daemon-reload` no longer revokes a running container's GPUs.
 - Six console entry points: `eyvan`, `eyvan-server`, `eyvan-agent`,
   `eyvan-native-worker`, `eyvan-migrate`, and `eyvan-tracker`.
 - Helm chart (`deploy/helm/eyvan`) with a pre-install migration hook, hardened
@@ -154,6 +168,16 @@ Changes planned for the first public release.
 
 ### Fixed
 
+- A GPU cell is no longer reported ready on a host whose GPUs are not there.
+  For a cell whose type is a catalog GPU row, the native worker checks `/dev`
+  against the row's device count (driver loaded with no device node, missing
+  driver, fewer GPUs than declared, or device nodes the workload user cannot
+  open) and the cell stays `EXECUTION_CONNECTING` with the reason.
+- `onprem-ssh` now publishes `cell_accelerator` for a cataloged type, as
+  `manual` already did, so on-prem GPU cells join GPU-coordinated gangs.
+- GPU containers no longer run on Docker's 64 MiB `/dev/shm` and dockerd's
+  memlock limit: a GPU workload gets `--ulimit memlock=-1:-1` and host IPC by
+  default, and the container block gains `ipc` and `shm_size`.
 - Local native runtime path that provisioned TPUs but never ran anything.
 - Startup races: a losing race no longer destroys the winner's PID record, and
   the winner is adopted on its record rather than a fresh health probe.

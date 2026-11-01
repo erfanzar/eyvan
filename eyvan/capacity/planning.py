@@ -736,11 +736,16 @@ class CapacitySimulation:
                 failed_request = cell.state is CellState.UNAVAILABLE and cell.provider_failure_code is not None
                 target = stalled_pools if failed_request else owned_pools
                 target.setdefault(cell.autoscale_request_workload_id, set()).add(pool.id)
-            if supplies and cell.state is CellState.READY:
+            if supplies and cell.state is CellState.READY and cell.build_skew is None:
                 scheduler_cells.append(cell)
-            elif supplies and cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE}:
+            elif supplies and (cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE} or cell.build_skew):
+                # A cell held for build skew is supply on its way back, like one
+                # still registering: it returns as soon as its host is upgraded in
+                # place. Read as absent, the pool would ask its backend for a
+                # second cell -- which, on operator-owned hosts, is a claim on the
+                # very machine the held cell already holds.
                 acquiring_cell_ids[cell.id] = cell.worker_count
-                scheduler_cells.append(cell.model_copy(update={"state": CellState.READY}))
+                scheduler_cells.append(cell.model_copy(update={"state": CellState.READY, "build_skew": None}))
             elif cell.id in active_lease_cells:
                 # Not supply, and not omissible either. The scheduler is handed
                 # these cells *and* the live leases in one call, and it rejects a

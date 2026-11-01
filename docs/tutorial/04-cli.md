@@ -85,6 +85,12 @@ install software or create firewall rules on a plain host. `--cpus` and
 class defaults to `reserved` (`--capacity-class on_demand` is also supported,
 never Spot), and `--region` defaults to `onprem`.
 
+The CLI checks worker liveness; agent authentication and the fenced claim are
+established during fleet readiness. With `EYVAN_NATIVE_WORKER_ROOT_SECRET` set, the
+agent pushes the per-cell worker token over SSH before each start, so a replaced
+cell comes up without a human (unit and pool setup in
+`docs/reference/capacity-and-providers.md`).
+
 A successful plan does not establish worker reachability or TPU execution.
 Verify readiness and run a workload before relying on an attached fleet.
 

@@ -43,6 +43,7 @@ from eyvan.worker.agent.models import (
     MutationConflictCode,
     MutationModel,
     NativeStageActionRequest,
+    NativeWorkerAccelerators,
     NativeWorkerHealth,
     WorkloadMutationRequest,
     WorkloadReference,
@@ -247,6 +248,36 @@ class NativeRemoteExecutor:
             return True
         except (httpx.HTTPError, ValidationError, ValueError):
             return False
+
+    def gpu_readiness(self, expected_devices: int) -> tuple[bool, str]:
+        """Ask the worker whether its host exposes the GPUs its cell declares.
+
+        Only the worker can look at its host's ``/dev``; the agent supplies the
+        count from the cell's catalog row. Never raises. A worker that cannot
+        answer -- unreachable, or a build that predates the route -- is reported
+        not ready: the cell declared GPUs, and "could not check" must not be read
+        as "checked and fine", which is how the P100 cell came to run a workload
+        on a host whose driver could not open its GPU.
+        """
+
+        try:
+            response = self._request(
+                "GET",
+                "/api/v1/accelerators",
+                params={"expected_gpu_devices": expected_devices},
+                timeout=5.0 if self._owns_client else None,
+            )
+        except httpx.HTTPError as exc:
+            return False, f"native worker GPU readiness could not be read: {exc}"
+        if response.status_code == 404:
+            return False, "native worker does not report GPU readiness (it predates /api/v1/accelerators); upgrade it"
+        if response.status_code != 200:
+            return False, f"native worker GPU readiness returned HTTP {response.status_code}"
+        try:
+            report = NativeWorkerAccelerators.model_validate_json(response.content)
+        except ValidationError as exc:
+            return False, f"native worker GPU readiness was unreadable: {exc}"
+        return report.ready, report.detail
 
     def submit(self, spec: tp.Mapping[str, JsonValue], context: MutationContext) -> str:
         response = self._raise_for_status(

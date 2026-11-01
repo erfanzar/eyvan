@@ -399,8 +399,15 @@ def test_every_shipped_shape_states_the_host_it_describes() -> None:
 
     for shape in hardware_catalog().shapes:
         assert shape.kind in {"gpu", "tpu"}, shape.accelerator_type
-        assert shape.host_cpu > 0, shape.accelerator_type
-        assert shape.host_memory_gib > 0, shape.accelerator_type
+        if shape.kind == "gpu" and shape.capacity_backend in {"onprem-ssh", "manual"}:
+            # An operator-owned bare-metal row: no vendor publishes its host, and
+            # admission for those providers never reads it from the catalog. It
+            # must say so with an explicit null on both, not on one.
+            assert shape.host_cpu is None and shape.host_memory_gib is None, shape.accelerator_type
+            assert shape.devices_per_host, shape.accelerator_type
+        else:
+            assert shape.host_cpu is not None and shape.host_cpu > 0, shape.accelerator_type
+            assert shape.host_memory_gib is not None and shape.host_memory_gib > 0, shape.accelerator_type
         assert shape.source_url.startswith("https://"), shape.accelerator_type
         assert shape.source_version.strip(), shape.accelerator_type
         # Exactly one dimension, so a caller adding shapes up cannot double-count.

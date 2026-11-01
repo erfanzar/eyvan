@@ -106,6 +106,48 @@ _SYSTEMD_LIFECYCLE_LINE = re.compile(
     r"|(?:Started|Starting|Stopped|Stopping) (?:/|\S+\.service\b))"
 )
 
+#: Device-visibility variables a cell with a GPU device list owns. A workload's
+#: value may narrow the cell's devices but never name one outside them; see
+#: :meth:`SystemdTransientServiceExecutor._validate_gpu_environment`.
+_GPU_VISIBILITY_ENVIRONMENT_NAMES = ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
+
+#: NVIDIA device nodes every CUDA process needs whichever GPUs it uses: the
+#: control device and the modeset device by path, and the unified-memory pair
+#: (``/dev/nvidia-uvm`` and ``/dev/nvidia-uvm-tools``) by the character-device
+#: name they share in ``/proc/devices``. systemd resolves a path when the unit
+#: starts and skips, with a journal warning, one that does not exist yet -- the
+#: UVM nodes are created on first use on some hosts -- whereas the driver name
+#: is resolved from the loaded module and covers both nodes either way.
+_GPU_SHARED_DEVICE_ALLOWS = ("/dev/nvidiactl", "/dev/nvidia-modeset", "char-nvidia-uvm")
+
+
+def validate_gpu_devices(devices: tp.Sequence[int]) -> tuple[int, ...]:
+    """Return a cell's GPU device list in ascending order, refusing a malformed one.
+
+    The list names host GPUs by the ``N`` of ``/dev/nvidiaN``, which is the
+    index ``nvidia-smi`` and ``docker run --gpus`` use on every host whose
+    driver probed its GPUs in PCI bus order -- that is, on practically every
+    host, and ``nvidia-smi -q`` prints each GPU's ``Minor Number`` for the
+    others. Sorted rather than kept in the order given, because both the
+    container and the device cgroup expose the devices in bus order whatever
+    order they were named in, and the cell-local numbering below has to say
+    which device is ``0``.
+
+    Raises:
+        ValueError: If the list is empty, or names a device that is not a
+            non-negative integer, or names one device twice.
+    """
+
+    values = tuple(devices)
+    if not values:
+        raise ValueError("a GPU device list must name at least one device")
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"GPU devices must be non-negative integers, not {value!r}")
+    if len(values) != len(set(values)):
+        raise ValueError("a GPU device list must not name a device twice")
+    return tuple(sorted(values))
+
 
 def _is_recoverable_indeterminate(record: tp.Mapping[str, JsonValue]) -> bool:
     """Return whether a later observation may still resolve this indeterminacy.
@@ -858,9 +900,20 @@ class SystemdTransientServiceExecutor:
         workload_group: str | None = None,
         workload_directory: str | os.PathLike[str] | None = None,
         base_environment: tp.Mapping[str, str] | None = None,
+        gpu_devices: tp.Sequence[int] | None = None,
         command_timeout_s: float = 315.0,
         _defer_startup_recovery: bool = False,
     ) -> None:
+        """Create the executor.
+
+        ``gpu_devices`` makes this cell a slice of its host's GPUs: the host
+        GPUs it names are the only ones a workload here can open, and the
+        workload sees them as ``0..n-1``. See :func:`validate_gpu_devices` for
+        how they are named and :meth:`_gpu_device_launch_properties` for how a
+        native unit is confined to them. ``None`` -- the default, and every
+        cell before slicing existed -- leaves device access exactly as it was.
+        """
+
         if command_timeout_s <= 0:
             raise ValueError("systemd command timeout must be positive")
         if not isinstance(_defer_startup_recovery, bool):
@@ -911,8 +964,31 @@ class SystemdTransientServiceExecutor:
         self._workload_group = workload_group
         self._workload_directory = str(workload_directory) if workload_directory is not None else None
         self._base_environment = dict(base_environment or {})
+        self._gpu_devices = validate_gpu_devices(gpu_devices) if gpu_devices is not None else None
+        if self._gpu_devices is not None:
+            # The soft slice that predates device lists was CUDA_VISIBLE_DEVICES
+            # in the runtime environment, naming *host* indices. Beside a device
+            # list those indices are wrong -- the cell numbers its devices from
+            # zero -- so a half-migrated host is refused rather than handed a
+            # visibility that selects no GPU or the wrong one.
+            inherited = sorted(set(_GPU_VISIBILITY_ENVIRONMENT_NAMES) & set(self._base_environment))
+            if inherited:
+                raise ValueError(
+                    f"the runtime environment sets {inherited[0]}, which a GPU device list owns; "
+                    "remove it and name the cell's GPUs only in the device list"
+                )
         if not _defer_startup_recovery:
             self._recover_startup()
+
+    @property
+    def workload_user(self) -> str | None:
+        """Return the unprivileged user workloads run as, or ``None`` for root.
+
+        Read by the worker's GPU readiness probe, which must check device access
+        for the identity that will open the devices -- not for the worker's own.
+        """
+
+        return self._workload_user
 
     def _record_path(self, remote_id: str) -> Path:
         return self.jobs_dir / f"{_record_name(remote_id)}.json"
@@ -1463,8 +1539,95 @@ class SystemdTransientServiceExecutor:
         remote_id = record.get("remote_id")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
-        launch_environment = self._resolved_launch_environment({**self._base_environment, **_environment(spec)})
+        launch_environment = self._resolved_launch_environment(
+            {**self._base_environment, **self._gpu_device_environment(), **_environment(spec)}
+        )
         _write_environment_file(self._environment_file_path(remote_id), launch_environment, systemd=True)
+
+    def _gpu_device_environment(self) -> dict[str, str]:
+        """Return the device visibility a sliced cell states below the job's own.
+
+        The cell's GPUs are numbered ``0..n-1`` for the workload on both
+        execution paths: Docker exposes only the requested devices, and the
+        NVIDIA driver enumerates only the device nodes a process's device
+        cgroup lets it open -- the behaviour Slurm relies on when it confines
+        GPUs with cgroups and hands jobs zero-based indices. Stating the full
+        range is therefore the same as stating nothing, and is written anyway so
+        that a workload reading ``CUDA_VISIBLE_DEVICES`` is told its devices
+        rather than left to infer them. Lowest precedence after the operator's
+        runtime environment: a job, or a GPU-coordinated gang rank, may narrow
+        it, and :meth:`_validate_gpu_environment` keeps that narrowing inside
+        the cell.
+        """
+
+        if self._gpu_devices is None:
+            return {}
+        return {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "CUDA_VISIBLE_DEVICES": ",".join(str(index) for index in range(len(self._gpu_devices))),
+        }
+
+    def _validate_gpu_environment(self, environment: tp.Mapping[str, str]) -> None:
+        """Refuse a device visibility that names a GPU outside this cell.
+
+        Refused rather than stripped, because both legitimate writers are
+        indistinguishable here and both have to keep working: a job narrowing
+        its cell to one device, and a GPU-coordinated gang rank, whose plan
+        (``distributed_environment.plan_gpu_devices``) splits ``0..n-1`` of the
+        devices the catalog says this cell has. Both are cell-local indices and
+        both are accepted. What is refused is a value that cannot be one -- a
+        host index from before the cell was sliced, ``all``, a UUID, or a plan
+        that counted the host's GPUs instead of the cell's -- because the
+        confinement would turn it into a workload that silently sees no GPU,
+        which is worse than a submission that is told why.
+        """
+
+        if self._gpu_devices is None:
+            return
+        count = len(self._gpu_devices)
+        for name in _GPU_VISIBILITY_ENVIRONMENT_NAMES:
+            value = environment.get(name)
+            if value is None or value == "":
+                continue
+            parts = value.split(",")
+            if (
+                all(part.isdigit() and part.isascii() for part in parts)
+                and len(parts) == len(set(parts))
+                and all(int(part) < count for part in parts)
+            ):
+                continue
+            devices = ",".join(str(device) for device in self._gpu_devices)
+            raise ValueError(
+                f"workload environment {name}={value!r} names a device outside this cell: the cell owns host "
+                f"GPUs {devices} and numbers them 0..{count - 1}, so a job or gang plan may only select among "
+                f"those {count}"
+            )
+
+    def _gpu_device_launch_properties(self) -> tuple[str, ...]:
+        """Return the transient-unit properties that confine a sliced cell's GPUs.
+
+        ``DevicePolicy=closed`` denies every device node not allowed below,
+        except the standard pseudo devices (``/dev/null``, ``/dev/zero``,
+        ``/dev/full``, ``/dev/random``, ``/dev/urandom``, ``/dev/tty``,
+        ``/dev/ptmx``) that systemd always permits under that policy. Allowed:
+        the shared NVIDIA control nodes and this cell's ``/dev/nvidiaN``. A
+        neighbouring cell's GPU then cannot be opened at all, which is the
+        difference between a slice and a convention.
+
+        The cost is that *every* other device is denied too: FUSE, TUN, and
+        InfiniBand verbs among them. A cell sliced from one host's GPUs is the
+        case this exists for, and its collectives run over NVLink; a sliced
+        cell that also needs RDMA is not supported yet. An unsliced cell gets
+        none of this and keeps the access it always had.
+        """
+
+        if self._gpu_devices is None:
+            return ()
+        allowed = (*_GPU_SHARED_DEVICE_ALLOWS, *(f"/dev/nvidia{device}" for device in self._gpu_devices))
+        return (
+            "--property=DevicePolicy=closed",
+            *(f"--property=DeviceAllow={device} rw" for device in allowed),
+        )
 
     def _launch_command(
         self,
@@ -1495,6 +1658,7 @@ class SystemdTransientServiceExecutor:
             "--property=LimitMEMLOCK=infinity",
             "--property=LimitNOFILE=100000",
             "--property=NoNewPrivileges=yes",
+            *self._gpu_device_launch_properties(),
             f"--property=EnvironmentFile={self._environment_file_path(remote_id)}",
             *((f"--property=User={self._workload_user}",) if self._workload_user is not None else ()),
             *((f"--property=Group={self._workload_group}",) if self._workload_group is not None else ()),
@@ -1564,6 +1728,9 @@ class SystemdTransientServiceExecutor:
             raise ValueError("native-systemd workloads require a non-empty entrypoint")
         _validate_gang(spec)
         environment = _environment(spec)
+        # Before any durable record: a refusal after it would strand a record
+        # that no unit backs.
+        self._validate_gpu_environment(environment)
         secret_bearing = bool(secret_environment_keys(environment))
         durable_environment = {
             name: value for name, value in environment.items() if not name.startswith("EYVAN_SECRET_")
@@ -2293,6 +2460,10 @@ class SystemdTransientServiceExecutor:
             "--collect",
             "--wait",
             f"--property=RuntimeMaxSec={max(1, int(timeout_s))}",
+            # Confined like the workload it sits beside. The inherited
+            # CUDA_VISIBLE_DEVICES numbers the cell's slice from zero, which on
+            # an unconfined host would select someone else's GPUs.
+            *self._gpu_device_launch_properties(),
         ]
         invocation.extend(f"--setenv={name}={value}" for name, value in sorted(environment.items()))
         invocation.append("--")
@@ -2479,4 +2650,5 @@ __all__ = (
     "SystemdLogsUnavailableError",
     "SystemdTransientServiceExecutor",
     "systemd_unit_name",
+    "validate_gpu_devices",
 )

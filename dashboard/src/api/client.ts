@@ -192,6 +192,8 @@ interface RawCell {
   unavailable_reason?: string | null;
   /** The provider's own diagnostic behind `unavailable_reason`. */
   unavailable_detail?: string | null;
+  /** Set while the cell is held for build skew: what it runs instead of the plane's build. */
+  build_skew?: string | null;
   labels: Record<string, string>;
   topology?: Record<string, string>;
   last_heartbeat_at?: string;

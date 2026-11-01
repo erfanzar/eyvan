@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import typing as tp
@@ -126,6 +127,14 @@ _PROTECTED_CONTAINER_MOUNT_SOURCES = (
     PurePosixPath("/etc/eyvan-native"),
     PurePosixPath("/run/eyvan-native"),
 )
+#: The subset of Docker's ``--shm-size`` grammar Eyvan accepts: a positive
+#: integer and one optional binary unit. Docker also takes fractions and
+#: ``gb``/``GiB`` spellings; one spelling per size keeps the durable fleet API
+#: comparable and is never short of a size an operator can state.
+_CONTAINER_SHM_SIZE = re.compile(r"[1-9][0-9]*[bkmg]?")
+#: A numeric ``UID`` or ``UID:GID``. Names would resolve inside the image, not on the host
+#: whose mounts the process writes to, so only numbers mean the same thing on both sides.
+_CONTAINER_USER = re.compile(r"(0|[1-9][0-9]{0,9})(:(0|[1-9][0-9]{0,9}))?")
 _AUTOMATIC_CONTAINER_MOUNT_TARGETS = frozenset(
     {
         "/opt/eyvan-native/oci-callable-runner",
@@ -303,6 +312,55 @@ class NativeContainerMount(EyvanModel):
         return self
 
 
+class NativeContainerPort(EyvanModel):
+    """One container port published on the host, for a container off the host network.
+
+    The host address defaults to loopback: a published port is reachable from
+    wherever its address is, and a workload's port should reach the network
+    only when an operator writes that address down.
+    """
+
+    container_port: int = Field(ge=1, le=65535)
+    host_port: int = Field(ge=1, le=65535)
+    host_ip: str = "127.0.0.1"
+    protocol: Literal["tcp", "udp"] = "tcp"
+
+    @field_validator("host_ip")
+    @classmethod
+    def _valid_host_ip(cls, value: str) -> str:
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError as exc:
+            raise ValueError("native container port host_ip must be an IP address") from exc
+
+
+class NativeContainerTmpfs(EyvanModel):
+    """One writable in-memory filesystem, the usual companion of ``read_only``."""
+
+    target: str
+    #: Docker's spelling, as for ``shm_size``; absent means Docker's default (half the host's memory).
+    size: str | None = None
+
+    @model_validator(mode="after")
+    def validate_tmpfs(self) -> NativeContainerTmpfs:
+        path = PurePosixPath(self.target)
+        if (
+            self.target != self.target.strip()
+            or "\x00" in self.target
+            or "," in self.target
+            or not path.is_absolute()
+            or ".." in path.parts
+            or str(path) == "/"
+            or str(path).startswith("//")
+        ):
+            raise ValueError("native container tmpfs target must be an absolute non-root path without '..' or ','")
+        if self.size is not None and not _CONTAINER_SHM_SIZE.fullmatch(self.size):
+            raise ValueError(
+                "native container tmpfs size must be a positive integer with an optional b, k, m, or g unit"
+            )
+        return self
+
+
 class NativeContainerConfig(EyvanModel):
     """Structured OCI execution settings for an Eyvan-native workload.
 
@@ -315,6 +373,64 @@ class NativeContainerConfig(EyvanModel):
     working_dir: str | None = None
     privileged: bool = False
     mounts: tuple[NativeContainerMount, ...] = ()
+    #: The container's IPC namespace. ``None`` leaves the choice to Eyvan, and
+    #: what Eyvan chooses depends on the workload rather than on the fleet: a
+    #: workload that requests a GPU, with no ``shm_size`` stated, is given the
+    #: host's namespace, and every other workload keeps Docker's default.
+    #:
+    #: Host IPC for GPU work because Docker's default ``/dev/shm`` is 64 MiB.
+    #: NCCL's intra-node transport and PyTorch's DataLoader workers both move
+    #: tensors through shared memory, and at 64 MiB an eight-GPU collective or a
+    #: handful of loader workers fails with a bus error rather than a message
+    #: that names the cause. NVIDIA's container guidance is ``--ipc=host`` or a
+    #: large ``--shm-size``; the first needs no sizing decision, so it is the
+    #: default, and ``shm_size`` is how an operator who wants a private
+    #: namespace says so.
+    ipc: Literal["host", "private"] | None = None
+    #: The size of a private ``/dev/shm``, as Docker spells it: a positive
+    #: integer with an optional ``b``/``k``/``m``/``g`` unit, such as ``16g``.
+    #: Stating it keeps a GPU workload in a private namespace of that size
+    #: instead of the host's. Refused beside ``ipc: host``, where Docker ignores
+    #: it: a size that silently does nothing is worse than no size at all.
+    shm_size: str | None = None
+    #: The container's network. ``None`` is the host's network, as every
+    #: container had before this option. ``bridge`` gives the workload its own
+    #: network namespace: its listeners, and those of anything it starts, are
+    #: unreachable except through ``ports``. ``none`` has no network at all.
+    network: Literal["host", "bridge", "none"] | None = None
+    #: Ports published from a ``bridge`` container, on loopback unless stated.
+    ports: tuple[NativeContainerPort, ...] = ()
+    #: Run the container's process as this numeric ``UID`` or ``UID:GID``
+    #: instead of the image's user. Files it writes to mounts are owned by it,
+    #: so the cell's workload directory (the container's ``HOME``) should be too.
+    user: str | None = None
+    #: Mount the image's root filesystem read-only; ``tmpfs`` gives it scratch space.
+    read_only: bool = False
+    tmpfs: tuple[NativeContainerTmpfs, ...] = ()
+    #: Drop every Linux capability and forbid gaining privileges
+    #: (``--cap-drop ALL --security-opt no-new-privileges``). Refused beside ``privileged``.
+    drop_capabilities: bool = False
+    #: Run a minimal init as PID 1 that forwards signals and reaps orphans (``--init``).
+    init: bool = False
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        # A container block that states neither serializes exactly as it did
+        # before they existed. The block travels to native workers in their
+        # container-runtime file and in capacity metadata, and an older worker
+        # validates it with extra="forbid": a null it has never heard of would
+        # refuse the whole runtime and leave the worker unable to start.
+        document = handler(self)
+        for name in ("ipc", "shm_size", "network", "user"):
+            if getattr(self, name) is None:
+                document.pop(name, None)
+        for name in ("ports", "tmpfs"):
+            if not getattr(self, name):
+                document.pop(name, None)
+        for name in ("read_only", "drop_capabilities", "init"):
+            if not getattr(self, name):
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_container(self) -> NativeContainerConfig:
@@ -343,6 +459,25 @@ class NativeContainerConfig(EyvanModel):
             raise ValueError(
                 f"native container mount target {conflicting_target!r} overlaps another configured mount target"
             )
+        if self.shm_size is not None:
+            if not _CONTAINER_SHM_SIZE.fullmatch(self.shm_size):
+                raise ValueError(
+                    "native container shm_size must be a positive integer with an optional b, k, m, or g unit"
+                )
+            if self.ipc == "host":
+                raise ValueError("native container shm_size cannot be combined with ipc: host, which ignores it")
+        if self.ports and self.network != "bridge":
+            raise ValueError("native container ports are published only from network: bridge")
+        published = [(port.host_ip, port.host_port, port.protocol) for port in self.ports]
+        if len(published) != len(set(published)):
+            raise ValueError("native container ports must not publish the same host address and port twice")
+        if self.user is not None and not _CONTAINER_USER.fullmatch(self.user):
+            raise ValueError("native container user must be a numeric UID or UID:GID")
+        tmpfs_targets = [str(PurePosixPath(mount.target)) for mount in self.tmpfs]
+        if len(tmpfs_targets) != len(set(tmpfs_targets)) or set(tmpfs_targets) & set(targets):
+            raise ValueError("native container tmpfs targets must be unique and must not repeat a mount target")
+        if self.drop_capabilities and self.privileged:
+            raise ValueError("native container drop_capabilities cannot be combined with privileged")
         return self
 
 
@@ -2141,6 +2276,16 @@ class CellRecord(EyvanModel):
     #: provider error has many; collapsing them all to one code means an operator
     #: has to reconstruct the cause from an agent's storage document by hand.
     unavailable_detail: str | None = Field(default=None, max_length=2048)
+    #: Set while the cell is held under the ``refuse`` build-skew policy: what
+    #: its agent and workers run instead of the plane's build, for example
+    #: ``"worker 4f0c2a9e81d3"``. A held cell keeps its state, its generation and
+    #: its machine -- the host is operator-owned, so deleting the cell would only
+    #: hand the same stale build a new cell id and a new token -- and attracts no
+    #: new placement until the build sweep sees every digest match again and
+    #: clears this. Separate from ``unavailable_reason`` on purpose: observation
+    #: owns that field and rewrites it on every heartbeat, and an answering agent
+    #: on the wrong build is reachable, not unavailable.
+    build_skew: str | None = Field(default=None, max_length=512)
     availability: CapacityBeliefState = Field(default_factory=CapacityBeliefState)
     #: Copied from the pool at creation, like the runtime and the labels. Held on
     #: the cell so an observation needs nothing but the cell it is about -- and

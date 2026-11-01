@@ -4668,7 +4668,7 @@ async def test_dispatch_refuses_a_cell_running_a_different_build(monkeypatch) ->
             )
 
         def worker_builds(self, cell_id):
-            return [{"source_digest": "c" * 64}]
+            return [{"rank": 0, "endpoint": "http://w0:8100", "build": {"source_digest": "c" * 64}}]
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
@@ -4731,7 +4731,7 @@ async def test_a_matching_cell_build_dispatches(monkeypatch) -> None:
             )
 
         def worker_builds(self, cell_id):
-            return [{"source_digest": "a" * 64}]
+            return [{"rank": 0, "endpoint": "http://w0:8100", "build": {"source_digest": "a" * 64}}]
 
     repository = InMemoryRepository()
     service = ControlPlaneService(repository, scheduler=CoreSchedulingService())

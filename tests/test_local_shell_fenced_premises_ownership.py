@@ -289,7 +289,7 @@ def test_partial_replacement_retains_every_exact_cleanup_identity(tmp_path, oper
     original_run = rack.run
 
     def interrupted(host, argv, *, stdin="", timeout_s):
-        if host == "rack-b" and argv[3] == "claim":
+        if host == "rack-b" and argv[3] in ("claim", "reclaim"):
             raise RemoteTransportError("simulated transport failure before replacement claim")
         return original_run(host, argv, stdin=stdin, timeout_s=timeout_s)
 
@@ -395,3 +395,38 @@ def test_changed_inventory_replay_is_refused_before_effects(tmp_path):
         driver.apply_capacity("cell-a", desired, context("apply"))
     assert driver.state.get("cell-a") == before
     assert rack.events() == ["start", "start"]
+
+
+def test_real_script_pushes_the_agents_token_and_restarts_only_on_identity_change(tmp_path):
+    from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
+
+    driver, rack, desired = driver_and_desired(tmp_path)
+    driver.shared_secret = "root-secret-for-the-real-script-test"
+
+    def token_file(host):
+        return rack.root / host / "state" / "worker-secret"
+
+    def agent_token(observation):
+        return derive_native_worker_token(
+            driver.shared_secret,
+            observation.metadata["management_uid"],
+            provider_generation=observation.metadata["provider_generation"],
+        )
+
+    applied = driver.apply_capacity("cell-a", desired, context("apply"))
+    assert applied.state is CapacityStatus.HEALTHY
+    for host in ("rack-a", "rack-b"):
+        assert token_file(host).read_text() == agent_token(applied)
+        assert token_file(host).stat().st_mode & 0o777 == 0o600
+    assert rack.events() == ["start", "start"]
+
+    assert driver.reconcile("cell-a", context("reconcile")).state is CapacityStatus.HEALTHY
+    assert rack.events() == ["start", "start"]
+
+    successor = MutationContext(idempotency_key="reconcile-2", generation=2, fencing_token="fence-2")
+    moved = driver.reconcile("cell-a", successor)
+    assert moved.state is CapacityStatus.HEALTHY
+    assert agent_token(moved) != agent_token(applied)
+    for host in ("rack-a", "rack-b"):
+        assert token_file(host).read_text() == agent_token(moved)
+    assert rack.events() == ["start", "start", "start", "start"]

@@ -497,6 +497,16 @@ def plan_gpu_devices(
     identical to one built without them, which is what keeps the shape that
     ships today unchanged.
 
+    A "host" here is what a cell exposes, not the machine under it. A worker
+    started with a GPU device list (``--gpu-devices 4,5,6,7``) confines its
+    workloads to those devices and numbers them ``0..n-1``, so the host-local
+    indices this plan hands out are already that slice's -- two ranks on it get
+    ``0,1`` and ``2,3``, which are host GPUs 4,5 and 6,7 -- with no translation
+    anywhere. The count must then be the slice's, not the machine's: a plan
+    that read eight GPUs for a four-GPU slice names devices the slice does not
+    have, and the worker refuses that rank at submission rather than start it
+    on no GPU.
+
     Args:
         devices_per_rank: Device count of each rank's host, in rank order.
         rank_hosts: The host each rank lands on, in rank order, or ``None`` when

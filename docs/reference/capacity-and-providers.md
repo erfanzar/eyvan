@@ -97,12 +97,110 @@ unknown/inconclusive, not absent.
 * **Manual.** Existing hosts and native-worker endpoints are adopted by
   declaration; Eyvan does not start, stop, or delete them. The driver reports
   operator-declared shape and provides native-worker fencing/cgroups where the
-  host runtime does so. Spot is deliberately not advertised.
+  host runtime does so. Spot is deliberately not advertised. A cell on another
+  Eyvan build is held rather than recycled under the default
+  `EYVAN_BUILD_SKEW_POLICY=auto` (see [Operating Eyvan](../operate.md#build-skew-after-an-upgrade)).
 * **On-prem SSH.** Hosts are claimed with a POSIX marker containing cell,
   management UID, provider generation, and fence. A foreign/old marker yields
   `NEEDS_RECREATE`; an unreachable host is `UNOBSERVED`, not gone. Eyvan owns
   the claim and marker, while the operator owns software installation and
-  normally worker startup.
+  normally worker startup. Because Eyvan cannot reinstall the host, a cell on
+  another Eyvan build is held out of scheduling until it is upgraded in place,
+  not drained and replaced (`EYVAN_BUILD_SKEW_POLICY=auto`). Eyvan also owns
+  the worker *credential*: see below.
+
+### Setting up an on-prem SSH host
+
+The agent authenticates to each worker with a per-cell token,
+`HMAC(EYVAN_NATIVE_WORKER_ROOT_SECRET, management_uid, provider_generation)`.
+It changes whenever the incarnation does — an accepted apply, a reconcile under
+a new fence, a replacement cell after an upgrade — so it cannot be installed
+once by hand. When the `onprem-ssh` agent has `EYVAN_NATIVE_WORKER_ROOT_SECRET`
+set, the driver derives the token and, inside the host's marker lock and after
+the ownership check:
+
+1. writes it to `{state_dir}/worker-secret` — sent on SSH **stdin**, never argv;
+   created mode `0600` and renamed into place atomically, owned by the SSH user
+   (SSH as `root` for a root-only file);
+2. runs `start_command`, if one is declared;
+3. records the identity it started under in `{state_dir}/eyvan-cell.marker.started`.
+
+Apply always does this. Reconcile does it only when the identity it writes
+differs from the one recorded (a new cell, generation or fence, a rebuilt host,
+or an apply whose start failed), so a healthy worker is never bounced by a
+reconcile interval, and a foreign, older or unreadable marker still refuses
+before anything is written or started. Without the root secret nothing is
+pushed and the worker must be given its token another way.
+
+The worker deletes the secret file it reads, so the unit copies the persistent
+file into its private runtime directory before **every** start — the same
+pattern as Eyvan's own bootstrapped unit:
+
+```ini
+# /etc/systemd/system/eyvan-native-worker.service
+[Unit]
+Description=Eyvan native worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=eyvan-native
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/install -o root -g root -m 0600 /var/lib/eyvan/native-worker/worker-secret /run/eyvan-native/worker-secret
+ExecStart=/opt/eyvan-native/venv/bin/python -m eyvan.worker.runtime.native_worker \
+  --host 0.0.0.0 --port 8100 --state-dir /var/lib/eyvan/native-worker \
+  --secret-file /run/eyvan-native/worker-secret --systemd-transient
+KillMode=control-group
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```yaml
+pools:
+  gpu:
+    capacity_backend: onprem-ssh
+    provider_options:
+      hosts: [root@gpu-01, root@gpu-02]
+      state_dir: /var/lib/eyvan/native-worker   # must match --state-dir and the ExecStartPre source
+      worker_port: 8100
+      # Synchronous: `systemctl restart` returns once the unit has started.
+      start_command: [systemctl, restart, eyvan-native-worker]
+      stop_command: [systemctl, stop, eyvan-native-worker]
+```
+
+Declare `start_command`: without it the token file is still refreshed, but a
+running worker keeps the old token until something restarts it.
+
+The worker runs each job as `EYVAN_NATIVE_WORKLOAD_USER` (default
+`eyvan-workload`) in `EYVAN_NATIVE_WORKLOAD_DIRECTORY` (default
+`/var/lib/eyvan/workload`), which is that user's `HOME`, cache root and staging
+directory. On a host Eyvan does not provision, neither exists until you create
+them, and the same applies to a `manual` host. Without them the cell still
+reports ready, and every job then fails to start (`status=200/CHDIR`). Create
+both before starting the worker:
+
+```sh
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin eyvan-workload
+install -d -m 0700 -o eyvan-workload -g eyvan-workload /var/lib/eyvan/workload
+```
+
+Jobs that download models or datasets fill that directory, so on a host with a
+small system disk, put it on a large local disk and set
+`EYVAN_NATIVE_WORKLOAD_DIRECTORY` in the unit to match.
+
+`runtime.container`, `runtime.init_commands` and `runtime.artifacts` are
+host setup that only GCP bootstrap ships; fleet validation refuses them for
+`onprem-ssh` and `manual` pools rather than accepting and dropping them.
+Configure the host instead: write `/etc/eyvan-native/container-runtime.json`
+(`{"container": {...}, "artifact_mounts": []}`) and add
+`--container-runtime-file /etc/eyvan-native/container-runtime.json` to
+`ExecStart`; run setup and stage artifacts in the host's own provisioning.
+`runtime.env` and `runtime.python` stay accepted: the plane applies them at
+submission and dispatch, on every provider.
 
 ## 4. Provider clients
 
@@ -190,7 +288,10 @@ authority for what a named shape *is*: kind, chips, quota units, per-host CPU
 and memory, backend, topology where grounded, and HTTPS source/version. It is
 not quota discovery: quota metrics say what is available and join on type.
 GPU rows describe one VM (`hosts=1`, exact device count, machine type and GPU
-model); TPU quota units differ by generation. Unknown hardware remains usable
+model); TPU quota units differ by generation. An operator-owned bare-metal GPU
+row (`capacity_backend: onprem-ssh`, today only `hgx-h200-8g`) records host
+CPU, memory and machine type as explicit `null`, since no vendor publishes
+them and non-GCP pools state their own vector. Unknown hardware remains usable
 only with an explicit complete resource vector. Catalog data is sourced
 provider documentation, not test execution.
 

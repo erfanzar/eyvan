@@ -18,6 +18,13 @@ The interpreter contract is checked **before provisioning** when
 `runtime.python` is declared: a callable pickled on a different
 `major.minor` is refused at submission.
 
+Both models describe hosts Eyvan bootstraps (GCP). On `onprem-ssh` and
+`manual` pools Eyvan installs nothing, so fleet validation refuses
+`runtime.container`, `runtime.init_commands` and `runtime.artifacts` there;
+configure the worker's container runtime file on the host instead
+([setting up an on-prem SSH host](reference/capacity-and-providers.md#setting-up-an-on-prem-ssh-host)).
+`runtime.env` and `runtime.python` work on every provider.
+
 ## Two allocation modes
 
 Independent of the runtime: **how a job's `pods` workers are allocated**.
@@ -123,6 +130,112 @@ The complete worked shape is
 5. `bootstrap_egress: public-internet` for the docker install and pull, or
    a prebaked engine plus wheelhouse with `private-google-access`.
 
+### GPU containers
+
+A container that requests a GPU (`gpu > 0` per replica) is launched with
+`--gpus`, `--ulimit memlock=-1:-1` and, unless the container block says
+otherwise, `--ipc host`. Docker's own defaults are a 64 MiB `/dev/shm` and
+dockerd's memlock limit; the first makes NCCL's shared-memory transport and
+PyTorch DataLoader workers die with a bus error, and the transient unit's
+`LimitMEMLOCK=infinity` reaches only the `docker` client, not the container.
+Two container fields change the IPC choice:
+
+| Field | Values | Effect |
+|---|---|---|
+| `ipc` | `host`, `private`, unset | Unset: host IPC for GPU workloads with no `shm_size`, Docker's default for everything else. Set: passed as `--ipc` for every workload. |
+| `shm_size` | positive integer with optional `b`/`k`/`m`/`g`, e.g. `16g` | A private `/dev/shm` of that size; a GPU workload then stays in a private namespace. Refused beside `ipc: host`, which ignores it. |
+
+### Container network and lockdown
+
+By default a container shares the host's network, so every port the workload
+opens, and every port opened by anything it starts (a cluster runtime's own
+head and object store, a debugger, a dashboard), is open on the host's
+addresses. For a workload that serves something, take it off the host network
+and publish only what it serves:
+
+```yaml
+runtime:
+  container:
+    image: registry.example/server@sha256:...
+    network: bridge
+    ports:
+      - {container_port: 8000, host_port: 8003}   # host_ip defaults to 127.0.0.1
+    user: "997:997"
+    read_only: true
+    tmpfs: [{target: /tmp, size: 16g}]
+    drop_capabilities: true
+    init: true
+    shm_size: 16g
+```
+
+| Field | Values | Effect |
+|---|---|---|
+| `network` | `host`, `bridge`, `none`, unset | Unset is `host`, as before. `bridge` gives the container its own network namespace; `none` has no network. |
+| `ports` | `container_port`, `host_port`, `host_ip` (default `127.0.0.1`), `protocol` (`tcp`/`udp`) | Published with `--publish`; only with `network: bridge`. A port reaches the network only when its `host_ip` says so. |
+| `user` | numeric `UID` or `UID:GID` | Runs the workload as that user instead of the image's. Numeric only: a name would resolve inside the image, not on the host whose mounts it writes. Make the cell's workload directory (the container's `HOME`) writable by it. |
+| `read_only` | boolean | The image's root filesystem is read-only; pair it with `tmpfs`. |
+| `tmpfs` | `target`, optional `size` | A writable in-memory filesystem (`rw,nosuid,nodev`). |
+| `drop_capabilities` | boolean | `--cap-drop ALL --security-opt no-new-privileges`. Refused beside `privileged`. |
+| `init` | boolean | `--init`: a minimal PID 1 that forwards signals and reaps orphans. |
+
+Unset fields are left out of the serialized block, so a block that uses none
+of them reads the same to a worker that predates them.
+
+One container per published host port: two cells publishing the same
+`host_port` on one host cannot both run. Give each cell's worker its own
+runtime file with its own port; the slicing layout below already has one
+worker per cell.
+
+### Slicing one host's GPUs between cells
+
+One machine can carry several cells: run one native worker per slice, each with
+its own port (`worker_port`) and `--state-dir`, and give each the host GPUs it
+owns with `--gpu-devices` (default: `EYVAN_NATIVE_WORKER_GPU_DEVICES`; empty or
+unset means unsliced). An eight-GPU host cut 1/1/2/4:
+
+```bash
+eyvan-native-worker --systemd-transient --port 8101 --state-dir /var/lib/eyvan/cell-a --gpu-devices 0
+eyvan-native-worker --systemd-transient --port 8102 --state-dir /var/lib/eyvan/cell-b --gpu-devices 1
+eyvan-native-worker --systemd-transient --port 8103 --state-dir /var/lib/eyvan/cell-c --gpu-devices 2,3
+eyvan-native-worker --systemd-transient --port 8104 --state-dir /var/lib/eyvan/cell-d --gpu-devices 4,5,6,7
+```
+
+(Other flags as usual.) Indices are the `N` of `/dev/nvidiaN`, which equals
+`nvidia-smi`'s index wherever the driver probed in PCI bus order;
+`nvidia-smi -q` prints each GPU's `Minor Number` if in doubt. The list is
+sorted and must be non-empty, non-negative and duplicate-free. Nothing checks
+that two workers on one host name disjoint lists; that is the operator's
+layout.
+
+What the list does:
+
+- **Container cells** run GPU workloads with `--gpus '"device=4,5,6,7"'`
+  instead of `--gpus all`, and drop `NVIDIA_VISIBLE_DEVICES` from the
+  container environment so the device request is the only authority. They
+  also name the slice's device nodes and `/dev/nvidiactl` and
+  `/dev/nvidia-uvm` with `--device`: under Docker's systemd cgroup driver, a
+  later `systemctl daemon-reload` on the host rewrites the container's device
+  policy from what Docker told systemd, which leaves out devices that
+  `--gpus` added, and the running workload loses its GPUs ("Failed to
+  initialize NVML: Unknown Error"). Devices named with `--device` survive.
+- **Native cells** run every unit with `DevicePolicy=closed` and `DeviceAllow`
+  for `/dev/nvidiactl`, `/dev/nvidia-modeset`, `char-nvidia-uvm` and the listed
+  `/dev/nvidiaN`. `closed` still permits the standard pseudo devices
+  (`/dev/null`, `/dev/zero`, `/dev/random`, …) but denies everything else,
+  including FUSE and InfiniBand verbs; a sliced cell that needs RDMA is not
+  supported yet. Diagnostic `exec` units beside a workload are confined the
+  same way.
+- **Both** number the slice `0..n-1` for the workload and set
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES=0,…,n-1` below the
+  job's environment. A job (or a GPU-coordinated gang rank) may narrow that to
+  a subset of `0..n-1`; any other `CUDA_VISIBLE_DEVICES` or
+  `NVIDIA_VISIBLE_DEVICES` — host indices, `all`, a UUID — is refused at
+  submission, and so is either name in `--runtime-env-file` beside a list.
+- **GPU-coordinated gangs** need no translation: `plan_gpu_devices` already
+  numbers a cell's GPUs `0..n-1`, so its split is the slice's split, provided
+  the catalog counts the slice's GPUs rather than the machine's (a plan for
+  more GPUs than the slice has is refused).
+
 ### Attached TPUs (existing hardware)
 
 A TPU Eyvan did not create gets its image at attach time:
@@ -172,6 +285,65 @@ automatically.
 
 `@execute(..., workspace="src/")` ships a source tree to the worker's
 working directory for the callable to import.
+
+## GPU hosts
+
+A cell is GPU-aware when its pool's `accelerator_type` is a catalog GPU row:
+`a3-highgpu-8g`, `a2-highgpu-1g` and `g2-standard-48` on GCP, or
+`hgx-h200-8g` for an operator-owned 8x H200 (141 GB, SXM) node under
+`onprem-ssh` or `manual`. The driver then publishes `cell_accelerator`, which
+does two things:
+
+- **Readiness holds the host to the count.** Before a GPU cell becomes
+  schedulable the agent asks its native worker
+  (`GET /api/v1/accelerators?expected_gpu_devices=N`) to look at `/dev`. The
+  cell stays `EXECUTION_CONNECTING`, with the reason as its detail, while:
+  - the NVIDIA driver is loaded but exposes no `/dev/nvidiaN` (a GPU the
+    driver cannot drive),
+  - no NVIDIA node exists at all (driver not loaded),
+  - fewer than `N` GPU nodes exist (a GPU fell off the bus or is unbound),
+  - or, on the native (non-container) path, the workload user cannot open a
+    node read-write.
+
+  A worker too old to answer is reported not ready rather than assumed fine.
+  TPU, CPU and uncatalogued cells are not asked. The probe reads device nodes
+  only: it does not catch Xid or ECC faults, and it does not exercise the
+  container path's NVIDIA toolkit (that needs an image the worker does not own,
+  so a container cell's first workload is its toolkit check).
+- **Multi-cell gangs get per-rank devices** (`CUDA_VISIBLE_DEVICES` and
+  friends), which needs every cell to report a catalog GPU shape.
+
+An on-prem H200 pool still states its own complete `resources` vector (CPU,
+memory, `gpu: 8`); the catalog does not know the host's CPU or memory.
+
+No GPU row is hardware-qualified: no Eyvan workload has run on an H200.
+
+### NVIDIA device access (native path, operator-owned hosts)
+
+Native workloads run as `eyvan-workload`, which must open `/dev/nvidiactl`,
+`/dev/nvidia-uvm` and every `/dev/nvidiaN` read-write. The GCP bootstrap grants
+this with `setfacl`, which a reboot or driver reload undoes; on a host Eyvan
+does not create, install a udev rule instead so the grant is reapplied each time
+the nodes appear:
+
+```bash
+sudo apt-get install -y acl
+sudo tee /etc/udev/rules.d/70-eyvan-nvidia.rules >/dev/null <<'RULE'
+KERNEL=="nvidia[0-9]*|nvidiactl|nvidia-uvm|nvidia-uvm-tools|nvidia-modeset", \
+  RUN+="/usr/bin/setfacl -m u:eyvan-workload:rw /dev/%k"
+RULE
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+Some driver installs create the nodes with `nvidia-modprobe` rather than
+through udev, and then the rule never fires; reboot once and check
+`getfacl /dev/nvidia0`. If the grant is missing, run the same `setfacl` from a
+oneshot systemd unit ordered `After=nvidia-persistenced.service` instead.
+
+Check with `ls -l /dev/nvidia*` first: many Ubuntu driver packages already
+create the nodes mode `0666`, in which case nothing is needed. Readiness names the nodes
+it cannot open if the grant is missing. The container path is unaffected:
+Docker opens the devices as root.
 
 ## Local components
 

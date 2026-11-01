@@ -327,6 +327,13 @@ workload identity, and Eyvan-owned topology variables. Caller-supplied
 JAX/TPU topology overrides are removed by
 `without_distributed_topology_overrides` before dispatch. A native worker can
 serve a local executor, or the production systemd executor described below.
+With `--gpu-devices 4,5,6,7` (or `EYVAN_NATIVE_WORKER_GPU_DEVICES`), which
+requires `--systemd-transient`, the worker's cell owns only those host GPUs:
+containers get `--gpus '"device=4,5,6,7"'`, native units get
+`DevicePolicy=closed` plus `DeviceAllow` for the NVIDIA control nodes and the
+listed `/dev/nvidiaN`, workloads see the slice as `0..n-1`, and a
+`CUDA_VISIBLE_DEVICES`/`NVIDIA_VISIBLE_DEVICES` outside that range is refused
+at submission (see [runtimes](../runtimes.md#slicing-one-hosts-gpus-between-cells)).
 
 ### 3.2 Container worker
 
@@ -338,7 +345,15 @@ service's cgroup. Images use `always`, `if-not-present`, or `never` pull
 policies. Mounts must be absolute, non-root, non-dot paths with unique targets;
 staged artifact mounts are read-only. The callable runner is staged into the
 image and rejects shell composition instead of accepting an arbitrary shell
-entrypoint.
+entrypoint. A workload that requests a GPU gets `--gpus`,
+`--ulimit memlock=-1:-1` and, while the container block states neither `ipc`
+nor `shm_size`, `--ipc host`; `shm_size` (refused beside `ipc: host`) keeps it
+in a private namespace instead. The container joins the host's network unless the block
+states `network` (`bridge` publishes only its `ports`, on loopback by default);
+`user`, `read_only`, `tmpfs`, `drop_capabilities` and `init` map to the Docker
+options of the same meaning (see [runtimes](../runtimes.md#container-network-and-lockdown)).
+A sliced cell also passes its GPU device nodes with `--device`, so a host
+`systemctl daemon-reload` cannot revoke them from a running container.
 
 ### 3.3 Local process / local worker
 

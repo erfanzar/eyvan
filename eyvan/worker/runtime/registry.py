@@ -127,6 +127,18 @@ class HealthCheckedExecutionDriver(tp.Protocol):
 
 
 @tp.runtime_checkable
+class GpuReadinessCheckedExecutionDriver(tp.Protocol):
+    """Optional capability: hold the worker host to a declared GPU count.
+
+    Implemented by the native drivers, whose workers can look at their host's
+    ``/dev``. A backend that cannot (Kubernetes, where the device plugin owns
+    GPU admission) says so by not satisfying this protocol.
+    """
+
+    def gpu_readiness(self, expected_devices: int) -> tuple[bool, str]: ...
+
+
+@tp.runtime_checkable
 class IntrospectableExecutionDriver(tp.Protocol):
     """Optional live-process introspection.
 
@@ -687,9 +699,22 @@ class ExecutionDriverResolver:
             driver = self.resolve(cell_id, observation)
             if not isinstance(driver, HealthCheckedExecutionDriver):
                 return True, "execution runtime is ready"
-            if driver.health():
-                return True, "execution runtime is ready"
-            return False, f"{self.backend} execution runtime is not ready"
+            if not driver.health():
+                return False, f"{self.backend} execution runtime is not ready"
+            # Gated strictly on a catalog GPU shape: a TPU cell, a CPU cell and a
+            # cell whose agent or type publishes no accelerator all answer
+            # ``None`` here and keep exactly the readiness they had before.
+            accelerator = read_cell_accelerator(observation.metadata)
+            expected = accelerator.gpu_devices_per_host if accelerator is not None else None
+            if (
+                accelerator is not None
+                and expected is not None
+                and isinstance(driver, GpuReadinessCheckedExecutionDriver)
+            ):
+                ready, detail = driver.gpu_readiness(expected)
+                if not ready:
+                    return False, f"{self.backend} GPU readiness failed for {accelerator.accelerator_type}: {detail}"
+            return True, "execution runtime is ready"
         except Exception as exc:
             return False, f"{self.backend} execution runtime is not ready: {exc}"
 
@@ -721,6 +746,7 @@ __all__ = (
     "ConfiguredExecutionResolver",
     "ExecutionDriverResolver",
     "ExecutionRuntimeRegistry",
+    "GpuReadinessCheckedExecutionDriver",
     "NativeGangCell",
     "StructuredLogExecutionDriver",
     "available_execution_drivers",

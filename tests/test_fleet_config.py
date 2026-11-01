@@ -1074,3 +1074,84 @@ def test_v5e_stays_on_the_tpu_queue_by_default() -> None:
     }
 
     assert EyvanFleetConfig.model_validate(raw).desired_cells()[0]["capacity_backend"] == "gcp-tpu"
+
+
+def _host_owned_fleet(backend: str) -> dict:
+    """One pool on operator-owned hosts: Eyvan claims them and installs nothing."""
+
+    return {
+        "version": 1,
+        "name": "rack",
+        "provider": {"type": backend, "region": "onprem"},
+        "executor": "eyvan-native",
+        "capacity_class": "reserved",
+        "pools": {
+            "cpu": {
+                "kind": "cpu",
+                "capacity_backend": backend,
+                "machine_type": "rack-host",
+                "resources": {"cpu": 4, "memory_gib": 16},
+                "min_workers": 0,
+                "max_workers": 1,
+                "agent_endpoint": "http://agent.example.com:8095",
+                "provider_options": {"hosts": ["root@rack-a"]},
+            }
+        },
+    }
+
+
+_HOST_RUNTIME = {
+    "container": {"image": "registry.example.com/train@sha256:" + "a" * 64},
+    "init_commands": ["apt-get install -y nvidia-container-toolkit"],
+    "artifacts": [{"source": "gs://bucket/train", "destination": "/opt/eyvan-runtime/train"}],
+}
+
+
+@pytest.mark.parametrize("backend", ["onprem-ssh", "manual"])
+@pytest.mark.parametrize("field", sorted(_HOST_RUNTIME))
+@pytest.mark.parametrize("placement", ["fleet", "pool"])
+def test_host_runtime_is_refused_where_the_backend_would_silently_drop_it(backend, field, placement) -> None:
+    """Accepted and never applied was the bug: the error names the field, the backend, and the fix."""
+
+    raw = _host_owned_fleet(backend)
+    runtime = {field: _HOST_RUNTIME[field]}
+    if placement == "fleet":
+        raw["runtime"] = runtime
+    else:
+        raw["pools"]["cpu"]["runtime"] = runtime
+
+    with pytest.raises(ValidationError) as raised:
+        EyvanFleetConfig.model_validate(raw)
+
+    message = str(raised.value)
+    assert f"runtime.{field}" in message
+    assert repr(backend) in message
+    assert "never ships it" in message
+    if field == "container":
+        assert "--container-runtime-file" in message
+
+
+@pytest.mark.parametrize("backend", ["onprem-ssh", "manual"])
+def test_runtime_the_plane_applies_itself_stays_accepted_on_operator_owned_hosts(backend) -> None:
+    """``runtime.env`` reaches workloads at dispatch and ``python`` gates submission, on every backend."""
+
+    raw = _host_owned_fleet(backend)
+    raw["runtime"] = {"env": {"HF_HOME": "/var/lib/eyvan/workload/hf"}, "python": "3.12"}
+
+    pool = EyvanFleetConfig.model_validate(raw).pool_payloads()[0]
+
+    assert pool["runtime"]["env"] == {"HF_HOME": "/var/lib/eyvan/workload/hf"}
+    assert pool["runtime"]["python"] == "3.12"
+
+
+def test_the_pool_api_refuses_host_runtime_the_backend_never_ships() -> None:
+    """The API is a second writer of the same pool; it gets the same refusal."""
+
+    from eyvan.server.api.schemas import CapacityPoolUpsertRequest
+
+    payload = EyvanFleetConfig.model_validate(_host_owned_fleet("onprem-ssh")).pool_payloads()[0]
+    CapacityPoolUpsertRequest.model_validate(payload)
+
+    payload["runtime"] = {"container": _HOST_RUNTIME["container"]}
+    with pytest.raises(ValidationError, match=r"runtime\.container.*'onprem-ssh'"):
+        CapacityPoolUpsertRequest.model_validate(payload)

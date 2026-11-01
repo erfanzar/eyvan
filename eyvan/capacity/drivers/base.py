@@ -96,11 +96,22 @@ class BackendCapabilities:
             run and are billed whether or not Eyvan uses them (attached or
             operator-owned), rather than capacity Eyvan provisions. Running on
             such a cell starts no new spend, whatever its capacity class.
+        ships_host_runtime: Whether the backend delivers the fleet's *host*
+            runtime -- ``runtime.container``, ``runtime.init_commands`` and
+            ``runtime.artifacts`` -- to the machines its cells run on. One that
+            does not must say so, and fleet validation then refuses those
+            fields instead of accepting a pool whose container image, setup
+            and artifacts are silently never applied. ``True`` by default, and
+            unlike the fields above that is not the cautious reading: an
+            out-of-tree provider receives ``runtime`` in its desired document
+            and this table cannot see whether it reads it, so only a built-in
+            known to drop it declares ``False``.
     """
 
     multi_worker_cells: bool = False
     max_workers_per_cell: int = 1
     existing_hardware: bool = False
+    ships_host_runtime: bool = True
 
 
 #: Every backend's capabilities. A backend absent from this table hosts only
@@ -122,9 +133,15 @@ _BACKEND_CAPABILITIES: dict[str, BackendCapabilities] = {
     "kubernetes": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512),
     # Operator-owned host sets joined over SSH or declared by hand share the
     # drivers' own 512-host ceilings (onprem_ssh.MAX_HOSTS and the manual
-    # driver's limit), which is why the two numbers agree.
-    "onprem-ssh": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True),
-    "manual": BackendCapabilities(multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True),
+    # driver's limit), which is why the two numbers agree. Neither installs
+    # anything on a host it does not own, so neither ships host runtime: the
+    # operator configures the worker's container runtime file and setup there.
+    "onprem-ssh": BackendCapabilities(
+        multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True, ships_host_runtime=False
+    ),
+    "manual": BackendCapabilities(
+        multi_worker_cells=True, max_workers_per_cell=512, existing_hardware=True, ships_host_runtime=False
+    ),
     # An already-running TPU VM adopted by ``eyvan gcp connect``: one slice per
     # cell, never created or deleted by Eyvan.
     "gcp-attach": BackendCapabilities(existing_hardware=True),
@@ -137,6 +154,69 @@ def backend_capabilities(name: str | None) -> BackendCapabilities:
     if not name:
         return BackendCapabilities()
     return _BACKEND_CAPABILITIES.get(name.strip().lower().replace("_", "-"), BackendCapabilities())
+
+
+#: Host-runtime fields a backend that does not ship them refuses, with what the
+#: operator configures on the host instead. ``runtime.env`` and
+#: ``runtime.python`` are absent on purpose: the plane applies them itself, at
+#: dispatch and at submission, on every backend.
+_HOST_RUNTIME_FIELDS: tuple[tuple[str, str], ...] = (
+    (
+        "container",
+        "write the worker's container runtime file (/etc/eyvan-native/container-runtime.json) "
+        "and start the worker with --container-runtime-file",
+    ),
+    ("init_commands", "run host setup in the host's own provisioning before the worker starts"),
+    ("artifacts", "stage artifacts on the host in its own provisioning"),
+)
+
+
+class _HostRuntime(tp.Protocol):
+    """The fields of ``NativeRuntimeConfig`` this check reads, without importing it."""
+
+    @property
+    def container(self) -> object | None: ...
+
+    @property
+    def init_commands(self) -> tp.Sequence[str]: ...
+
+    @property
+    def artifacts(self) -> tp.Sequence[object]: ...
+
+
+def validate_host_runtime_write_boundary(
+    *,
+    capacity_backend: str | None,
+    runtime: _HostRuntime | None,
+    boundary: str,
+) -> None:
+    """Refuse host runtime a backend would accept and then silently drop.
+
+    ``runtime.container`` on an ``onprem-ssh`` or ``manual`` pool used to
+    validate, persist, and reach no host at all: the worker ran every job
+    without the image, and nothing said why. Refusing it where the pool is
+    written -- fleet YAML and the pool API alike -- is the only point at which
+    the operator is still looking at the field that will not take effect.
+
+    Raises:
+        ValueError: Naming the first such field, the backend, and what to
+            configure on the host instead.
+    """
+
+    if runtime is None or backend_capabilities(capacity_backend).ships_host_runtime:
+        return
+    declared = {
+        "container": runtime.container is not None,
+        "init_commands": bool(runtime.init_commands),
+        "artifacts": bool(runtime.artifacts),
+    }
+    for name, instead in _HOST_RUNTIME_FIELDS:
+        if declared[name]:
+            backend = (capacity_backend or "").strip().lower().replace("_", "-")
+            raise ValueError(
+                f"{boundary} declares runtime.{name}, but capacity backend {backend!r} never ships it to its "
+                f"hosts (Eyvan does not install software on hardware it does not own); remove it and {instead}"
+            )
 
 
 def providers_hosting_multi_worker_cells() -> frozenset[str]:

@@ -26,6 +26,7 @@ from eyvan.capacity.acquisition_backoff import (
 )
 from eyvan.capacity.audit import CapacityLifecycleEvent, CapacityReplacementReason
 from eyvan.capacity.autoscale.pool_capacity import ClusterCapacityPass
+from eyvan.capacity.build_skew import BuildSkewPolicy, resolve_build_skew_policy
 from eyvan.capacity.planning import (
     CapacityPlanner,
     CapacitySimulation,
@@ -72,6 +73,10 @@ ACQUISITION_BACKOFF_ACTION = "capacity_pool.acquisition_backoff"
 ACQUISITION_BACKOFF_CLEARED_ACTION = "capacity_pool.acquisition_backoff_cleared"
 #: How far back a newly elected leader looks for the last announcement.
 _BACKOFF_EVENT_SCAN_LIMIT = 50
+#: Audit actions for a cell held under the ``refuse`` build-skew policy and for
+#: its return to service once its agent and workers report the plane's build.
+BUILD_SKEW_HELD_ACTION = "cell.build_skew_held"
+BUILD_SKEW_CLEARED_ACTION = "cell.build_skew_cleared"
 
 
 def _still_demanded(cell: CellRecord, pending_specs: tp.Sequence[WorkloadDefinition]) -> bool:
@@ -241,20 +246,112 @@ class _ControllerFleets:
                 expected_pool_generation=expected_pool_generation,
             )
 
+    def _build_skew_policy(self, cell: CellRecord) -> BuildSkewPolicy:
+        """Return the build-skew policy this cell is judged under (never ``AUTO``)."""
+
+        return resolve_build_skew_policy(self.settings.build_skew_policy, cell.capacity_backend or cell.provider)
+
+    async def _hold_stale_build_cell(self, cell: CellRecord, description: str, head_digest: str) -> bool:
+        """Hold one cell out of scheduling until its build matches the plane's again.
+
+        The ``refuse`` answer to build skew. The cell keeps its state, its
+        generation and its host, because the host is operator-owned: draining it
+        hands the autoscaler a cell to delete and the backend a replacement that
+        lands on the same machine with the same stale build and a new token.
+        Recording the mismatch on the cell is what keeps the scheduler from
+        leasing it again -- a refusal alone would requeue the workload onto the
+        same cell until the attempt bound failed it -- and the build sweep, which
+        asks every held cell each pass, clears the hold once an in-place upgrade
+        makes every digest match.
+
+        Returns whether this call placed (or re-described) the hold, so a cell
+        already held for the same mismatch writes nothing and announces nothing.
+        """
+
+        async with self._capacity_operation(cell):
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_cell(cell.id)
+                if (
+                    current is None
+                    or current.generation != cell.generation
+                    or current.state is not CellState.READY
+                    or current.build_skew == description
+                ):
+                    return False
+                held = current.model_copy(update={"build_skew": description, "updated_at": utcnow()})
+                await transaction.put_cell(held)
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        entity_type="cell",
+                        entity_id=cell.id,
+                        action=BUILD_SKEW_HELD_ACTION,
+                        previous_state=current.state.value,
+                        new_state=current.state.value,
+                        payload={
+                            "runs": description,
+                            "plane": head_digest[:12],
+                            "policy": BuildSkewPolicy.REFUSE.value,
+                        },
+                    )
+                )
+        logger.warning(
+            "cell %s runs %s but this plane stages %s; held out of scheduling until it is upgraded in place",
+            cell.id,
+            description,
+            head_digest[:12],
+        )
+        return True
+
+    async def _release_build_skew_hold(self, cell: CellRecord, head_digest: str) -> bool:
+        """Return a held cell to service: its agent and workers now run the plane's build."""
+
+        async with self._capacity_operation(cell):
+            async with self.repository.transaction() as transaction:
+                current = await transaction.get_cell(cell.id)
+                if current is None or current.generation != cell.generation or current.build_skew is None:
+                    return False
+                await transaction.put_cell(current.model_copy(update={"build_skew": None, "updated_at": utcnow()}))
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        entity_type="cell",
+                        entity_id=cell.id,
+                        action=BUILD_SKEW_CLEARED_ACTION,
+                        previous_state=current.state.value,
+                        new_state=current.state.value,
+                        payload={"previously_ran": current.build_skew, "plane": head_digest[:12]},
+                    )
+                )
+        logger.info("cell %s now runs this plane's build %s; returned to service", cell.id, head_digest[:12])
+        return True
+
     async def recycle_stale_build_cells_once(self) -> int:
-        """Drain every schedulable cell whose agent runs a different build.
+        """Answer every schedulable cell whose agent or workers run a different build.
 
         The dispatch guard catches these one submission at a time, which left
         the recycling to whoever submitted next -- and an idle stale cell
         billed until someone did, because a cell the current build cannot use
         is still a cell the pool counts and pays for. This sweep is the same
-        check without the submission: each stale cell is drained, the
-        autoscaler deletes it once its leases are gone, and the replacement is
-        provisioned from the wheel the plane stages now.
+        check without the submission. How each stale cell is answered is its
+        build-skew policy (:mod:`eyvan.capacity.build_skew`):
+
+        - ``recycle``: the cell is drained, the autoscaler deletes it once its
+          leases are gone, and the replacement is provisioned from the wheel the
+          plane stages now.
+        - ``refuse``: the cell is held out of scheduling and kept. The sweep
+          asks it again every pass, and the pass that finds every digest
+          matching -- after the operator upgrades the host in place -- returns
+          it to service. That return is the only way out of a hold, which is why
+          held cells are read here even though nothing can lease them.
+        - ``warn``: the skew is logged once per mismatch and nothing else moves.
 
         Returns the number of cells drained, so the phase's effect is visible
         without reading the audit trail -- and so a fleet that recycles on
-        every pass is noticeable as a number, not as churn.
+        every pass is noticeable as a number, not as churn. Holds are counted
+        in the audit trail instead: a held cell is not churn.
         """
 
         from eyvan._internal.build_identity import build_identity
@@ -303,9 +400,28 @@ class _ControllerFleets:
         reports = await asyncio.gather(*(read(cell) for cell in cells))
         drained = 0
         for cell, stale in zip(cells, reports, strict=True):
+            if stale is None:
+                continue  # unreadable: neither a mismatch nor a match, so a hold stays put
             if not stale:
+                self._build_skew_warnings.pop(cell.id, None)
+                if cell.build_skew is not None:
+                    await self._release_build_skew_hold(cell, head_digest)
                 continue
             _cell, description = stale[0]
+            policy = self._build_skew_policy(cell)
+            if policy is BuildSkewPolicy.WARN:
+                if self._build_skew_warnings.get(cell.id) != description:
+                    self._build_skew_warnings[cell.id] = description
+                    logger.warning(
+                        "cell %s runs %s but this plane stages %s; left in service (build_skew_policy=warn)",
+                        cell.id,
+                        description,
+                        head_digest[:12],
+                    )
+                continue
+            if policy is BuildSkewPolicy.REFUSE:
+                await self._hold_stale_build_cell(cell, description, head_digest)
+                continue
             try:
                 await self.drain_cell(
                     self._principal,
