@@ -27,7 +27,7 @@ PostgreSQL tests use `EYVAN_TEST_POSTGRES_URL`, or start a disposable cluster wi
 skip. To require PostgreSQL, select a disposable test database and run:
 
 ```bash
-EYVAN_REQUIRE_POSTGRES=1 EYVAN_TEST_POSTGRES_URL=postgresql+asyncpg://user:password@localhost/eyvan_test \
+EYVAN_REQUIRE_POSTGRES=1 EYVAN_TEST_POSTGRES_URL=postgresql+asyncpg://eyvan@127.0.0.1:5432/eyvan_test \
   uv run pytest tests -q -rs
 ```
 
