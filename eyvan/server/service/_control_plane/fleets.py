@@ -246,6 +246,26 @@ class FleetsMixin:
                     and _fleet_pool_declaration(previous) == _fleet_pool_declaration(pool)
                 ):
                     continue
+                if (
+                    previous is not None
+                    and previous.enabled
+                    and previous.chip_sharing != pool.chip_sharing
+                    and _fleet_pool_declaration(previous.model_copy(update={"chip_sharing": pool.chip_sharing}))
+                    == _fleet_pool_declaration(pool)
+                ):
+                    # Chip sharing is a scheduling policy, not a different
+                    # machine: flip it on the pool and its live cells in place.
+                    # Bumping the generation would fence and replace every cell
+                    # (an attached TPU included) just to change who may share it.
+                    await tx.put_capacity_pool(
+                        previous.model_copy(update={"chip_sharing": pool.chip_sharing, "updated_at": now})
+                    )
+                    for cell in await tx.list_cells():
+                        if cell.pool_id == pool.id and cell.state is not CellState.DELETED:
+                            await tx.put_cell(
+                                cell.model_copy(update={"chip_sharing": pool.chip_sharing, "updated_at": now})
+                            )
+                    continue
                 await tx.put_capacity_pool(
                     pool.model_copy(
                         update={

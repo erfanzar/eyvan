@@ -565,6 +565,29 @@ async def test_a_sharing_pool_validates_shapes_and_reserves_a_proportional_share
 
 
 @pytest.mark.asyncio
+async def test_turning_chip_sharing_on_reaches_live_cells_without_replacing_them() -> None:
+    from eyvan.records import CellState
+
+    pool = _pool()
+    repository, service = await _plane(pool)
+    async with repository.transaction() as tx:
+        stored = (await tx.list_capacity_pools(fleet_name=pool.fleet_name))[0]
+        await tx.put_cell(stored.make_cell(f"{pool.id}-0001").model_copy(update={"state": CellState.READY}))
+
+    await service.apply_fleet(_admin(), pool.fleet_name, (_pool(chip_sharing=True),), idempotency_key="fleet-v2")
+    async with repository.transaction() as tx:
+        after = (await tx.list_capacity_pools(fleet_name=pool.fleet_name))[0]
+        cell = (await tx.list_cells())[0]
+    assert after.chip_sharing is True
+    assert after.generation == stored.generation, "a policy flag must not fence and replace the cell"
+    assert cell.chip_sharing is True and cell.state is CellState.READY and cell.generation == 1
+
+    await service.apply_fleet(_admin(), pool.fleet_name, (_pool(),), idempotency_key="fleet-v3")
+    async with repository.transaction() as tx:
+        assert (await tx.list_cells())[0].chip_sharing is False
+
+
+@pytest.mark.asyncio
 async def test_the_controller_leases_disjoint_chips_to_concurrent_shares_of_one_cell() -> None:
     from eyvan.config import EyvanSettings
     from eyvan.records import CellState, LeaseState, WorkloadState
