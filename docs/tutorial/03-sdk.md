@@ -61,6 +61,7 @@ verified in `eyvan/sdk/client/jobs.py`:
 | `type` | — | accelerator type: `"v5p-16"`, `"v6e-8"`, `"nvidia-tesla-a100"`, `"cpu"` |
 | `pods` | `1` | workers. Only `TpuConfig` allows `pods > 1` |
 | `atomic` | `False` | `False` (**elastic**): pack warm cells of the same type, provision only the deficit; one lease group, one hardware world per cell. `True`: one exact-shape provider resource, one hardware world spanning every pod — single-mesh training |
+| `chips` / `chips_indexes` | `None` | TPU only: run on part of one host instead of the whole slice. `chips=1` takes any free chip; `chips_indexes=[1, 2]` takes exactly those (global index; host = index // chips per host). Needs a pool with `chip_sharing: true`; see [runtimes](../runtimes.md#chip-shares) |
 | `capacity_class` | `SPOT` (TPU) / `ON_DEMAND` | `reserved`, `on_demand`, `spot`, `flex_start` (`eyvan/records.py`) |
 | `max_retries` | `3` | retries for **lost capacity** attempts |
 | `max_preemption_retries` | `10` | restarts after spot reclamation — deliberately generous; reclamation is the cheap failure |

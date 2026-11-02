@@ -39,6 +39,40 @@ All-or-nothing holds in both: nothing is leased unless the full worker
 count is covered, so a deficit that never grants holds no warm cell
 hostage.
 
+## Chip shares
+
+A pool that sets `chip_sharing: true` lets several jobs share one TPU
+slice, each holding some chips of one host and seeing only those:
+
+```python
+@execute(TpuConfig("v5p-128", chips=1))               # any free chip
+def probe(): ...
+
+@execute(TpuConfig("v5p-128", chips_indexes=[1, 2]))  # exactly chips 1 and 2
+def train(): ...
+```
+
+The CLI equivalent is `eyvan run --tpu v5p-128 --chips 1 -- python probe.py`
+or `--chip-index 1 --chip-index 2`.
+
+- Chip indexes are global within the slice: host `index // chips_per_host`
+  owns chip `index` (a v5p host has 4 chips, so a v5p-128 has chips 0-63).
+- One share lives on one host. On a 4-chip host it is one chip, a
+  neighbouring pair, or the whole host. The chips form a ring 0-1-2-3-0;
+  the diagonal pairs {0,2} and {1,3} are refused because libtpu aborts on
+  them (measured on a v5p host). Other host widths offer single chips only.
+- A share reserves its fraction of the host's CPU and memory.
+- Pinned chips wait while busy; a share never preempts anything. Whole-slice
+  jobs and shares never run on the same cell at once.
+- The job gets its own libtpu environment (`TPU_VISIBLE_CHIPS`, process
+  bounds, a private `TPU_PROCESS_PORT`) and runs only on the owning host.
+  Separate shares are separate JAX runtimes: there are no collectives
+  between them.
+- Turning `chip_sharing` on or off updates live cells in place; it does
+  not replace them.
+
+Pools without `chip_sharing` refuse chip requests and keep one job per cell.
+
 ## The defaults profile
 
 `~/.eyvan/autoscale/defaults.yaml` is the one place an operator pins what
