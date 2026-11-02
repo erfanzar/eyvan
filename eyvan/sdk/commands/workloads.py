@@ -30,6 +30,7 @@ from eyvan.records import (
     PriorityBand,
     ResourceGang,
     ResourceVector,
+    TpuChipRequest,
     WorkloadDefinition,
     WorkloadExplanation,
     WorkloadRecord,
@@ -66,6 +67,16 @@ _ACTION_HEADLINES: dict[str, str] = {
     "checkpoint": "Asked for a checkpoint of",
     "retry": "Retrying",
 }
+
+
+def _chip_request(chips: int | None, chip_indexes: tp.Sequence[int]) -> TpuChipRequest | None:
+    """Return the chip request ``--chips`` / ``--chip-index`` describe, or ``None`` for the whole slice."""
+
+    if chips is None and not chip_indexes:
+        return None
+    indexes = tuple(chip_indexes) if chip_indexes else None
+    count = chips if chips is not None else len(chip_indexes)
+    return TpuChipRequest(count=count, indexes=indexes)
 
 
 def _requirements(declared: tp.Sequence[str], path: Path | None) -> tuple[str, ...]:
@@ -266,6 +277,8 @@ class WorkloadCommandService:
         zone: str | None = None,
         dependencies: tuple[str, ...] = (),
         wait: bool = True,
+        chips: int | None = None,
+        chip_indexes: tuple[int, ...] = (),
     ) -> int:
         """Submit one pool-targeted command using context and fleet defaults.
 
@@ -301,6 +314,7 @@ class WorkloadCommandService:
                 pods=pods,
                 zone=zone,
                 dependencies=dependencies,
+                tpu_chips=_chip_request(chips, chip_indexes),
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -773,6 +787,21 @@ class WorkloadCommandService:
     help="How many slices to allocate together, atomically. The same shape TpuConfig(pods=N) asks for.",
 )
 @click.option(
+    "--chips",
+    type=int,
+    default=None,
+    help="Run on this many chips of one TPU host instead of the whole slice (any free ones). Needs a pool with "
+    "chip_sharing: true. The same request TpuConfig(chips=N) makes.",
+)
+@click.option(
+    "--chip-index",
+    "chip_indexes",
+    type=int,
+    multiple=True,
+    help="Run on exactly this chip (global index in the slice; repeatable, all on one host). The same request "
+    "TpuConfig(chips_indexes=[...]) makes.",
+)
+@click.option(
     "--zone",
     help="Pin this job to one zone. A constraint, not a preference: without it the fleet places the job wherever "
     "its pools of this shape have capacity.",
@@ -874,6 +903,8 @@ def run_workload(
     gpu_type: str | None,
     cpu_only: bool,
     pods: int,
+    chips: int | None,
+    chip_indexes: tuple[int, ...],
     zone: str | None,
     dependencies: tuple[str, ...],
     requirements_file: Path | None,
@@ -951,6 +982,8 @@ def run_workload(
         zone=zone,
         dependencies=declared,
         wait=not no_wait,
+        chips=chips,
+        chip_indexes=chip_indexes,
     )
     if exit_code:
         # The job's outcome is this command's outcome, so `eyvan run ... && ...`

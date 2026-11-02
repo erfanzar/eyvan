@@ -77,7 +77,7 @@ from eyvan.capacity.drivers.base import (
     rollback_context,
 )
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
-from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.distributed_environment import chip_host_of, without_distributed_topology_overrides
 from eyvan.worker.runtime._multihost_site import (
     DEFAULT_GANG_INITIALIZATION,
     GangInitializationPolicy,
@@ -1017,6 +1017,20 @@ class NativeSliceExecutor:
 
         return NativeSliceStageDriver(self._workers, self.endpoints, generation=generation, fence=fence)
 
+    def _targets(self, remote_id: str) -> list[tuple[int, NativeRemoteExecutor]]:
+        """Return the ``(rank, worker)`` pairs that own ``remote_id``.
+
+        Every host for a whole-slice job; only the owning host for a chip share,
+        whose remote ID names it (see ``chip_submission_id``).
+        """
+
+        host = chip_host_of(remote_id)
+        if host is None:
+            return list(enumerate(self._workers))
+        if host >= len(self._workers):
+            raise ValueError(f"chip share names host {host}, but this slice has {len(self._workers)} hosts")
+        return [(host, self._workers[host])]
+
     def _ranked_spec(self, spec: tp.Mapping[str, JsonValue], rank: int) -> JsonObject:
         """Copy one JSON workload spec and add its rank-local environment."""
 
@@ -1091,12 +1105,17 @@ class NativeSliceExecutor:
             expected_remote_id = raw_submission_id.strip()
         else:
             raise ValueError("native slice submission requires a non-empty submission ID")
+        chip_host = chip_host_of(expected_remote_id)
         attempted: list[tuple[int, NativeRemoteExecutor, set[str]]] = []
         try:
-            for rank, worker in enumerate(self._workers):
+            for rank, worker in self._targets(expected_remote_id):
                 remote_ids = {expected_remote_id}
                 attempted.append((rank, worker, remote_ids))
-                remote_id = worker.submit(self._ranked_spec(spec, rank), context)
+                # A chip share is its own single-process runtime on one host: the
+                # controller already wrote its libtpu environment, and the
+                # slice-wide JAX world must not be layered over it.
+                payload = dict(spec) if chip_host is not None else self._ranked_spec(spec, rank)
+                remote_id = worker.submit(payload, context)
                 remote_ids.add(remote_id)
                 if remote_id != expected_remote_id:
                     raise RuntimeError(
@@ -1147,7 +1166,10 @@ class NativeSliceExecutor:
                 )
             return _SliceWorkerObservation(rank=rank, endpoint=endpoint, observation=observation)
 
-        workers = _each_host(self._workers, observe)
+        if chip_host_of(remote_id) is not None:
+            workers = [observe(rank, worker) for rank, worker in self._targets(remote_id)]
+        else:
+            workers = _each_host(self._workers, observe)
         status = _aggregate_status(workers)
         message = _aggregate_message(workers)
         if status is ExecutionWorkloadStatus.FAILED:
@@ -1221,7 +1243,7 @@ class NativeSliceExecutor:
         """Apply one closed mutation action to every worker."""
 
         first_error: BaseException | None = None
-        for worker in self._workers:
+        for _rank, worker in self._targets(remote_id):
             try:
                 if action == "stop":
                     worker.stop(remote_id, context)
@@ -1264,7 +1286,7 @@ class NativeSliceExecutor:
         expected_remote_id = context.idempotency_key
         attempted: list[tuple[int, NativeRemoteExecutor, set[str]]] = []
         try:
-            for rank, worker in enumerate(self._workers):
+            for rank, worker in self._targets(remote_id):
                 remote_ids = {expected_remote_id}
                 attempted.append((rank, worker, remote_ids))
                 checkpoint_id = worker.checkpoint(
@@ -1298,7 +1320,8 @@ class NativeSliceExecutor:
         """Return rank-prefixed logs from every TPU VM host when available."""
 
         sections: list[str] = []
-        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
+        for rank, worker in self._targets(remote_id):
+            endpoint = self.endpoints[rank]
             try:
                 logs = worker.logs(remote_id)
             except httpx.TransportError as exc:
@@ -1332,17 +1355,21 @@ class NativeSliceExecutor:
         replays the whole slice's journal while reporting a clean read.
         """
 
+        # A chip share runs on one host, so its cursor and its pages name that
+        # host's rank only; a whole-slice job reads every host as before.
+        targets = self._targets(remote_id)
+        target_ranks = tuple(rank for rank, _ in targets)
         expected = CursorContext(
             kind=CURSOR_KIND_WORKLOAD_LOG,
             mode=CURSOR_MODE_LIVE,
-            ranks=tuple(range(len(self._workers))),
+            ranks=target_ranks,
         )
         outcome = decode_log_cursor(after, expected=expected)
         if not isinstance(outcome, (CursorFresh, CursorResume)):
             return LogPage(
                 unavailable=True,
                 detail=f"{outcome.reason}: {outcome.detail}",
-                truncated_ranks=tuple(range(len(self._workers))),
+                truncated_ranks=target_ranks,
             )
         _attempt = outcome.attempt if isinstance(outcome, CursorResume) else None
         cursors = outcome.cursors if isinstance(outcome, CursorResume) else {}
@@ -1355,7 +1382,8 @@ class NativeSliceExecutor:
 
         pages: dict[int, LogPage] = {}
         next_cursors: dict[int, str] = {}
-        for rank, page in enumerate(_each_host(self._workers, read)):
+        answers = _each_host([worker for _, worker in targets], lambda index, worker: read(targets[index][0], worker))
+        for rank, page in zip(target_ranks, answers, strict=True):
             pages[rank] = LogPage(
                 records=tuple(replace(record, rank=rank) for record in page.records),
                 next_cursor=page.next_cursor,
@@ -1391,7 +1419,8 @@ class NativeSliceExecutor:
         """
 
         ranks: list[JsonValue] = []
-        for rank, (endpoint, worker) in enumerate(zip(self.endpoints, self._workers, strict=True)):
+        for rank, worker in self._targets(remote_id):
+            endpoint = self.endpoints[rank]
             try:
                 detail: JsonValue = worker.process_status(remote_id)
             except httpx.TransportError as exc:

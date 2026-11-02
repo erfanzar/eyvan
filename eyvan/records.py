@@ -1308,6 +1308,45 @@ class ResourceGang(EyvanModel):
         return self
 
 
+#: Upper bound on one chip request. One allocation lives on one TPU host, and no
+#: generation the catalog describes has more chips per host than this.
+MAX_TPU_CHIPS_PER_REQUEST = 8
+
+
+class TpuChipRequest(EyvanModel):
+    """A share of one TPU host: ``count`` chips, optionally the exact ``indexes``.
+
+    Indexes are global within the slice -- host ``index // chips_per_host``,
+    local chip ``index % chips_per_host`` -- and are kept sorted. Only accepted
+    by pools that opt into chip sharing; absent, a workload takes its whole cell
+    exactly as before.
+    """
+
+    count: int = Field(ge=1, le=MAX_TPU_CHIPS_PER_REQUEST, strict=True)
+    #: Strict items: lax validation would quietly read ``True`` as chip 1.
+    indexes: tuple[tp.Annotated[int, Field(strict=True)], ...] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sorted_indexes(cls, value: tp.Any) -> tp.Any:
+        if isinstance(value, dict) and isinstance(value.get("indexes"), (list, tuple)):
+            indexes = value["indexes"]
+            if all(isinstance(index, int) and not isinstance(index, bool) for index in indexes):
+                value = {**value, "indexes": tuple(sorted(indexes))}
+        return value
+
+    @model_validator(mode="after")
+    def validate_chips(self) -> TpuChipRequest:
+        if self.indexes is not None:
+            if any(isinstance(index, bool) or index < 0 for index in self.indexes):
+                raise ValueError("TPU chip indexes must be non-negative integers")
+            if len(set(self.indexes)) != len(self.indexes):
+                raise ValueError("TPU chip indexes must not repeat")
+            if len(self.indexes) != self.count:
+                raise ValueError("TPU chip count must equal the number of chip indexes")
+        return self
+
+
 class CommandExecution(EyvanModel):
     """A shell command submitted to a cell execution backend."""
 
@@ -1522,6 +1561,29 @@ class WorkloadDefinition(EyvanModel):
     #: only the deficit (elastic). Elastic workloads run as one lease group with
     #: one hardware world per cell, and require ``per_worker`` scope.
     placement: PlacementMode = PlacementMode.ATOMIC
+    #: A share of one TPU host instead of the whole cell. ``None`` -- the
+    #: default and every spec written before chip sharing -- is omitted from the
+    #: wire document, so existing payloads and fingerprints are unchanged.
+    tpu_chips: TpuChipRequest | None = None
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.tpu_chips is None:
+            document.pop("tpu_chips", None)
+        return document
+
+    @model_validator(mode="after")
+    def validate_tpu_chips(self) -> WorkloadDefinition:
+        if self.tpu_chips is None:
+            return self
+        if self.worker_count != 1 or self.cell_group_count != 1 or self.gang.replicas != 1:
+            raise ValueError("a TPU chip request runs on one host of one cell; pods and replicas must be 1")
+        if self.placement is not PlacementMode.ATOMIC:
+            raise ValueError("a TPU chip request requires atomic placement")
+        if self.gang.per_replica.tpu != self.tpu_chips.count:
+            raise ValueError("a TPU chip request must reserve exactly its chip count of TPU")
+        return self
 
     @model_validator(mode="after")
     def validate_placement(self) -> WorkloadDefinition:
@@ -2106,6 +2168,9 @@ class CellRecord(EyvanModel):
     max_replica_resources: CanonicalResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
     worker_count: int = Field(default=1, ge=1, le=10_000, strict=True)
+    #: Copied from the pool: whether several chip-sized workloads may share this
+    #: cell's hosts. Omitted from the wire document while false.
+    chip_sharing: bool = False
     provider_phase: CapacityStatus | None = None
     provider_failure_code: CapacityProviderFailureCode | None = None
     #: First observation of this failure in this provider attempt. Heartbeats
@@ -2179,6 +2244,8 @@ class CellRecord(EyvanModel):
         for name in ("provider_failure_occurred_at", "provider_failure_event_id", "provider_failure_generation"):
             if getattr(self, name) is None:
                 document.pop(name, None)
+        if not self.chip_sharing:
+            document.pop("chip_sharing", None)
         return document
 
     def hourly_cost(self) -> float:
@@ -2362,6 +2429,11 @@ class CapacityPoolRecord(EyvanModel):
     max_hold_s: int | None = Field(default=None, ge=60)
     max_replica_resources: CanonicalResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
+    #: Let several workloads that each ask for some chips (``TpuConfig(chips=...)``)
+    #: share one cell's TPU hosts, each seeing only its own chips. Off by
+    #: default, which keeps one workload per native cell; omitted from the wire
+    #: document while false.
+    chip_sharing: bool = False
     quota_group: str | None = Field(default=None, max_length=192)
     quota_limit: int | None = Field(default=None, ge=0)
     quota_units_per_cell: int | None = Field(default=None, ge=1)
@@ -2398,6 +2470,13 @@ class CapacityPoolRecord(EyvanModel):
     generation: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if not self.chip_sharing:
+            document.pop("chip_sharing", None)
+        return document
 
     @model_validator(mode="after")
     def validate_pool(self) -> CapacityPoolRecord:
@@ -2586,6 +2665,7 @@ class CapacityPoolRecord(EyvanModel):
             ),
             max_gang_replicas=self.max_gang_replicas,
             worker_count=worker_count,
+            chip_sharing=self.chip_sharing,
         )
 
 
@@ -2670,6 +2750,9 @@ class LeaseRecord(EyvanModel):
     group_id: str | None = Field(default=None, max_length=128)
     group_index: int = Field(default=0, ge=0)
     revocation_reason: Literal["preemption"] | None = None
+    #: Global indexes of the TPU chips this lease holds on a chip-sharing cell.
+    #: ``None`` means the whole cell, and is omitted from the wire document.
+    tpu_chips: tuple[int, ...] | None = None
     expires_at: datetime
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -2679,6 +2762,8 @@ class LeaseRecord(EyvanModel):
         document = handler(self)
         if self.settlement_budget_period_id is None:
             document.pop("settlement_budget_period_id", None)
+        if self.tpu_chips is None:
+            document.pop("tpu_chips", None)
         return document
 
     @model_validator(mode="after")

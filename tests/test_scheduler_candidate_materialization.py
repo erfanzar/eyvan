@@ -27,9 +27,11 @@ class CountingScheduler(Scheduler):
         super().__init__()
         self.materialized_cells = []
 
-    def _make_lease(self, workload, requested, cell, hourly_cost, reserved_cost, resource_hours) -> CapacityLease:
+    def _make_lease(
+        self, workload, requested, cell, hourly_cost, reserved_cost, resource_hours, **kwargs
+    ) -> CapacityLease:
         self.materialized_cells.append(cell.cell_id)
-        return super()._make_lease(workload, requested, cell, hourly_cost, reserved_cost, resource_hours)
+        return super()._make_lease(workload, requested, cell, hourly_cost, reserved_cost, resource_hours, **kwargs)
 
 
 @pytest.mark.parametrize("order", list(permutations(("a", "b", "c"))))

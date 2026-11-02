@@ -267,6 +267,8 @@ def to_core_workload(record: WorkloadRecord, policy: PolicyRecord | None = None)
         worker_count=spec.worker_count,
         worker_resource_scope=spec.worker_resource_scope,
         placement=spec.placement,
+        tpu_chip_count=None if spec.tpu_chips is None else spec.tpu_chips.count,
+        tpu_chip_indexes=None if spec.tpu_chips is None else spec.tpu_chips.indexes,
     )
 
 
@@ -309,7 +311,18 @@ def to_core_cell(record: CellRecord) -> CapacityCell:
         autoscale_request_workload_id=record.autoscale_request_workload_id,
         enabled=record.state is CellState.READY,
         worker_count=record.worker_count,
+        chip_sharing=record.chip_sharing,
+        chips_per_host=_chips_per_host(record) if record.chip_sharing else None,
     )
+
+
+def _chips_per_host(record: CellRecord) -> int | None:
+    """Return the cell's TPU chips per host from the hardware catalog, or ``None`` when unknown."""
+
+    from eyvan.capacity.hardware_catalog import shape_for
+
+    shape = shape_for(record.accelerator_type or "") if record.accelerator_type else None
+    return None if shape is None else shape.chips_per_host
 
 
 def landed_capacity_classes(cells: tp.Iterable[CellRecord]) -> dict[str, ApiCapacityClass]:
@@ -375,6 +388,7 @@ def to_core_lease(
         )
         and (policy is None or policy.preemption_enabled),
         fencing_epoch=record.generation,
+        tpu_chips=record.tpu_chips or (),
     )
 
 

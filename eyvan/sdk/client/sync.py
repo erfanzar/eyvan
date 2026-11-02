@@ -25,6 +25,7 @@ from eyvan.records import (
     LeaseRecord,
     PolicyRecord,
     PriorityBand,
+    TpuChipRequest,
     WorkloadEstimate,
     WorkloadProgress,
     WorkloadRecord,
@@ -261,6 +262,7 @@ class EyvanClient:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         atomic: bool = False,
+        tpu_chips: TpuChipRequest | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -271,6 +273,7 @@ class EyvanClient:
             accelerator_type=accelerator_type,
             pods=pods,
             atomic=atomic,
+            tpu_chips=tpu_chips,
             capacity_class=capacity_class,
             execution=execution,
             name=name,

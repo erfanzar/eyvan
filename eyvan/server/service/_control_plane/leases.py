@@ -136,6 +136,10 @@ class LeasesMixin:
                     raise ConflictError(reason)
                 if placement.lease.lease_id != lease.id:
                     raise ConflictError("lease identifier does not match the current placement decision")
+                # Revalidation re-ran the scheduler against every active lease, so
+                # these chips are disjoint from every other share on the cell now.
+                if tuple(lease.tpu_chips or ()) != placement.lease.tpu_chips:
+                    raise ConflictError("lease TPU chips do not match the current placement decision")
                 if lease.resources != workload.spec.gang:
                     raise ConflictError("lease resources do not match the current workload gang")
                 if lease.hourly_cost != float(placement.lease.hourly_cost) or lease.reserved_cost != float(

@@ -1511,6 +1511,11 @@
             "$ref": "#/components/schemas/CapacityClass",
             "default": "on_demand"
           },
+          "chip_sharing": {
+            "default": false,
+            "title": "Chip Sharing",
+            "type": "boolean"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -2435,6 +2440,11 @@
           "capacity_class": {
             "$ref": "#/components/schemas/CapacityClass",
             "default": "on_demand"
+          },
+          "chip_sharing": {
+            "default": false,
+            "title": "Chip Sharing",
+            "type": "boolean"
           },
           "created_at": {
             "format": "date-time",
@@ -3986,6 +3996,20 @@
             "$ref": "#/components/schemas/LeaseState",
             "default": "pending"
           },
+          "tpu_chips": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tpu Chips"
+          },
           "updated_at": {
             "format": "date-time",
             "title": "Updated At",
@@ -5014,6 +5038,16 @@
             },
             "title": "Secret Mounts",
             "type": "object"
+          },
+          "tpu_chips": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TpuChipRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -5372,6 +5406,16 @@
             },
             "title": "Secret Mounts",
             "type": "object"
+          },
+          "tpu_chips": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TpuChipRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "workspace": {
             "anyOf": [
@@ -7657,6 +7701,37 @@
         "title": "TokenBody",
         "type": "object"
       },
+      "TpuChipRequest": {
+        "additionalProperties": false,
+        "description": "A share of one TPU host: ``count`` chips, optionally the exact ``indexes``.\n\nIndexes are global within the slice -- host ``index // chips_per_host``,\nlocal chip ``index % chips_per_host`` -- and are kept sorted. Only accepted\nby pools that opt into chip sharing; absent, a workload takes its whole cell\nexactly as before.",
+        "properties": {
+          "count": {
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "indexes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indexes"
+          }
+        },
+        "required": [
+          "count"
+        ],
+        "title": "TpuChipRequest",
+        "type": "object"
+      },
       "TpuQuotaEntry": {
         "additionalProperties": false,
         "description": "One zone and accelerator type's quota ceiling, usage, and free balance.\n\nChips are Cloud TPU quota units, which use the public accelerator suffix:\none ``v6e-8`` slice consumes eight units. ``free_slices`` is that division\nalready done, because the question an operator actually has is \"how many of\nthese fit\", not \"how many units are left\".",
@@ -8693,6 +8768,16 @@
             },
             "title": "Secret Mounts",
             "type": "object"
+          },
+          "tpu_chips": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TpuChipRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "worker_count": {
             "default": 1,

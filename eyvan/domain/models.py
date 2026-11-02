@@ -470,9 +470,22 @@ class WorkloadSpec:
     worker_resource_scope: WorkerResourceScope = WorkerResourceScope.ATOMIC_CELL
     placement: PlacementMode = PlacementMode.ATOMIC
     allowed_label_combinations: tuple[tuple[tuple[str, str], ...], ...] = ()
+    #: A share of one TPU host: this many chips, optionally exactly these
+    #: global indexes. ``None`` is a whole-cell workload, as before.
+    tpu_chip_count: int | None = None
+    tpu_chip_indexes: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.workload_id, field_name="workload_id")
+        if self.tpu_chip_count is not None:
+            if self.tpu_chip_count <= 0:
+                raise ValueError("tpu_chip_count must be positive")
+            if self.worker_count != 1 or self.cell_group_count != 1 or self.placement is not PlacementMode.ATOMIC:
+                raise ValueError("a TPU chip workload is one atomic single-worker placement")
+            if self.tpu_chip_indexes is not None and len(self.tpu_chip_indexes) != self.tpu_chip_count:
+                raise ValueError("tpu_chip_indexes must name exactly tpu_chip_count chips")
+        elif self.tpu_chip_indexes is not None:
+            raise ValueError("tpu_chip_indexes require tpu_chip_count")
         if self.runtime is not None:
             _non_empty(self.runtime, field_name="runtime")
         object.__setattr__(self, "placement", PlacementMode(self.placement))
@@ -606,9 +619,15 @@ class CapacityCell:
     autoscale_request_workload_id: str | None = None
     enabled: bool = True
     worker_count: int = 1
+    #: Whether chip-sized workloads may share this (otherwise exclusive) cell,
+    #: each holding disjoint TPU chips. Needs ``chips_per_host``.
+    chip_sharing: bool = False
+    chips_per_host: int | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.cell_id, field_name="cell_id")
+        if self.chips_per_host is not None and self.chips_per_host <= 0:
+            raise ValueError("chips_per_host must be positive")
         if not self.capacity:
             raise ValueError("cell capacity must not be empty")
         object.__setattr__(self, "capacity_class", CapacityClass.parse(self.capacity_class))
@@ -677,8 +696,14 @@ class CapacityLease:
     checkpoint_policy: CheckpointPolicy = field(default_factory=CheckpointPolicy)
     revocable: bool = True
     fencing_epoch: int = 0
+    #: Global TPU chip indexes held on a chip-sharing cell; empty means the whole cell.
+    tpu_chips: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        chips = tuple(sorted(self.tpu_chips))
+        if len(set(chips)) != len(chips) or any(chip < 0 for chip in chips):
+            raise ValueError("lease tpu_chips must be unique non-negative indexes")
+        object.__setattr__(self, "tpu_chips", chips)
         _non_empty(self.lease_id, field_name="lease_id")
         _non_empty(self.workload_id, field_name="workload_id")
         _non_empty(self.cell_id, field_name="cell_id")

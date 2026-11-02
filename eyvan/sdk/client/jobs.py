@@ -19,6 +19,7 @@ from eyvan.records import (
     REMOTE_CALLABLE_SIGNATURE_ERROR,
     REMOTE_CALLABLE_SIGNING_KEY_ERROR,
     CapacityClass,
+    TpuChipRequest,
     WorkloadRecord,
     WorkloadState,
 )
@@ -169,6 +170,14 @@ class TpuConfig:
     #: run as one lease group with one hardware world per cell, and the job's
     #: receipt states the packing it got.
     atomic: bool = False
+    #: Run on this many chips of one TPU host instead of the whole slice, so
+    #: several jobs can share one slice. Any free chips are chosen. Requires a
+    #: pool with ``chip_sharing: true``.
+    chips: int | None = None
+    #: Run on exactly these chips (global indexes within the slice: host
+    #: ``index // chips_per_host``). Implies ``chips=len(chips_indexes)``; all
+    #: indexes must sit on one host. The job waits while any of them is busy.
+    chips_indexes: tuple[int, ...] | None = None
     #: Whether the caller named ``capacity_class``. Derived, never passed: only
     #: an unnamed class may be substituted by a fleet's reserved capacity.
     capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
@@ -179,6 +188,41 @@ class TpuConfig:
             object.__setattr__(self, "capacity_class_explicit", False)
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
         object.__setattr__(self, "type", normalized)
+        self._validate_chips()
+
+    def _validate_chips(self) -> None:
+        indexes = self.chips_indexes
+        if indexes is not None:
+            if isinstance(indexes, (str, bytes)) or not isinstance(indexes, (list, tuple)):
+                raise ValueError("TPU chips_indexes must be a list of chip indexes")
+            if not indexes:
+                raise ValueError("TPU chips_indexes must name at least one chip")
+            if any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indexes):
+                raise ValueError("TPU chips_indexes must be non-negative integers")
+            if len(set(indexes)) != len(indexes):
+                raise ValueError("TPU chips_indexes must not repeat a chip")
+            indexes = tuple(sorted(indexes))
+            object.__setattr__(self, "chips_indexes", indexes)
+            if self.chips is None:
+                object.__setattr__(self, "chips", len(indexes))
+        if self.chips is None:
+            return
+        if isinstance(self.chips, bool) or not isinstance(self.chips, int) or self.chips < 1:
+            raise ValueError("TPU chips must be a positive integer")
+        if indexes is not None and len(indexes) != self.chips:
+            raise ValueError("TPU chips must equal len(chips_indexes) when both are given")
+        if self.pods != 1:
+            raise ValueError("TPU chips runs on one host of one slice; it cannot be combined with pods > 1")
+        if self.atomic:
+            raise ValueError("TPU chips already runs on one host; atomic=True does not apply")
+
+    @property
+    def chip_request(self) -> TpuChipRequest | None:
+        """Return the wire form of this chip request, or ``None`` for a whole-slice job."""
+
+        if self.chips is None:
+            return None
+        return TpuChipRequest(count=self.chips, indexes=self.chips_indexes)
 
 
 @dataclass(frozen=True, slots=True)

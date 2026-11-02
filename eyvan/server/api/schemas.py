@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Annotated
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from eyvan._internal.compat import StrEnum
 from eyvan.capacity.hardware_catalog import validate_accelerator_write_boundary
@@ -45,6 +45,7 @@ from eyvan.records import (
     RoleGrantRecord,
     ServiceProbeOutcome,
     ServiceReplicaHealthState,
+    TpuChipRequest,
     WarmWindow,
     WorkloadDefinition,
     WorkloadRecord,
@@ -264,6 +265,16 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: Logical names of large inputs this job pulls. A hint only: cells that
     #: recently ran something naming the same asset are preferred.
     named_assets: tuple[str, ...] = ()
+    #: Run on some chips of one host of a chip-sharing pool instead of the
+    #: whole slice. Omitted from the wire document while unset.
+    tpu_chips: TpuChipRequest | None = None
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.tpu_chips is None:
+            document.pop("tpu_chips", None)
+        return document
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolWorkloadSubmitRequest:
@@ -284,6 +295,10 @@ class PoolCallableSubmitRequest(ApiModel):
     #: pod) instead of the default elastic packing across warm same-type cells
     #: with only the deficit provisioned.
     atomic: bool = False
+    #: Run on some chips of one host of a chip-sharing pool instead of the
+    #: whole slice. Omitted by the SDK when unset, so whole-slice requests are
+    #: unchanged on the wire.
+    tpu_chips: TpuChipRequest | None = None
     capacity_class: CanonicalCapacityClass = CapacityClass.SPOT
     execution: CallableExecution
     name: str | None = Field(default=None, min_length=1, max_length=200)

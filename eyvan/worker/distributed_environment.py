@@ -30,6 +30,7 @@ delivered correctly is host-testable, and is all that is claimed.
 
 from __future__ import annotations
 
+import re
 import typing as tp
 from dataclasses import dataclass
 
@@ -554,6 +555,69 @@ def plan_gpu_devices(
     return GpuDevicePlan(assignments=tuple(assignments))
 
 
+#: Suffix on a chip-share submission ID naming the slice host that owns its chips.
+#: Routing reads it back from the remote ID itself, so a restarted agent or a
+#: resolver rebuilt from scratch still sends status, logs and retire to the one
+#: host that runs the job. A whole-slice ID (``...-a<n>-g<n>``) never ends this way.
+_CHIP_HOST_SUFFIX = re.compile(r"-tpuhost(\d{1,5})$")
+
+#: libtpu's default per-process port; a chip share offsets it by its first chip.
+_TPU_PROCESS_BASE_PORT = 8476
+
+#: ``TPU_CHIPS_PER_PROCESS_BOUNDS`` per host-local chip set, measured on a v5p
+#: host on 2026-11-02: each pair accepts exactly one orientation and the other
+#: aborts libtpu; diagonal pairs {0,2} and {1,3} accept none and are absent.
+_CHIP_BOUNDS: dict[tuple[int, ...], str] = {
+    (0, 1): "1,2,1",
+    (2, 3): "1,2,1",
+    (1, 2): "2,1,1",
+    (0, 3): "2,1,1",
+    (0, 1, 2, 3): "2,2,1",
+}
+
+
+def chip_submission_id(base: str, host: int) -> str:
+    """Return the submission ID of a chip share running on slice host ``host``."""
+
+    if isinstance(host, bool) or not isinstance(host, int) or host < 0:
+        raise ValueError("chip share host must be a non-negative integer")
+    return f"{base}-tpuhost{host}"
+
+
+def chip_host_of(remote_id: str) -> int | None:
+    """Return the slice host a chip-share remote ID runs on, or ``None`` for a whole-slice job."""
+
+    match = _CHIP_HOST_SUFFIX.search(remote_id)
+    return None if match is None else int(match.group(1))
+
+
+def tpu_chip_environment(local_chips: tp.Sequence[int]) -> dict[str, str]:
+    """Return the libtpu environment that confines one process to ``local_chips`` of its host.
+
+    The process is its own single-process TPU runtime: process bounds 1x1x1, a
+    private libtpu port derived from its first chip (so neighbours on one host
+    never share one), and the shared ``/tmp/libtpu_lockfile`` bypassed because
+    several runtimes on one host are the point.
+    """
+
+    chips = tuple(sorted(local_chips))
+    if not chips or len(set(chips)) != len(chips) or any(chip < 0 for chip in chips):
+        raise ValueError("a chip share needs unique non-negative local chip indexes")
+    bounds = "1,1,1" if len(chips) == 1 else _CHIP_BOUNDS.get(chips)
+    if bounds is None:
+        raise ValueError(f"chips {list(chips)} have no libtpu process bounds; one process cannot hold them")
+    port = _TPU_PROCESS_BASE_PORT + chips[0]
+    return {
+        "TPU_VISIBLE_CHIPS": ",".join(str(chip) for chip in chips),
+        "TPU_CHIPS_PER_PROCESS_BOUNDS": bounds,
+        "TPU_PROCESS_BOUNDS": "1,1,1",
+        "TPU_PROCESS_PORT": str(port),
+        "TPU_PROCESS_ADDRESSES": f"localhost:{port}",
+        "CLOUD_TPU_TASK_ID": "0",
+        "ALLOW_MULTIPLE_LIBTPU_LOAD": "1",
+    }
+
+
 def remove_gce_tpu_topology_overrides(environment: tp.MutableMapping[str, str]) -> None:
     """Remove values that must come from GCE TPU metadata discovery."""
 
@@ -573,12 +637,15 @@ __all__ = (
     "GpuDeviceAssignment",
     "GpuDevicePlan",
     "GpuRankLayout",
+    "chip_host_of",
+    "chip_submission_id",
     "gpu_rank_placement_error",
     "is_distributed_topology_environment_name",
     "is_gpu_topology_environment_name",
     "is_runtime_owned_environment_name",
     "plan_gpu_devices",
     "remove_gce_tpu_topology_overrides",
+    "tpu_chip_environment",
     "without_distributed_topology_overrides",
     "without_gpu_topology_overrides",
 )

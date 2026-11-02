@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+from eyvan.records import TpuChipRequest
 from eyvan.server.service._control_plane.shared import (
     DEFAULT_MAX_RETRIES,
     CommandExecution,
     ConflictError,
+    InputError,
     NotFoundError,
     Permission,
     Principal,
@@ -105,11 +107,14 @@ class SubmissionMixin:
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
+        tpu_chips: TpuChipRequest | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        if tpu_chips is not None and pods != 1:
+            raise InputError("a TPU chip request runs on one host; it cannot be combined with pods > 1")
         key = _validate_idempotency_key(idempotency_key)
         scope = _scope(org_id, project_id)
         operation = "workload.submit_pool"
@@ -149,6 +154,8 @@ class SubmissionMixin:
                 # dependency set is a different job, and a replay that ignored
                 # them would hand back a run built against yesterday's packages.
                 "dependencies": list(dependencies),
+                # Only when asked for, so every whole-slice fingerprint is unchanged.
+                **({"tpu_chips": tpu_chips.model_dump(mode="json")} if tpu_chips is not None else {}),
             }
         )
         async with self.repository.transaction() as tx:
@@ -243,8 +250,14 @@ class SubmissionMixin:
                     f"but the job requested pods={pods}"
                 )
 
+            if tpu_chips is not None:
+                self._require_chip_sharing_pool(pool, tpu_chips, fleet_name=fleet_name)
+                # Chip indexes name hardware on this pool's slice only.
+                alternate_pool_ids = ()
+                alternate_pool_templates = ()
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
+                tpu_chips=tpu_chips,
                 alternate_pool_ids=alternate_pool_ids,
                 alternate_pool_templates=alternate_pool_templates,
                 name=name if name is not None else f"{fleet_name}/{node_type}",

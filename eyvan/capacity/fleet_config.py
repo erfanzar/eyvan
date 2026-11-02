@@ -384,6 +384,9 @@ class NodeTypeBase(FleetConfigModel):
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
+    #: Let several jobs that each ask for some TPU chips (``TpuConfig(chips=...)``)
+    #: share this pool's cells, each seeing only its own chips. Off by default.
+    chip_sharing: bool = False
     quota_group: str | None = Field(default=None, max_length=192)
     quota_limit: int | None = Field(default=None, ge=0)
     quota_units_per_cell: int | None = Field(default=None, ge=1)
@@ -887,6 +890,9 @@ class EyvanFleetConfig(FleetConfigModel):
                     "topology": template["topology"],
                     "max_replica_resources": template["max_replica_resources"],
                     "max_gang_replicas": template["max_gang_replicas"],
+                    # Only when enabled, so a compiled pool document is unchanged
+                    # for every fleet that does not opt in.
+                    **({"chip_sharing": True} if node_type.chip_sharing else {}),
                     "quota_group": node_type.quota_group,
                     "quota_limit": node_type.quota_limit,
                     "quota_units_per_cell": node_type.quota_units_per_cell,

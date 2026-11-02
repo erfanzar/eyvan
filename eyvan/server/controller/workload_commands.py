@@ -54,7 +54,11 @@ from eyvan.worker.agent.models import (
     WorkloadMutationRequest,
     WorkloadRequest,
 )
-from eyvan.worker.distributed_environment import NATIVE_RENDEZVOUS_PORTS
+from eyvan.worker.distributed_environment import (
+    NATIVE_RENDEZVOUS_PORTS,
+    chip_submission_id,
+    tpu_chip_environment,
+)
 
 if tp.TYPE_CHECKING:
     from eyvan.server.persistence import RepositorySession
@@ -274,6 +278,28 @@ class GangRendezvousCollision(PermanentDispatchRefusal):
     retry re-runs the same placement and refuses again. Failing the workload with
     the reason names the configuration to change instead of looping on it.
     """
+
+
+def _chip_share_dispatch(submission_id: str, chips: tp.Sequence[int], cell: CellRecord) -> tuple[str, dict[str, str]]:
+    """Return the host-routed submission ID and libtpu environment for one chip-share lease.
+
+    The chips are global slice indexes; the host that owns them is encoded in
+    the submission ID so every later status, log and retire reaches that host
+    alone, and the environment names the host-local chips.
+    """
+
+    from eyvan.capacity.hardware_catalog import shape_for
+    from eyvan.domain.tpu_chips import host_local_chips
+
+    shape = shape_for(cell.accelerator_type or "") if cell.accelerator_type else None
+    chips_per_host = None if shape is None else shape.chips_per_host
+    if chips_per_host is None:
+        raise PermanentDispatchRefusal(
+            f"cell {cell.id!r} holds a TPU chip-share lease, but the hardware catalog does not record the chips "
+            f"per host of {cell.accelerator_type!r}"
+        )
+    host, local = host_local_chips(chips, chips_per_host)
+    return chip_submission_id(submission_id, host), tpu_chip_environment(local)
 
 
 class _ControllerWorkloadCommands:
@@ -1168,11 +1194,16 @@ class _ControllerWorkloadCommands:
             )
             await self._persist_attempt_topology(transaction, reserved, (cell,))
             entrypoint, environment = self._render_execution(reserved, runtime_environment=cell.runtime.env)
+            submission_id = f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}"
+            if lease.tpu_chips:
+                submission_id, chip_environment = _chip_share_dispatch(submission_id, lease.tpu_chips, cell)
+                # Last, so a job cannot point its share at a neighbour's chips.
+                environment.update(chip_environment)
             request = WorkloadRequest(
                 mutation=self._mutation(command, lease.fencing_token),
                 spec={
                     "entrypoint": entrypoint,
-                    "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
+                    "submission_id": submission_id,
                     "environment": environment,
                     "backend_options": reserved.spec.backend_options,
                     "gang": {

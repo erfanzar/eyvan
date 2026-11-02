@@ -35,6 +35,7 @@ from .models import (
     WorkloadIdentity,
     WorkloadSpec,
 )
+from .tpu_chips import pick_chips
 
 _EMPTY_RESOURCES = ResourceVector()
 
@@ -438,7 +439,9 @@ class Scheduler:
         if not feasible_cells:
             return self._summarize_static_failures(workload, static_failures)
 
-        best_placement: tuple[PlacementScore, CapacityCell, Decimal, Decimal, ResourceVector] | None = None
+        best_placement: tuple[PlacementScore, CapacityCell, Decimal, Decimal, ResourceVector, tuple[int, ...]] | None = (
+            None
+        )
         dynamic_failures: list[CellInfeasibility] = []
         budget_allowed_cells: list[CapacityCell] = []
         for cell in feasible_cells:
@@ -472,11 +475,11 @@ class Scheduler:
                 continue
             budget_allowed_cells.append(cell)
             remaining = accounting.remaining(cell)
-            exclusive_busy = cell.exclusive_workloads and any(accounting.leases_for_cell(cell.cell_id))
-            if not exclusive_busy and requested.fits_within(remaining) and quota_failure is None:
+            busy_reason, chips = self._cell_occupancy(workload, cell, accounting)
+            if busy_reason is None and requested.fits_within(remaining) and quota_failure is None:
                 score = self._placement_score(workload, requested, cell, remaining, reserved_cost)
                 if best_placement is None or score < best_placement[0]:
-                    best_placement = (score, cell, hourly_cost, reserved_cost, resource_hours)
+                    best_placement = (score, cell, hourly_cost, reserved_cost, resource_hours, chips)
             else:
                 code = (
                     InfeasibilityCode.QUOTA_EXCEEDED
@@ -486,8 +489,8 @@ class Scheduler:
                 message = (
                     quota_failure.message
                     if quota_failure is not None
-                    else "cell permits exactly one active workload"
-                    if exclusive_busy
+                    else busy_reason
+                    if busy_reason is not None
                     else f"gang requires {requested.as_dict()}, available {remaining.as_dict()}"
                 )
                 dynamic_failures.append(
@@ -498,13 +501,16 @@ class Scheduler:
                     )
                 )
         if best_placement is not None:
-            score, cell, hourly_cost, reserved_cost, resource_hours = best_placement
-            lease = self._make_lease(workload, requested, cell, hourly_cost, reserved_cost, resource_hours)
+            score, cell, hourly_cost, reserved_cost, resource_hours, chips = best_placement
+            lease = self._make_lease(
+                workload, requested, cell, hourly_cost, reserved_cost, resource_hours, tpu_chips=chips
+            )
             return PlacementDecision(workload.workload_id, lease, score)
 
         preemption_plans: list[_PreemptionCandidate] = []
         unsafe_preemption = False
-        for cell in budget_allowed_cells:
+        # A chip share waits for its chips; it never stops another job to get them.
+        for cell in () if workload.tpu_chip_count is not None else budget_allowed_cells:
             candidate, unsafe = self._preemption_candidate(workload, requested, cell, accounting, quotas)
             unsafe_preemption |= unsafe
             if candidate is not None:
@@ -902,6 +908,12 @@ class Scheduler:
     ) -> CellInfeasibility | None:
         if not cell.enabled:
             return CellInfeasibility(cell.cell_id, InfeasibilityCode.HARD_CONSTRAINT, "cell is disabled")
+        if workload.tpu_chip_count is not None and (not cell.chip_sharing or cell.chips_per_host is None):
+            return CellInfeasibility(
+                cell.cell_id,
+                InfeasibilityCode.HARD_CONSTRAINT,
+                "cell does not allow TPU chip sharing (set chip_sharing: true on its pool)",
+            )
         if require_worker_count_equality and workload.worker_count != cell.worker_count:
             return CellInfeasibility(
                 cell.cell_id,
@@ -1093,6 +1105,8 @@ class Scheduler:
         hourly_cost: Decimal,
         reserved_cost: Decimal,
         resource_hours: ResourceVector,
+        *,
+        tpu_chips: tuple[int, ...] = (),
     ) -> CapacityLease:
         lease_key = f"{workload.workload_id}\0{workload.attempt}\0{workload.generation}\0{cell.cell_id}".encode()
         return CapacityLease(
@@ -1108,7 +1122,46 @@ class Scheduler:
             resource_hours_reserved=resource_hours,
             checkpoint_policy=workload.checkpoint_policy,
             revocable=workload.revocable,
+            tpu_chips=tpu_chips,
         )
+
+    @staticmethod
+    def _cell_occupancy(
+        workload: WorkloadSpec,
+        cell: CapacityCell,
+        accounting: _LeaseAccounting,
+    ) -> tuple[str | None, tuple[int, ...]]:
+        """Return why ``cell`` cannot take this workload now (or ``None``) and the chips it would get.
+
+        A whole-cell workload keeps the exclusive rule: one workload per native
+        cell. A chip workload may join a chip-sharing cell whose every lease
+        holds chips, and is granted chips disjoint from all of them.
+        """
+
+        leases = tuple(accounting.leases_for_cell(cell.cell_id))
+        if workload.tpu_chip_count is None:
+            if cell.exclusive_workloads and leases:
+                return "cell permits exactly one active workload", ()
+            return None, ()
+        if any(not lease.tpu_chips for lease in leases):
+            return "cell is held whole by another workload", ()
+        if cell.chips_per_host is None:
+            return "cell does not allow TPU chip sharing", ()
+        total = int(cell.capacity.get("tpu"))
+        used = {chip for lease in leases for chip in lease.tpu_chips}
+        chips = pick_chips(
+            frozenset(range(total)) - used,
+            workload.tpu_chip_count,
+            workload.tpu_chip_indexes,
+            total_chips=total,
+            chips_per_host=cell.chips_per_host,
+        )
+        if chips is not None:
+            return None, chips
+        if workload.tpu_chip_indexes is not None:
+            held = sorted(set(workload.tpu_chip_indexes) & used)
+            return f"TPU chips {held} are held by another workload", ()
+        return f"no host has {workload.tpu_chip_count} free TPU chips", ()
 
     @staticmethod
     def _placement_score(

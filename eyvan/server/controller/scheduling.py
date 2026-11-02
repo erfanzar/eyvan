@@ -87,6 +87,7 @@ class _ControllerScheduling:
             resource_hours_reserved=_api_resources(lease.resource_hours_reserved),
             generation=workload.generation,
             fencing_token=secrets.token_urlsafe(32),
+            tpu_chips=lease.tpu_chips or None,
             expires_at=utcnow() + timedelta(seconds=self.settings.lease_ttl_s),
         )
         await self.service.create_lease(

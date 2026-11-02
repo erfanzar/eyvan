@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from eyvan.capacity.hardware_catalog import shape_for
+from eyvan.domain.tpu_chips import chip_request_error
+from eyvan.records import ResourceVector, TpuChipRequest
 from eyvan.server.service._control_plane.shared import (
     CALLABLE_SIGNING_KEY_ENV,
     DEFAULT_MAX_RETRIES,
@@ -44,6 +47,26 @@ from eyvan.server.service._control_plane.shared import (
 )
 
 
+def chip_share_resources(allocatable: ResourceVector, chips: int) -> ResourceVector:
+    """Return one chip share's reservation: ``chips`` TPU and that fraction of the cell's CPU and memory.
+
+    Host CPU and memory are split in proportion so neighbours on one host cannot
+    starve each other through the scheduler's accounting.
+    """
+
+    total = allocatable.tpu
+    if total <= 0 or chips > total:
+        raise ValueError("a chip share must fit within the cell's TPU chips")
+    fraction = chips / total
+    return ResourceVector(
+        cpu=allocatable.cpu * fraction,
+        memory_gib=allocatable.memory_gib * fraction,
+        gpu=0,
+        tpu=chips,
+        custom={name: amount * fraction for name, amount in allocatable.custom.items()},
+    )
+
+
 class CallableSubmissionMixin:
     """Transactional callable submission operations."""
 
@@ -76,6 +99,7 @@ class CallableSubmissionMixin:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         atomic: bool = False,
+        tpu_chips: TpuChipRequest | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on ``pods`` workers, packed or atomic.
@@ -105,6 +129,8 @@ class CallableSubmissionMixin:
             )
         if not accelerator_type or accelerator_type != accelerator_type.strip():
             raise InputError("accelerator_type must be non-empty and trimmed")
+        if tpu_chips is not None and (pods != 1 or atomic):
+            raise InputError("a TPU chip request runs on one host; it cannot be combined with pods > 1 or atomic")
 
         key = _validate_idempotency_key(idempotency_key)
         scope = _scope(org_id, project_id)
@@ -139,6 +165,9 @@ class CallableSubmissionMixin:
                 # different dependency set is a different job, and a replay
                 # ignoring them would return one built on other packages.
                 "dependencies": list(dependencies),
+                # Only when asked for, so every whole-slice fingerprint (and
+                # therefore every stored replay) stays what it was.
+                **({"tpu_chips": tpu_chips.model_dump(mode="json")} if tpu_chips is not None else {}),
             }
         )
         async with self.repository.transaction() as tx:
@@ -299,8 +328,15 @@ class CallableSubmissionMixin:
                     "interpreter. Submit from a matching Python, or give the pool a runtime that provides yours."
                 )
 
+            if tpu_chips is not None:
+                self._require_chip_sharing_pool(pool, tpu_chips, fleet_name=fleet_name)
+                # A chip share pins to this one pool: alternates are other
+                # zones' slices, whose chip indexes mean different hardware.
+                alternate_pool_ids = ()
+                alternate_pool_templates = ()
             spec = self._pinned_pool_workload_spec(
                 pool=pool,
+                tpu_chips=tpu_chips,
                 alternate_pool_ids=alternate_pool_ids,
                 alternate_pool_templates=alternate_pool_templates,
                 name=name if name is not None else f"{fleet_name}/{accelerator_type}",
@@ -313,7 +349,8 @@ class CallableSubmissionMixin:
                 max_preemption_retries=max_preemption_retries,
                 cell_group_count=1,
                 worker_count=pods,
-                placement=PlacementMode.ATOMIC if atomic else PlacementMode.ELASTIC,
+                # A chip share is one host of one cell by construction: atomic.
+                placement=PlacementMode.ATOMIC if atomic or tpu_chips is not None else PlacementMode.ELASTIC,
                 checkpointable=checkpointable,
                 checkpoint_hook=checkpoint_hook,
                 checkpoint_output_uri=checkpoint_output_uri,
@@ -336,6 +373,31 @@ class CallableSubmissionMixin:
                 key=key,
                 fingerprint=fingerprint,
             )
+
+    @staticmethod
+    def _require_chip_sharing_pool(pool: CapacityPoolRecord, request: TpuChipRequest, *, fleet_name: str) -> None:
+        """Refuse a chip request the pool has not opted into or whose shape cannot hold it."""
+
+        if not pool.chip_sharing:
+            raise ConflictError(
+                f"pool {pool.id!r} in fleet {fleet_name!r} does not allow chip sharing; set chip_sharing: true on "
+                "the pool to run jobs on some of its chips, or drop chips=/chips_indexes= to use the whole slice"
+            )
+        shape = shape_for(pool.accelerator_type or "")
+        chips_per_host = shape.chips_per_host if shape is not None else None
+        if chips_per_host is None:
+            raise ConflictError(
+                f"chip sharing needs the chips per host of {pool.accelerator_type!r}, which the hardware catalog "
+                "does not record"
+            )
+        problem = chip_request_error(
+            request.count,
+            request.indexes,
+            total_chips=pool.allocatable.tpu,
+            chips_per_host=chips_per_host,
+        )
+        if problem is not None:
+            raise InputError(f"TPU chip request for pool {pool.id!r}: {problem}")
 
     def _require_trusted_callable_project(self, org_id: str, project_id: str) -> None:
         self.callable_trust.require(org_id, project_id)
@@ -519,6 +581,7 @@ class CallableSubmissionMixin:
         alternate_pool_ids: tuple[str, ...] = (),
         placement: PlacementMode = PlacementMode.ATOMIC,
         alternate_pool_templates: tuple[str, ...] = (),
+        tpu_chips: TpuChipRequest | None = None,
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
 
@@ -550,9 +613,12 @@ class CallableSubmissionMixin:
             workspace=workspace,
             gang=ResourceGang(
                 replicas=1,
-                per_replica=pool.allocatable,
+                per_replica=(
+                    pool.allocatable if tpu_chips is None else chip_share_resources(pool.allocatable, tpu_chips.count)
+                ),
                 required_topology=pool.topology,
             ),
+            tpu_chips=tpu_chips,
             environment=dict(environment),
             secret_mounts=dict(secret_mounts),
             metadata={**dict(metadata), **pool_labels},

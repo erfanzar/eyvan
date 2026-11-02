@@ -2629,6 +2629,7 @@ def create_app(
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
             dependencies=request.dependencies,
+            tpu_chips=request.tpu_chips,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2684,6 +2685,7 @@ def create_app(
             named_assets=request.named_assets,
             dependencies=request.dependencies,
             atomic=request.atomic,
+            tpu_chips=request.tpu_chips,
             idempotency_key=idempotency_key,
         )
         if replayed:

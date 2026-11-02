@@ -733,6 +733,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 can_submit_children=request.tpu.can_submit_children,
                 dependencies=tuple(request.tpu.dependencies),
                 atomic=getattr(request.tpu, "atomic", False),
+                tpu_chips=getattr(request.tpu, "chip_request", None),
                 idempotency_key=idempotency_key,
             )
 

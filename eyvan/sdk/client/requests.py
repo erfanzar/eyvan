@@ -12,7 +12,14 @@ import typing as tp
 from pydantic import BaseModel
 
 from eyvan._internal.json_types import JsonObject, model_json
-from eyvan.records import CallableExecution, CapacityClass, PriorityBand, WorkloadState, WorkspaceRef
+from eyvan.records import (
+    CallableExecution,
+    CapacityClass,
+    PriorityBand,
+    TpuChipRequest,
+    WorkloadState,
+    WorkspaceRef,
+)
 from eyvan.sdk.client.jobs import reject_remote_callable_signature, reject_remote_callable_signing_environment
 from eyvan.sdk.client.types import QueryParams
 from eyvan.server.api.schemas import PoolCallableSubmitRequest, PoolWorkloadSubmitRequest
@@ -52,10 +59,13 @@ def pool_workload_request(
     estimated_duration_seconds: int = 3600,
     named_assets: tuple[str, ...] = (),
     dependencies: tuple[str, ...] = (),
+    tpu_chips: TpuChipRequest | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
+    chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
     return PoolWorkloadSubmitRequest(
+        **chip_fields,
         org_id=org_id,
         project_id=project_id,
         command=command,
@@ -108,12 +118,20 @@ def pool_callable_request(
     named_assets: tuple[str, ...] = (),
     dependencies: tuple[str, ...] = (),
     atomic: bool = False,
+    tpu_chips: TpuChipRequest | None = None,
 ) -> PoolCallableSubmitRequest:
-    """Build the shared pool-callable request payload."""
+    """Build the shared pool-callable request payload.
+
+    ``tpu_chips`` is passed to the model only when set, so ``pool_request_json``
+    (which drops fields the caller never set) keeps whole-slice requests
+    byte-identical to what they were before chip sharing existed.
+    """
 
     reject_remote_callable_signature(execution.signature)
     reject_remote_callable_signing_environment(environment)
+    chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
     return PoolCallableSubmitRequest(
+        **chip_fields,
         org_id=org_id,
         project_id=project_id,
         accelerator_type=accelerator_type,
