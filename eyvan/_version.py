@@ -9,4 +9,4 @@ A leaf module with no imports, so the bottom layer can read the version
 without pointing a dependency edge at the package root.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
