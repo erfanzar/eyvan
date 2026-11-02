@@ -494,6 +494,17 @@ def test_fleet_yaml_chip_sharing_reaches_the_pool_only_when_enabled() -> None:
     assert sharing["chip_sharing"] is True
     assert CapacityPoolRecord.model_validate(sharing).chip_sharing is True
 
+    # The path `eyvan up` actually takes: the fleet-apply request must carry it to the record.
+    from eyvan._internal.json_types import model_json
+    from eyvan.server.api.schemas import FleetApplyRequest
+
+    request = FleetApplyRequest.model_validate({"pools": [sharing]})
+    assert request.to_records()[0].chip_sharing is True
+    assert model_json(request)["pools"][0]["chip_sharing"] is True
+    plain = FleetApplyRequest.model_validate({"pools": [compiled()]})
+    assert "chip_sharing" not in model_json(plain)["pools"][0], "older planes forbid unknown fields"
+    assert plain.to_records()[0].chip_sharing is False
+
 
 # --- service + controller, end to end on an in-memory plane -----------------
 

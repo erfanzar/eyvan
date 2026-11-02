@@ -426,6 +426,9 @@ class CapacityPoolUpsertRequest(ApiModel):
     topology: dict[str, str] = Field(default_factory=dict)
     max_replica_resources: ResourceLimits | None = None
     max_gang_replicas: int | None = Field(default=None, ge=1)
+    #: Let chip-sized workloads share this pool's cells. Omitted from the wire
+    #: document while false, so applies to an older plane are unchanged.
+    chip_sharing: bool = False
     quota_group: str | None = Field(default=None, max_length=192)
     quota_limit: int | None = Field(default=None, ge=0)
     quota_units_per_cell: int | None = Field(default=None, ge=1)
@@ -443,6 +446,13 @@ class CapacityPoolUpsertRequest(ApiModel):
     upscaling_speed: float = Field(default=1.0, gt=0)
     launch_batch: int = Field(default=5, ge=1)
     enabled: bool = True
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if not self.chip_sharing:
+            document.pop("chip_sharing", None)
+        return document
 
     @model_validator(mode="after")
     def validate_accelerator_semantics(self) -> CapacityPoolUpsertRequest:

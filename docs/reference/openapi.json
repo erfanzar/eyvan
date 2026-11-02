@@ -1924,6 +1924,11 @@
             "$ref": "#/components/schemas/CapacityClass",
             "default": "on_demand"
           },
+          "chip_sharing": {
+            "default": false,
+            "title": "Chip Sharing",
+            "type": "boolean"
+          },
           "enabled": {
             "default": true,
             "title": "Enabled",
