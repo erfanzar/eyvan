@@ -442,6 +442,7 @@ def _validate_release_lock(path: Path, *, repository_root: Path | None = None) -
             "downloadArtifact",
             "login",
             "setupBuildx",
+            "setupNode",
             "setupUv",
             "uploadArtifact",
         },
@@ -479,6 +480,8 @@ def _validate_workflow_pins(repository_root: Path, lock: dict[str, Any]) -> None
         "actions/checkout": lock["actions"]["checkout"],
         "actions/download-artifact": lock["actions"]["downloadArtifact"],
         "actions/upload-artifact": lock["actions"]["uploadArtifact"],
+        # publish.yaml builds the dashboard into the wheel before the Python build.
+        "actions/setup-node": lock["actions"]["setupNode"],
         "astral-sh/setup-uv": lock["actions"]["setupUv"],
         "docker/build-push-action": lock["actions"]["buildPush"],
         "docker/login-action": lock["actions"]["login"],

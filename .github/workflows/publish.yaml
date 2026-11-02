@@ -48,6 +48,22 @@ jobs:
           test "$SOURCE" = "$CLAIMED" || {
             echo "tag claims $CLAIMED but pyproject declares $SOURCE" >&2; exit 1; }
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # A published wheel must serve its UI: build the dashboard and copy it
+      # into the package before the Python build, then refuse an artifact
+      # that does not carry every file index.html loads.
+      - name: Build the dashboard and stage it into the package
+        run: |
+          set -euo pipefail
+          npm --prefix dashboard ci
+          npm --prefix dashboard run build
+          python3 scripts/stage_dashboard.py
+
       - name: Build with the locked backend
         run: |
           set -euo pipefail
@@ -57,6 +73,7 @@ jobs:
           VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
             uv build --no-build-isolation --wheel --sdist --out-dir dist .
           test "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)" -eq 2
+          python3 scripts/stage_dashboard.py --check dist/*.whl dist/*.tar.gz
 
       - name: Install the built wheel and exercise every entry point
         run: |

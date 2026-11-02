@@ -935,16 +935,23 @@ def fleet_state_uri(artifact_store_uri: str, fleet: str) -> str:
 def _local_dashboard_bundle() -> bytes | None:
     """Return this checkout's built dashboard as a gzipped tar, or ``None``.
 
-    ``None`` for a wheel install is the ordinary case and not a failure: the
-    dashboard is a Node build tree that cannot travel inside a Python wheel,
-    which is why a head installed from one served no UI at all and
-    ``eyvan dashboard`` opened a 404. A head built from a checkout that has run
-    ``npm run build`` can carry it; one that has not says so rather than
-    pretending.
+    A checkout's ``dashboard/dist`` is used first, then the copy a release
+    build placed inside the package (``eyvan/_dashboard``), so a head launched
+    from ``pip install eyvan`` ships a UI too. ``None`` -- a checkout that has
+    not run ``npm run build``, or a wheel built without staging -- says so
+    rather than pretending.
     """
 
-    dist = Path(eyvan_package_root()).parent / "dashboard" / "dist"
-    if not (dist / "index.html").is_file():
+    package = Path(eyvan_package_root())
+    dist = next(
+        (
+            candidate
+            for candidate in (package.parent / "dashboard" / "dist", package / "_dashboard")
+            if (candidate / "index.html").is_file()
+        ),
+        None,
+    )
+    if dist is None:
         return None
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:

@@ -58,8 +58,8 @@ def test_a_declared_directory_that_is_not_there_is_not_substituted(monkeypatch, 
 
 
 def test_a_wheel_install_has_no_bundle_to_find(monkeypatch, tmp_path) -> None:
-    """The dashboard is a Node build tree and cannot travel inside a Python
-    distribution, so the fallback has to come up empty rather than guess."""
+    """A wheel built without a staged ``eyvan/_dashboard`` carries no UI, so the
+    fallback has to come up empty rather than guess."""
 
     monkeypatch.delenv("EYVAN_DASHBOARD_DIR", raising=False)
     monkeypatch.setattr(app_module, "__file__", str(tmp_path / "eyvan/server/api/app.py"))

@@ -209,16 +209,22 @@ makes no claim that a particular run has passed.
 
 `eyvan/server/api/app.py` is the server-side source of truth. If
 `EYVAN_DASHBOARD_DIR` names an existing directory, that directory is served;
-otherwise a checkout's `dashboard/dist` is used only when it contains
-`index.html`. The selected directory is mounted at `/` with FastAPI
-`StaticFiles(..., html=True)`, which serves the built SPA and its static assets.
+otherwise a checkout's `dashboard/dist` is used when it contains `index.html`,
+and then the copy packaged inside the wheel as `eyvan/_dashboard`. The
+selected directory is mounted at `/` with FastAPI `StaticFiles(..., html=True)`,
+which serves the built SPA and its static assets.
+
+Release builds put the dashboard in the package: after
+`npm --prefix dashboard run build`, `python3 scripts/stage_dashboard.py` copies
+`dashboard/dist` to the gitignored `eyvan/_dashboard`, `uv build` packs it into
+the wheel and sdist, and `python3 scripts/stage_dashboard.py --check dist/*`
+refuses an artifact missing `index.html` or any asset it loads. The CI package
+job and `publish.yaml` run all three, so `pip install eyvan` serves the UI.
 
 If no bundle is available, `/` returns a small self-contained explanation that
 the plane serves the API but not the dashboard, with `eyvan dashboard-dev`,
-`/healthz`, and `/docs` pointers. An installed Python wheel has no sibling
-Node build tree, so it does not acquire the UI merely by being installed. A
-release deployment must therefore build the dashboard and configure/provide
-its bundle; the server source does not itself build frontend assets.
+`/healthz`, and `/docs` pointers. A wheel built without staging is in that
+state.
 
 The static mount is intentionally at `/`; API routes remain under `/api/...`.
 Because the dashboard uses hash routes, deep navigation stays at the same

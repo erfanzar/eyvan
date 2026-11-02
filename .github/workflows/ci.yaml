@@ -287,6 +287,20 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.9.21"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # The wheel carries the built dashboard as eyvan/_dashboard, so an
+      # installed plane serves its UI at "/".
+      - name: Build the dashboard and stage it into the package
+        run: |
+          set -euo pipefail
+          npm --prefix dashboard ci
+          npm --prefix dashboard run build
+          python3 scripts/stage_dashboard.py
 
       - name: Build with the locked backend, never a resolved one
         run: |
@@ -296,6 +310,7 @@ jobs:
           uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
           VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
             uv build --no-build-isolation --wheel --sdist --out-dir dist .
+          python3 scripts/stage_dashboard.py --check dist/*.whl dist/*.tar.gz
 
       - name: Every entry point answers from an installed wheel
         run: |

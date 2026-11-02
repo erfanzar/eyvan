@@ -42,3 +42,6 @@ google-cloud-credentials.json
 .handoff/
 .xerxes/
 XERXES.md
+# The built dashboard copied into the package for a release build
+# (scripts/stage_dashboard.py); a build output, never source.
+/eyvan/_dashboard/

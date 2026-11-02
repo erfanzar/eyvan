@@ -101,10 +101,10 @@ buffering; the audit stream uses bounded lookback + dedupe.
 ## Static dashboard serving
 
 `dashboard_bundle()` in `app.py`: if `EYVAN_DASHBOARD_DIR` names an existing
-directory it is served; otherwise a checkout's `dashboard/dist` is used only when
-it contains `index.html`. The bundle is mounted at `/` with `StaticFiles(...,
+directory it is served; otherwise a checkout's `dashboard/dist` is used when it
+contains `index.html`, then the copy a release build packaged as `eyvan/_dashboard`
+(`scripts/stage_dashboard.py`). The bundle is mounted at `/` with `StaticFiles(...,
 html=True)`; API routes stay under `/api/...`. Because the dashboard uses hash
-routes, deep navigation needs no history-mode rewrite rules. An installed wheel has
-no Node build tree — a release deployment must build the dashboard and provide the
-bundle; otherwise `/` returns a self-contained page explaining exactly that, with
-pointers to `eyvan dashboard-dev`, `/healthz`, and `/docs`.
+routes, deep navigation needs no history-mode rewrite rules. With no bundle at all
+(a wheel built without staging), `/` returns a self-contained page explaining
+exactly that, with pointers to `eyvan dashboard-dev`, `/healthz`, and `/docs`.

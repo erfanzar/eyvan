@@ -342,18 +342,24 @@ def dashboard_bundle() -> Path | None:
     is the difference between the URL every command prints being the UI and
     being a 404.
 
-    An installed wheel has no such sibling -- the dashboard is a Node build tree
-    that cannot travel inside a Python distribution -- so it returns ``None``
-    and the plane says so at "/" rather than pretending.
+    An installed wheel has no such sibling, so release builds copy the bundle
+    into the package as ``eyvan/_dashboard`` (``scripts/stage_dashboard.py``).
+    A checkout's own build wins over that copy, so a developer sees what they
+    just built. With neither, it returns ``None`` and the plane says so at "/"
+    rather than pretending.
     """
 
     configured = os.environ.get("EYVAN_DASHBOARD_DIR")
     if configured:
         directory = Path(configured)
         return directory if directory.is_dir() else None
-    # .../eyvan/server/api/app.py -> the checkout root that holds dashboard/.
-    bundled = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
-    return bundled if (bundled / "index.html").is_file() else None
+    here = Path(__file__).resolve()
+    # .../eyvan/server/api/app.py -> the checkout root that holds dashboard/,
+    # then the copy a release build placed inside the package itself.
+    for bundled in (here.parents[3] / "dashboard" / "dist", here.parents[2] / "_dashboard"):
+        if (bundled / "index.html").is_file():
+            return bundled
+    return None
 
 
 @dataclass(frozen=True, slots=True)
