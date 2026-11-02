@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import re
+import subprocess
 import threading
 import time
 import typing as tp
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 
 from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, is_json_object
+from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.providers.gcp.accelerator_catalog import AcceleratorCatalogError, gcloud_access_token
 from eyvan.records import CapacityClass
 
@@ -290,6 +292,26 @@ def validate_node_name(name: str) -> str:
     return value
 
 
+def gcloud_active_account(timeout_s: float = 15.0) -> str | None:
+    """Return the gcloud account whose token :func:`gcloud_access_token` mints, or ``None`` when unknown."""
+
+    try:
+        result = subprocess.run(
+            ["gcloud", "config", "get-value", "account"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=provider_cli_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    account = (result.stdout or "").strip()
+    if result.returncode != 0 or not account or account == "(unset)" or len(account) > 320:
+        return None
+    return account
+
+
 @dataclass
 class TpuNodeApi:
     """Read projects and TPU nodes over REST with the operator's gcloud credential.
@@ -304,6 +326,22 @@ class TpuNodeApi:
     _token: str | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _forbidden_remint_at: float = field(default=float("-inf"), init=False, repr=False)
+    #: Names the account the credential belongs to. ``None`` means: ask gcloud
+    #: when the token comes from gcloud, otherwise the account is unknown.
+    account_source: tp.Callable[[], str | None] | None = None
+
+    def account(self) -> str | None:
+        """Return the identity this reader lists as, or ``None`` when it cannot be named."""
+
+        source = self.account_source
+        if source is None and self.token_source is gcloud_access_token:
+            source = gcloud_active_account
+        if source is None:
+            return None
+        try:
+            return source()
+        except Exception:  # naming the account is informational; never fail a listing over it
+            return None
 
     def _may_remint(self, status: int) -> bool:
         """Return whether a ``status`` answer should be retried with a fresh token."""
@@ -440,6 +478,7 @@ __all__ = (
     "TpuNodeParseError",
     "attach_fleet_name",
     "attach_management_uid",
+    "gcloud_active_account",
     "node_capacity_class",
     "parse_tpu_node",
     "validate_node_name",

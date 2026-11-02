@@ -370,7 +370,9 @@ export function FleetPage({
                 <div className="topology-region-label">
                   <MapPin size={15} aria-hidden="true" />
                   <strong>{regionName}</strong>
-                  <span>{regionCells.length} cells</span>
+                  <span>
+                    {regionCells.length} {regionCells.length === 1 ? "cell" : "cells"}
+                  </span>
                 </div>
                 <div className="topology-cell-row">
                   {regionCells.map((cell) => (
@@ -615,12 +617,28 @@ export function FleetPage({
           {discovered !== null && discovered.discovered_at === null && (
             <p className="panel-note">Not listed yet; the local plane is reading your GCP projects.</p>
           )}
+          {discovered !== null && discovered.discovered_at !== null && discovered.projects.length > 0 && (
+            <p className="panel-note discovered-scope">
+              {discovered.account ? (
+                <>
+                  Listed as <strong>{discovered.account}</strong> across{" "}
+                </>
+              ) : (
+                "Listed across "
+              )}
+              {discovered.projects.length} project{discovered.projects.length === 1 ? "" : "s"}:{" "}
+              {discovered.projects
+                .map((project) => `${project} (${discovered.tpus.filter((tpu) => tpu.project === project).length})`)
+                .join(", ")}
+              .
+            </p>
+          )}
           {discovered !== null && discovered.discovered_at !== null && discovered.tpus.length === 0 && (
             <p className="panel-note">No TPU VMs observed in {discovered.projects.length} project(s).</p>
           )}
           {discovered !== null && discovered.tpus.length > 0 && (
             <div className="table-scroll">
-              <table className="data-table">
+              <table className="data-table discovered-table">
                 <thead>
                   <tr>
                     <th>Fleet</th>
@@ -636,7 +654,9 @@ export function FleetPage({
                 <tbody>
                   {discovered.tpus.map((tpu) => (
                     <tr key={tpu.fleet}>
-                      <td className="monospace">{tpu.fleet}</td>
+                      <td className="monospace discovered-fleet" title={tpu.fleet}>
+                        {tpu.fleet}
+                      </td>
                       <td>{tpu.project}</td>
                       <td className="monospace">{tpu.zone}</td>
                       <td>{tpu.name}</td>

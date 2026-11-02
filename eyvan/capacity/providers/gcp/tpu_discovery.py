@@ -95,6 +95,8 @@ class DiscoverySnapshot:
     tpus: tuple[DiscoveredTpu, ...] = ()
     skipped: dict[str, str] = field(default_factory=dict)
     projects: tuple[str, ...] = ()
+    #: The gcloud account the listing ran as; ``None`` when it could not be named.
+    account: str | None = None
 
     def age_s(self, now: float | None = None) -> float:
         return max(0.0, (time.time() if now is None else now) - self.discovered_at)
@@ -126,6 +128,7 @@ class DiscoverySnapshot:
             "projects": list(self.projects),
             "tpus": [asdict(tpu) for tpu in self.tpus],
             "skipped": dict(self.skipped),
+            "account": self.account,
         }
 
     @classmethod
@@ -141,7 +144,9 @@ class DiscoverySnapshot:
         discovered_at = document.get("discovered_at")
         if not isinstance(discovered_at, (int, float)):
             raise ValueError("TPU discovery index has no timestamp")
+        account = document.get("account")
         return cls(
+            account=account if isinstance(account, str) and account else None,
             discovered_at=float(discovered_at),
             tpus=tpus,
             skipped={str(k): str(v) for k, v in skipped.items()} if isinstance(skipped, dict) else {},
@@ -196,7 +201,12 @@ def discover(
                 skipped[project] = note
             tpus.extend(DiscoveredTpu.from_node(node) for node in nodes)
     tpus.sort(key=lambda tpu: (tpu.project, tpu.zone, tpu.name))
-    return DiscoverySnapshot(discovered_at=clock(), tpus=tuple(tpus), skipped=skipped, projects=project_ids)
+    # Looked up on the type so a reader without an identity (a test double)
+    # is simply "unknown account" rather than asked for an attribute it lacks.
+    account = api.account() if callable(getattr(type(api), "account", None)) else None
+    return DiscoverySnapshot(
+        discovered_at=clock(), tpus=tuple(tpus), skipped=skipped, projects=project_ids, account=account
+    )
 
 
 @dataclass

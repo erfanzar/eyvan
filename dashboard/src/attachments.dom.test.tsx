@@ -342,6 +342,45 @@ describe("Add TPU", () => {
     expect(panel.textContent).not.toContain("Connected");
   });
 
+  it("names the listing account and every project with its TPU count, and clips long fleet names", async () => {
+    const [first, second] = mockDiscoveredTpus.tpus;
+    const longFleet = "tpu-ray-sc-foundation-us-east1-d-worker-90884e43-tpu-bb413fbf2";
+    const api: AttachmentClient = {
+      ...client(),
+      listDiscoveredTpus: vi.fn(async () => ({
+        ...mockDiscoveredTpus,
+        account: "someone@example.com",
+        projects: ["demo-empty", "demo-lab", "demo-research"],
+        tpus: [first, { ...second, fleet: longFleet }],
+      })),
+    };
+    render(
+      <FleetPage
+        cells={[]}
+        leases={[]}
+        onRefresh={async () => {}}
+        loadWarmth={async () => ({ observed_at: "", pools: [] })}
+        loadBilling={async () => ({
+          observed_at: "",
+          accrued_cost: 0,
+          idle_cost: 0,
+          cells: 0,
+          billed_seconds: 0,
+          idle_seconds: 0,
+          unpriced_cells: 0,
+        })}
+        loadLaunchLatency={async () => ({ observed_at: "", pools: [] })}
+        attachmentClient={api}
+      />,
+    );
+    const panel = await screen.findByRole("region", { name: "TPUs in your Google Cloud" });
+    await waitFor(() => expect(panel.textContent).toContain("someone@example.com"));
+    expect(panel.textContent).toContain("3 projects: demo-empty (0), demo-lab (1), demo-research (1)");
+    const fleetCell = Array.from(panel.querySelectorAll("td")).find((td) => td.textContent?.trim() === longFleet);
+    expect(fleetCell?.classList.contains("discovered-fleet")).toBe(true);
+    expect(fleetCell?.getAttribute("title")).toBe(longFleet);
+  });
+
   it("keeps the last discovered list and names the error when a refresh fails", async () => {
     const api: AttachmentClient = {
       ...client(),

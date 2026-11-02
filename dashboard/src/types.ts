@@ -52,6 +52,8 @@ export interface DiscoveredTpu {
 
 export interface DiscoveredTpus {
   discovered_at: number | null;
+  /** The gcloud account the listing ran as; null or absent when it could not be named. */
+  account?: string | null;
   projects: string[];
   tpus: DiscoveredTpu[];
   skipped: Record<string, string>;

@@ -206,3 +206,43 @@ def test_discovered_tpus_report_the_fleets_real_cell_state(tmp_path: Path, case:
         assert row["next_attempt_at"] is not None
     else:
         assert row["last_error"] is None
+
+
+def test_discovery_records_the_account_it_listed_as_and_old_indexes_still_load(tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex, DiscoverySnapshot, discover
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"nodes": [_NODE]})
+
+    api = TpuNodeApi(
+        token_source=lambda: "tok",
+        transport=httpx.MockTransport(handle),
+        account_source=lambda: "someone@example.com",
+    )
+    snapshot = discover(api, projects=["project-a"])
+    assert snapshot.account == "someone@example.com"
+
+    index = DiscoveryIndex(tmp_path / "discovered.json")
+    index.save(snapshot)
+    loaded = index.load()
+    assert loaded is not None and loaded.account == "someone@example.com"
+
+    # An index written before the account was recorded still loads, account unknown.
+    document = snapshot.as_document()
+    document.pop("account")
+    old = DiscoverySnapshot.from_document(document)
+    assert old.account is None and len(old.tpus) == 1
+
+
+def test_a_custom_token_source_never_shells_out_to_name_the_account() -> None:
+    api = TpuNodeApi(token_source=lambda: "tok", transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    assert api.account() is None
+
+
+def test_the_discovered_route_names_the_listing_account(tmp_path: Path) -> None:
+    from eyvan.capacity.providers.gcp.tpu_discovery import DiscoverySnapshot
+    from tests.test_attachments_api import ADMIN, _discovery_client
+
+    snapshot = DiscoverySnapshot(discovered_at=1000.0, projects=("project-a",), account="someone@example.com")
+    body = _discovery_client(tmp_path, snapshot).get("/api/v1/attachments/discovered", headers=ADMIN).json()
+    assert body["account"] == "someone@example.com"

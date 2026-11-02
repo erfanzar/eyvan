@@ -2935,6 +2935,40 @@ code,
   color: var(--text-faint);
   font-size: var(--text-2xs);
 }
+/* Cards in one grid row stretch to the tallest; the footer and the Drain
+   action are pushed to the bottom so they line up across the row even when
+   one card lists more resources (a TPU row) than its neighbour. */
+.cell-card {
+  display: flex;
+  flex-direction: column;
+}
+.cell-card-footer {
+  margin-top: auto;
+}
+/* The badge belongs to the cell name, not to the gap between name and zone. */
+.cell-card-heading {
+  align-items: start;
+}
+.cell-card-heading > .status-badge {
+  margin-top: 1px;
+}
+/* Panel actions sit at the right edge instead of taking half the header. */
+.panel-header > .attachment-actions {
+  flex: none;
+  margin-left: auto;
+}
+/* A long attached-TPU fleet name is clipped (full name on hover), never drawn
+   over the Project column beside it. */
+.discovered-table td.discovered-fleet {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.discovered-scope strong {
+  color: var(--text);
+  font-weight: 600;
+}
 .cell-card-error {
   display: flex;
   align-items: flex-start;
