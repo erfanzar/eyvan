@@ -437,12 +437,14 @@ def test_a_slice_is_not_failed_by_another_cells_missing_gpu(tmp_path: Path) -> N
     assert verdict.ready, verdict.detail
 
 
-def test_a_slice_smaller_than_its_cell_declares_names_the_setting(tmp_path: Path) -> None:
+def test_a_slice_smaller_than_its_cell_declares_stays_ready_and_names_the_setting(tmp_path: Path) -> None:
+    """Existing sliced cells keep working after an upgrade; the detail says what to set."""
+
     root = _dev(tmp_path, *EIGHT, "nvidiactl")
 
     verdict = check_gpu_readiness(8, required_indices=(4, 5, 6, 7), dev_root=root)
 
-    assert not verdict.ready
+    assert verdict.ready
     assert "gpu_devices_per_host" in verdict.detail
 
 

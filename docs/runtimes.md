@@ -210,8 +210,9 @@ layout. A four-GPU host split in two is `--gpu-devices 0,1` and `--gpu-devices 2
 
 When the pool's `accelerator_type` names a catalog row, set the pool's
 `gpu_devices_per_host` (`manual` and `onprem-ssh`) to the slice size, so ranks
-are planned on the slice's GPUs rather than the whole host's. A slice is held
-to its own devices in readiness; other GPUs on the host do not affect it.
+are planned on the slice's GPUs rather than the whole host's (readiness reports
+the mismatch until it is set). A slice is held to its own devices in readiness;
+other GPUs on the host do not affect it.
 
 What the list does:
 

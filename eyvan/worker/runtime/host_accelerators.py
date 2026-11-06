@@ -193,10 +193,13 @@ def evaluate_gpu_readiness(
             observed,
         )
     if required_indices and len(required_indices) < declared:
+        # Ready: the slice's own devices are present. Only gang planning reads
+        # the declared count, so say how to correct it rather than take a
+        # working cell out of service.
         return GpuReadiness(
-            False,
-            f"this worker's GPU slice has {len(required_indices)} devices but its cell declares {declared}; "
-            "set the pool's gpu_devices_per_host to the slice size",
+            True,
+            f"{len(required_indices)} GPU device nodes present for this slice; its cell declares {declared}, "
+            "so set the pool's gpu_devices_per_host to the slice size before running multi-rank GPU gangs on it",
             observed,
         )
     if not wanted and not required_indices:
