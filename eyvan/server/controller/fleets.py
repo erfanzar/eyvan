@@ -405,11 +405,20 @@ class _ControllerFleets:
             if not stale:
                 self._build_skew_warnings.pop(cell.id, None)
                 if cell.build_skew is not None:
-                    await self._release_build_skew_hold(cell, head_digest)
+                    try:
+                        proven = await self._cell_build_proven_current(cell, head_digest)
+                    except Exception as exc:
+                        logger.info("cell %s build could not be read; hold kept: %s", cell.id, exc)
+                        proven = False
+                    if proven:
+                        await self._release_build_skew_hold(cell, head_digest)
                 continue
             _cell, description = stale[0]
             policy = self._build_skew_policy(cell)
             if policy is BuildSkewPolicy.WARN:
+                if cell.build_skew is not None:
+                    # Held under an earlier policy; warn leaves cells in service.
+                    await self._release_build_skew_hold(cell, head_digest)
                 if self._build_skew_warnings.get(cell.id) != description:
                     self._build_skew_warnings[cell.id] = description
                     logger.warning(

@@ -249,12 +249,19 @@ def _publish_host(host_ip: str) -> str:
     return f"[{host_ip}]" if ":" in host_ip else host_ip
 
 
-#: Device nodes every GPU container needs beside its ``/dev/nvidiaN``.
-#: The control nodes GPU readiness already requires on a GPU host (``host_accelerators``).
-_NVIDIA_CONTROL_DEVICES = ("/dev/nvidiactl", "/dev/nvidia-uvm")
+#: Device nodes a GPU container uses beside its ``/dev/nvidiaN``.
+_NVIDIA_CONTROL_DEVICES = ("nvidiactl", "nvidia-uvm")
+
+#: ``/dev/shm`` for a GPU container whose configuration states neither ``ipc``
+#: nor ``shm_size``. Docker's 64 MiB default is too small for NCCL's
+#: shared-memory transport and DataLoader workers. The size is a tmpfs limit,
+#: charged to the container's memory only as it is used.
+_DEFAULT_GPU_SHM_SIZE = "16g"
 
 
-def gpu_device_arguments(gpu_devices: tp.Sequence[int] | None) -> tuple[str, ...]:
+def gpu_device_arguments(
+    gpu_devices: tp.Sequence[int] | None, device_root: str | os.PathLike[str] = "/dev"
+) -> tuple[str, ...]:
     """``--device`` options naming a GPU slice's device nodes, beside ``--gpus``.
 
     ``--gpus`` alone has the NVIDIA runtime add the device nodes to the
@@ -268,11 +275,18 @@ def gpu_device_arguments(gpu_devices: tp.Sequence[int] | None) -> tuple[str, ...
     Only a sliced cell names its devices: it knows exactly which ones it owns,
     and its worker refused to start without them. An unsliced cell (``None``)
     keeps ``--gpus all`` alone, as before.
+
+    A control node is named only when it exists: ``nvidia-uvm`` appears once its
+    module loads, and Docker refuses to create a container naming a missing
+    node. The NVIDIA hook still adds it when it loads the module.
     """
 
     if gpu_devices is None:
         return ()
-    nodes = [f"/dev/nvidia{device}" for device in gpu_devices] + list(_NVIDIA_CONTROL_DEVICES)
+    root = Path(device_root)
+    nodes = [f"/dev/nvidia{device}" for device in gpu_devices] + [
+        f"/dev/{name}" for name in _NVIDIA_CONTROL_DEVICES if (root / name).exists()
+    ]
     return tuple(option for node in nodes for option in ("--device", node))
 
 
@@ -321,7 +335,14 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         command_timeout_s: float = 315.0,
         docker_stop_timeout_s: int = 30,
         verify_docker: bool = True,
+        device_root: str | os.PathLike[str] = "/dev",
     ) -> None:
+        if gpu_devices is not None and container.privileged:
+            # --privileged hands the container every host device node, so the
+            # slice's cell-relative CUDA_VISIBLE_DEVICES would select another
+            # cell's GPUs.
+            raise ValueError("native container privileged cannot be combined with a GPU device slice")
+        self._device_root = Path(device_root)
         self._container_workload_directory = _absolute_path(str(workload_directory), "workload_directory")
         self._container_multihost_directory = _absolute_path(str(multihost_directory), "multihost_directory")
         self._runtime = _runtime_from_configuration(container, workload_directory=self._container_workload_directory)
@@ -496,7 +517,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         return '"device=' + ",".join(str(device) for device in self._gpu_devices) + '"'
 
     def _gpu_devices_arguments(self) -> tuple[str, ...]:
-        return gpu_device_arguments(self._gpu_devices)
+        return gpu_device_arguments(self._gpu_devices, self._device_root)
 
     @staticmethod
     def _mount_argument(mount: _ContainerMount) -> str:
@@ -595,21 +616,21 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
     def _ipc_arguments(self, *, gpu_requested: bool) -> tuple[str, ...]:
         """Return the ``docker run`` IPC namespace and ``/dev/shm`` options.
 
-        An unset ``ipc`` is Eyvan's choice, and it is made per workload: a GPU
-        workload gets the host's namespace -- Docker's 64 MiB ``/dev/shm`` is
-        too small for NCCL's shared-memory transport and DataLoader workers,
-        and fails as a bus error that never names the cause -- unless the
-        operator stated a ``shm_size``, which asks for a private namespace of
-        that size instead. Everything else keeps Docker's own default, which is
-        what every container launched before this option had.
+        An unset ``ipc`` keeps the container in its own namespace. A GPU
+        workload with no ``shm_size`` gets a larger ``/dev/shm`` there
+        (``_DEFAULT_GPU_SHM_SIZE``): Docker's 64 MiB is too small for NCCL's
+        shared-memory transport and DataLoader workers, and fails as a bus
+        error that never names the cause. The host's namespace only when
+        ``ipc: host`` asks for it.
         """
 
         ipc = self._runtime.ipc
-        if ipc is None and gpu_requested and self._runtime.shm_size is None:
-            ipc = "host"
+        shm_size = self._runtime.shm_size
+        if ipc is None and gpu_requested and shm_size is None:
+            shm_size = _DEFAULT_GPU_SHM_SIZE
         return (
             *(("--ipc", ipc) if ipc is not None else ()),
-            *(("--shm-size", self._runtime.shm_size) if self._runtime.shm_size is not None else ()),
+            *(("--shm-size", shm_size) if shm_size is not None else ()),
         )
 
     def _launch_command(

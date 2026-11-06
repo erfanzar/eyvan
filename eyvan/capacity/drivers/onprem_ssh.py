@@ -41,10 +41,11 @@ fence. A foreign, unreadable or missing marker never authorizes a stop.
 ``HMAC(root secret, management_uid, provider_generation)`` -- so the token a
 worker must accept changes whenever the incarnation does: an accepted apply, a
 reconcile under a new fence, a replacement cell. When the driver is built with
-the native-worker root secret it derives that token and pushes it on SSH
-*stdin* (never argv) into ``{state_dir}/worker-secret``, mode 0600 from
-creation and replaced atomically, inside the same marker lock and after the
-same ownership check that guards ``start_command``. The host's unit copies that
+the native-worker root secret and the pool sets ``push_worker_token: true``, it
+derives that token and pushes it on SSH *stdin* (never argv) into
+``{state_dir}/worker-secret``, mode 0600 from creation and replaced atomically,
+inside the same marker lock and after the same ownership check that guards
+``start_command``. The host's unit copies that
 persistent file into its private runtime directory before every start, exactly
 as Eyvan's own bootstrapped unit does, because the worker deletes the file it
 reads. A host whose worker was never told the current token answers every
@@ -259,8 +260,10 @@ case "$action" in
       fi
       if [ "$#" -gt 0 ]; then
         "$@" >&2 || { status=$?; printf 'lifecycle command exited %s\n' "$status" >&2; exit 8; }
+        stamp "$identity" || exit 5
       fi
-      stamp "$identity" || exit 5
+      # With no command nothing restarted, so a running worker still holds its
+      # old token: the record stays "pending" until a start runs.
     elif [ "$changed" -eq 1 ]; then
       stamp pending || exit 5
     fi
@@ -581,6 +584,13 @@ class OnPremSshCapacityDriver:
             raise ValueError("on-premises capacity state_dir must be an absolute path")
         return _safe_value("state_dir", value.rstrip("/") or "/")
 
+    @staticmethod
+    def _push_worker_token(options: tp.Mapping[str, JsonValue]) -> bool:
+        value = options.get("push_worker_token", False)
+        if not isinstance(value, bool):
+            raise ValueError("on-premises capacity push_worker_token must be true or false")
+        return value
+
     def _validate_desired(self, desired: tp.Mapping[str, JsonValue]) -> JsonObject:
         """Validate one apply document into the fields persisted on the record."""
 
@@ -611,6 +621,7 @@ class OnPremSshCapacityDriver:
             "state_dir": self._state_dir(options),
             "start_command": list(self._command(options, "start_command")),
             "stop_command": list(self._command(options, "stop_command")),
+            "push_worker_token": self._push_worker_token(options),
         }
 
     # ---- durable record helpers, shared in shape with manual.py and k8s -----
@@ -1154,6 +1165,7 @@ class OnPremSshCapacityDriver:
                     record.metadata["state_dir"] = state_dir
                     record.metadata["start_command"] = list(start_command)
                     record.metadata["stop_command"] = validated["stop_command"]
+                    record.metadata["push_worker_token"] = validated["push_worker_token"]
                     # Host identity survives a drain changing the durable fence.
                     record.metadata["claim_fence"] = marker_fingerprint(context.fencing_token)
                     # Derived, not random: a replay or a second store applying
@@ -1174,7 +1186,9 @@ class OnPremSshCapacityDriver:
                 provider_generation = captured.get("provider_generation", record.provider_generation)
                 management_uid = self._record_string(record, "management_uid", stable_id("onprem-ssh", cell_id))
                 fence = marker_fingerprint(context.fencing_token)
-                worker_token = self._worker_token(management_uid, provider_generation)
+                worker_token = (
+                    self._worker_token(management_uid, provider_generation) if validated["push_worker_token"] else None
+                )
 
                 def revalidate(phase: str) -> None:
                     self._revalidate_record_owner(
@@ -1286,7 +1300,11 @@ class OnPremSshCapacityDriver:
                 start_command = tuple(
                     part for part in tp.cast(list, record.metadata.get("start_command", [])) if isinstance(part, str)
                 )
-                worker_token = self._worker_token(management_uid, provider_generation)
+                worker_token = (
+                    self._worker_token(management_uid, provider_generation)
+                    if record.metadata.get("push_worker_token") is True
+                    else None
+                )
 
                 def revalidate(phase: str) -> None:
                     self._revalidate_record_owner(

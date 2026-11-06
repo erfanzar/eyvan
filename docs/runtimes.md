@@ -134,7 +134,8 @@ The complete worked shape is
 
 A container that requests a GPU (`gpu > 0` per replica) is launched with
 `--gpus`, `--ulimit memlock=-1:-1` and, unless the container block says
-otherwise, `--ipc host`. Docker's own defaults are a 64 MiB `/dev/shm` and
+otherwise, a private `/dev/shm` of 16 GiB (`--shm-size 16g`). The host's IPC
+namespace is shared only with `ipc: host`. Docker's own defaults are a 64 MiB `/dev/shm` and
 dockerd's memlock limit; the first makes NCCL's shared-memory transport and
 PyTorch DataLoader workers die with a bus error, and the transient unit's
 `LimitMEMLOCK=infinity` reaches only the `docker` client, not the container.
@@ -142,8 +143,8 @@ Two container fields change the IPC choice:
 
 | Field | Values | Effect |
 |---|---|---|
-| `ipc` | `host`, `private`, unset | Unset: host IPC for GPU workloads with no `shm_size`, Docker's default for everything else. Set: passed as `--ipc` for every workload. |
-| `shm_size` | positive integer with optional `b`/`k`/`m`/`g`, e.g. `16g` | A private `/dev/shm` of that size; a GPU workload then stays in a private namespace. Refused beside `ipc: host`, which ignores it. |
+| `ipc` | `host`, `private`, unset | Unset: a private namespace; GPU workloads with no `shm_size` get `--shm-size 16g`. Set: passed as `--ipc` for every workload. |
+| `shm_size` | positive integer with optional `b`/`k`/`m`/`g`, e.g. `16g` | A private `/dev/shm` of that size. Refused beside `ipc: host`, which ignores it. |
 
 ### Container network and lockdown
 

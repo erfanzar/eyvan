@@ -402,6 +402,7 @@ def test_real_script_pushes_the_agents_token_and_restarts_only_on_identity_chang
 
     driver, rack, desired = driver_and_desired(tmp_path)
     driver.shared_secret = "root-secret-for-the-real-script-test"
+    desired["provider_options"]["push_worker_token"] = True
 
     def token_file(host):
         return rack.root / host / "state" / "worker-secret"
@@ -430,3 +431,18 @@ def test_real_script_pushes_the_agents_token_and_restarts_only_on_identity_chang
     for host in ("rack-a", "rack-b"):
         assert token_file(host).read_text() == agent_token(moved)
     assert rack.events() == ["start", "start", "start", "start"]
+
+
+def test_real_script_leaves_a_token_push_without_a_start_pending(tmp_path):
+    """Nothing restarted, so the identity is not recorded as started and a later start still runs."""
+
+    driver, rack, desired = driver_and_desired(tmp_path)
+    driver.shared_secret = "root-secret-for-the-real-script-test"
+    desired["provider_options"]["push_worker_token"] = True
+    desired["provider_options"].pop("start_command")
+
+    assert driver.apply_capacity("cell-a", desired, context("apply")).state is CapacityStatus.HEALTHY
+    for host in ("rack-a", "rack-b"):
+        assert (rack.root / host / "state" / "worker-secret").exists()
+        assert (rack.root / host / "state" / "eyvan-cell.marker.started").read_text().strip() == "pending"
+    assert rack.events() == []

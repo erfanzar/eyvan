@@ -66,14 +66,30 @@ def _native(tmp_path: Path, systemd: FakeSystemd, devices: tuple[int, ...] | Non
     )
 
 
-def _container(tmp_path: Path, daemon: FakeDockerSystemd, devices: tuple[int, ...] | None = (4, 5, 6, 7)):
+def _fake_dev(tmp_path: Path, names: tuple[str, ...] = ("nvidiactl", "nvidia-uvm")) -> Path:
+    root = tmp_path / "dev"
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (root / name).touch()
+    return root
+
+
+def _container(
+    tmp_path: Path,
+    daemon: FakeDockerSystemd,
+    devices: tuple[int, ...] | None = (4, 5, 6, 7),
+    *,
+    device_root: Path | None = None,
+    privileged: bool = False,
+):
     return DockerContainerExecutor(
         tmp_path,
-        container=NativeContainerConfig(image=_IMAGE),
+        container=NativeContainerConfig(image=_IMAGE, privileged=privileged),
         command_runner=daemon,
         boot_id_reader=lambda: "boot-a",
         use_exit_type_cgroup=True,
         gpu_devices=devices,
+        device_root=device_root if device_root is not None else _fake_dev(tmp_path),
     )
 
 
@@ -103,6 +119,30 @@ def test_device_lists_are_sorted_and_refused_when_malformed() -> None:
 
 
 # --- container path ----------------------------------------------------------
+
+
+def test_container_refuses_privileged_beside_a_gpu_slice(tmp_path: Path) -> None:
+    """--privileged exposes every GPU, so the slice's cell-relative indices would pick others."""
+
+    with pytest.raises(ValueError, match="privileged cannot be combined with a GPU device slice"):
+        _container(tmp_path, FakeDockerSystemd(images={_IMAGE}), privileged=True)
+
+
+def test_container_privileged_without_a_slice_is_still_accepted(tmp_path: Path) -> None:
+    _container(tmp_path, FakeDockerSystemd(images={_IMAGE}), devices=None, privileged=True)
+
+
+def test_container_names_only_control_nodes_that_exist(tmp_path: Path) -> None:
+    """Before nvidia_uvm loads there is no /dev/nvidia-uvm, and naming it would fail docker create."""
+
+    daemon = FakeDockerSystemd(images={_IMAGE})
+    executor = _container(tmp_path, daemon, device_root=_fake_dev(tmp_path, ("nvidiactl",)))
+
+    executor.submit(_spec(), _context())
+
+    docker = _docker_run(daemon)
+    devices = [docker[i + 1] for i, part in enumerate(docker) if part == "--device"]
+    assert devices == ["/dev/nvidia4", "/dev/nvidia5", "/dev/nvidia6", "/dev/nvidia7", "/dev/nvidiactl"]
 
 
 def test_container_requests_only_the_cells_devices_as_one_csv_quoted_argument(tmp_path: Path) -> None:

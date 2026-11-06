@@ -138,7 +138,7 @@ class FakeSshFleet:
                         return RemoteResult(
                             exit_code=8, stdout="", stderr=f"lifecycle command exited {self.lifecycle_exit_code}"
                         )
-                self.started[host] = identity
+                    self.started[host] = identity
             elif changed:
                 self.started[host] = "pending"
             return RemoteResult(exit_code=0, stdout=payload, stderr="")
@@ -430,6 +430,7 @@ ROOT_SECRET = "root-secret-for-onprem-tests-0123456789"
 def _secret_driver(tmp_path: Path) -> tuple[OnPremSshCapacityDriver, FakeSshFleet, dict]:
     driver, fleet, desired = _driver(tmp_path)
     driver.shared_secret = ROOT_SECRET
+    desired["provider_options"]["push_worker_token"] = True
     return driver, fleet, desired
 
 
@@ -837,3 +838,39 @@ def test_the_marker_script_finishes_a_pending_start_and_spares_a_legacy_claim(tm
     assert not marker.with_name("eyvan-cell.marker.started").exists()
     assert _sh(marker, "reclaim", "cell-a", 1, command=command).returncode == 0
     assert _runs(log) == ["unset", "unset"]
+
+
+def test_the_token_is_not_pushed_unless_the_pool_asks(tmp_path) -> None:
+    """A host that manages its own worker-secret keeps it: pushing is opt-in."""
+
+    driver, fleet, desired = _driver(tmp_path)
+    driver.shared_secret = ROOT_SECRET
+
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    assert fleet.secret_pushes == []
+    assert fleet.secrets == {}
+
+
+def test_a_pool_refuses_a_non_boolean_push_worker_token(tmp_path) -> None:
+    driver, _fleet, desired = _secret_driver(tmp_path)
+    desired["provider_options"]["push_worker_token"] = "yes"
+
+    with pytest.raises(ValueError, match="push_worker_token must be true or false"):
+        driver.apply_capacity("cell-a", desired, _context("apply"))
+
+
+def test_a_token_pushed_with_nothing_to_start_is_not_recorded_as_started(tmp_path) -> None:
+    """With no start command the running worker still holds its old token.
+
+    Recording the new identity as started would stop every later reconcile from
+    pushing or starting again, leaving the worker on 401s for good.
+    """
+
+    driver, fleet, desired = _secret_driver(tmp_path)
+    desired["provider_options"].pop("start_command")
+
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    for host in HOSTS:
+        assert fleet.started.get(host) == "pending"

@@ -1560,6 +1560,40 @@ class _ControllerWorkloadCommands:
         except ConflictError as exc:
             raise StaleOutboxCommand("unlaunchable attempt lost ownership of the dispatch") from exc
 
+    async def _read_cell_builds(self, cell: CellRecord) -> tuple[str | None, list[dict[str, object]] | None]:
+        """Return the build digest a cell's agent reports and its workers' build entries.
+
+        ``None`` for either part that could not be read.
+        """
+
+        agent = self._agent_factory(cell)
+
+        def _read() -> tuple[str | None, list[dict[str, object]] | None]:
+            try:
+                build = agent.build()
+            except AttributeError:
+                return None, None  # an agent with no build surface cannot be judged
+            workers: list[dict[str, object]] | None
+            try:
+                workers = agent.worker_builds(cell.id)
+            except AttributeError:
+                workers = None
+            return (build.source_digest if build is not None else None), workers
+
+        return await asyncio.to_thread(_read)
+
+    async def _cell_build_proven_current(self, cell: CellRecord, head_digest: str) -> bool:
+        """Return whether the agent and every worker rank positively report ``head_digest``.
+
+        Stricter than an empty stale report, which also covers builds that
+        could not be read: a held cell returns to service only on proof.
+        """
+
+        reported, workers = await self._read_cell_builds(cell)
+        if reported != head_digest or not workers:
+            return False
+        return all(_worker_source_digest(worker) == head_digest for worker in workers)
+
     async def _stale_build_report(
         self,
         cells: tp.Sequence[CellRecord],
@@ -1578,25 +1612,7 @@ class _ControllerWorkloadCommands:
 
         stale: list[tuple[CellRecord, str]] = []
         for cell in cells:
-            bound_agent = self._agent_factory(cell)
-            bound_cell_id = cell.id
-
-            def _read(
-                bound_agent: tp.Any = bound_agent,
-                bound_cell_id: str = bound_cell_id,
-            ) -> tuple[str | None, list[dict[str, object]] | None]:
-                try:
-                    build = bound_agent.build()
-                except AttributeError:
-                    return None, None  # an agent with no build surface cannot be judged
-                workers: list[dict[str, object]] | None
-                try:
-                    workers = bound_agent.worker_builds(bound_cell_id)
-                except AttributeError:
-                    workers = None
-                return (build.source_digest if build is not None else None), workers
-
-            reported, workers = await asyncio.to_thread(_read)
+            reported, workers = await self._read_cell_builds(cell)
             parts: list[str] = []
             if reported is not None and reported != head_digest:
                 parts.append(f"agent {reported[:12]}")

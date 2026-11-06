@@ -709,11 +709,15 @@ def _option_value(docker: tuple[str, ...], option: str) -> str | None:
     return docker[docker.index(option) + 1] if option in docker else None
 
 
-def test_container_gpu_workload_gets_host_ipc_and_an_unlimited_memlock_by_default(tmp_path: Path) -> None:
+def test_container_gpu_workload_gets_a_private_large_shm_and_an_unlimited_memlock_by_default(
+    tmp_path: Path,
+) -> None:
     """Docker's 64 MiB ``/dev/shm`` and dockerd's memlock must not reach a GPU job.
 
-    ``LimitMEMLOCK=infinity`` on the transient unit applies to the ``docker``
-    client only, so the container has to be told directly.
+    The job stays in its own IPC namespace: the host's is shared only when the
+    configuration asks for it. ``LimitMEMLOCK=infinity`` on the transient unit
+    applies to the ``docker`` client only, so the container has to be told
+    directly.
     """
 
     daemon = FakeDockerSystemd(images={"registry.example/easydel:latest"})
@@ -722,8 +726,8 @@ def test_container_gpu_workload_gets_host_ipc_and_an_unlimited_memlock_by_defaul
     executor.submit(_spec(resources={"gpu": 8}), _context())
 
     docker = _docker_run(daemon)
-    assert _option_value(docker, "--ipc") == "host"
-    assert "--shm-size" not in docker
+    assert "--ipc" not in docker
+    assert _option_value(docker, "--shm-size") == "16g"
     assert _option_value(docker, "--ulimit") == "memlock=-1:-1"
     assert _option_value(docker, "--gpus") == "all"
 

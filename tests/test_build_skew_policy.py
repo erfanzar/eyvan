@@ -331,3 +331,64 @@ def test_a_held_pool_cell_is_supply_on_its_way_back_not_a_reason_to_launch() -> 
 
     assert demand[pool.id].virtual_worker_counts == ()
     assert held.id in simulation.acquiring_cell_ids
+
+
+class _RestartingAgent(_UpgradeableAgent):
+    """An agent that, while restarting, can report neither its own build nor its workers'."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.restarting = False
+
+    def build(self):
+        return None if self.restarting else super().build()
+
+    def worker_builds(self, cell_id):
+        return None if self.restarting else super().worker_builds(cell_id)
+
+
+@pytest.mark.asyncio
+async def test_a_hold_is_kept_until_every_build_is_proven_current(monkeypatch) -> None:
+    _plane_digest(monkeypatch)
+    agent = _RestartingAgent(worker_digest=STALE)
+    repository, _service, controller = _controller(agent)
+    await _put(repository, _cell("cell-onprem", "manual"))
+    assert await controller.recycle_stale_build_cells_once() == 0
+    assert (await _get(repository, "cell-onprem")).build_skew is not None
+
+    # Nothing readable is not proof of a match: the hold stays.
+    agent.restarting = True
+    assert await controller.recycle_stale_build_cells_once() == 0
+    assert (await _get(repository, "cell-onprem")).build_skew is not None
+
+    # The agent answers on the plane's build but its worker still cannot say.
+    agent.restarting = False
+    agent.worker_builds = lambda cell_id: [{"rank": 0, "endpoint": "http://w0:8100", "build": None}]
+    assert await controller.recycle_stale_build_cells_once() == 0
+    assert (await _get(repository, "cell-onprem")).build_skew is not None
+
+    del agent.worker_builds
+    agent.worker_digest = PLANE
+    assert await controller.recycle_stale_build_cells_once() == 0
+    assert (await _get(repository, "cell-onprem")).build_skew is None
+    assert await _actions(repository, "cell-onprem") == [BUILD_SKEW_HELD_ACTION, BUILD_SKEW_CLEARED_ACTION]
+
+
+@pytest.mark.asyncio
+async def test_warn_releases_a_hold_made_under_an_earlier_policy(monkeypatch) -> None:
+    _plane_digest(monkeypatch)
+    agent = _UpgradeableAgent(worker_digest=STALE)
+    repository, service, controller = _controller(agent)
+    await _put(repository, _cell("cell-onprem", "manual"))
+    assert await controller.recycle_stale_build_cells_once() == 0
+    assert (await _get(repository, "cell-onprem")).build_skew is not None
+
+    warned = EyvanController(
+        repository,
+        service,
+        settings=EyvanSettings(build_skew_policy="warn"),
+        agent_factory=lambda _cell: agent,
+    )
+    assert await warned.recycle_stale_build_cells_once() == 0
+    cell = await _get(repository, "cell-onprem")
+    assert cell.state is CellState.READY and cell.build_skew is None
