@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import os
+import secrets
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -401,7 +402,7 @@ def test_real_script_pushes_the_agents_token_and_restarts_only_on_identity_chang
     from eyvan.worker.runtime.native_bootstrap import derive_native_worker_token
 
     driver, rack, desired = driver_and_desired(tmp_path)
-    driver.shared_secret = "root-secret-for-the-real-script-test"
+    driver.shared_secret = secrets.token_hex(16)
     desired["provider_options"]["push_worker_token"] = True
 
     def token_file(host):
@@ -437,7 +438,7 @@ def test_real_script_leaves_a_token_push_without_a_start_pending(tmp_path):
     """Nothing restarted, so the identity is not recorded as started and a later start still runs."""
 
     driver, rack, desired = driver_and_desired(tmp_path)
-    driver.shared_secret = "root-secret-for-the-real-script-test"
+    driver.shared_secret = secrets.token_hex(16)
     desired["provider_options"]["push_worker_token"] = True
     desired["provider_options"].pop("start_command")
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import os
 import pwd
+import secrets
 import struct
 import typing as tp
 from pathlib import Path
@@ -246,8 +247,9 @@ def test_a_sliced_worker_requires_its_own_gpus_even_on_a_full_count_host(
         "check_gpu_readiness",
         functools.partial(check_gpu_readiness, dev_root=root),
     )
+    token = secrets.token_hex(16)
     app = native_worker.create_native_worker_app(
-        state_dir=tmp_path / "state", secret="worker-secret", systemd_transient=True, gpu_devices=(6, 7)
+        state_dir=tmp_path / "state", secret=token, systemd_transient=True, gpu_devices=(6, 7)
     )
 
     body = (
@@ -255,7 +257,7 @@ def test_a_sliced_worker_requires_its_own_gpus_even_on_a_full_count_host(
         .get(
             "/api/v1/accelerators",
             params={"expected_gpu_devices": 8},
-            headers={"Authorization": "Bearer worker-secret"},
+            headers={"Authorization": f"Bearer {token}"},
         )
         .json()
     )

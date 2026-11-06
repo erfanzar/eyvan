@@ -154,18 +154,18 @@ _EXIT_LIFECYCLE = 8
 #: persistent file rather than the runtime directory: the worker deletes the
 #: file it reads, so the unit copies this one in before every start, and a
 #: reboot or ``Restart=always`` finds it still there.
-WORKER_SECRET_FILE = "worker-secret"
+WORKER_TOKEN_FILE = "worker-secret"
 
 #: The one line the driver may prepend to ``MARKER_SCRIPT`` on stdin. A shell
 #: assignment of a value checked to be lowercase hex, never exported, so the
 #: token reaches neither a process's argv nor the lifecycle command's
 #: environment; ``printf`` is a builtin in every POSIX ``sh`` this runs under.
-_WORKER_SECRET_PREAMBLE = "worker_secret={token}\n"
+_WORKER_TOKEN_PREAMBLE = "worker_secret={token}\n"
 
 #: The whole remote protocol. Sent on stdin to ``sh -s`` so no value is ever
 #: interpolated into a command string, and shipped as one constant so the
 #: semantics an operator audits are the semantics that run. The only thing
-#: ever placed before it is ``_WORKER_SECRET_PREAMBLE``.
+#: ever placed before it is ``_WORKER_TOKEN_PREAMBLE``.
 MARKER_SCRIPT = r"""
 set -u
 worker_secret=${worker_secret:-}
@@ -744,7 +744,7 @@ class OnPremSshCapacityDriver:
 
         if worker_token is None:
             return MARKER_SCRIPT
-        return _WORKER_SECRET_PREAMBLE.format(token=worker_token) + MARKER_SCRIPT
+        return _WORKER_TOKEN_PREAMBLE.format(token=worker_token) + MARKER_SCRIPT
 
     def _run_marker(
         self,
@@ -1585,7 +1585,7 @@ class OnPremSshCapacityDriver:
 __all__ = (
     "MARKER_SCRIPT",
     "MAX_HOSTS",
-    "WORKER_SECRET_FILE",
+    "WORKER_TOKEN_FILE",
     "HostMarker",
     "OnPremSshCapacityDriver",
     "OpenSshCommandRunner",

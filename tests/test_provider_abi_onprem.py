@@ -15,6 +15,7 @@ exactly that reason.
 from __future__ import annotations
 
 import re
+import secrets
 import subprocess
 import typing as tp
 from contextlib import contextmanager
@@ -33,7 +34,7 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.capacity.drivers.onprem_ssh import (
     MARKER_SCRIPT,
-    WORKER_SECRET_FILE,
+    WORKER_TOKEN_FILE,
     OnPremSshCapacityDriver,
     RemoteResult,
     RemoteTransportError,
@@ -424,7 +425,7 @@ def test_a_stale_fencing_token_cannot_release_the_rack(tmp_path) -> None:
     assert set(fleet.markers) == set(HOSTS)
 
 
-ROOT_SECRET = "root-secret-for-onprem-tests-0123456789"
+ROOT_SECRET = secrets.token_hex(20)
 
 
 def _secret_driver(tmp_path: Path) -> tuple[OnPremSshCapacityDriver, FakeSshFleet, dict]:
@@ -786,7 +787,7 @@ def test_the_marker_script_writes_the_pushed_token_root_only_before_starting(tmp
     claimed = _sh(marker, "claim", "cell-a", 1, command=command, secret=token)
 
     assert claimed.returncode == 0, claimed.stderr
-    secret = marker.parent / WORKER_SECRET_FILE
+    secret = marker.parent / WORKER_TOKEN_FILE
     assert secret.read_text() == token
     assert secret.stat().st_mode & 0o777 == 0o600
     assert _runs(log) == ["unset"]
@@ -794,7 +795,7 @@ def test_the_marker_script_writes_the_pushed_token_root_only_before_starting(tmp
     assert sorted(path.name for path in marker.parent.iterdir()) == [
         "eyvan-cell.marker",
         "eyvan-cell.marker.started",
-        WORKER_SECRET_FILE,
+        WORKER_TOKEN_FILE,
     ]
 
 
@@ -807,15 +808,15 @@ def test_the_marker_script_reclaims_without_restarting_an_unchanged_worker(tmp_p
 
     assert _sh(marker, "reclaim", "cell-a", 1, command=command, secret="b" * 64).returncode == 0
     assert _runs(log) == ["unset"]
-    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "a" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "a" * 64
 
     assert _sh(marker, "reclaim", "cell-a", 2, "e" * 32, command=command, secret="c" * 64).returncode == 0
     assert _runs(log) == ["unset", "unset"]
-    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "c" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "c" * 64
 
     assert _sh(marker, "reclaim", "cell-b", 9, command=command, secret="d" * 64).returncode == 3
     assert _runs(log) == ["unset", "unset"]
-    assert (tmp_path / WORKER_SECRET_FILE).read_text() == "c" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "c" * 64
 
 
 def test_the_marker_script_finishes_a_pending_start_and_spares_a_legacy_claim(tmp_path) -> None:
