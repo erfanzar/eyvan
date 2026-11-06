@@ -21,6 +21,7 @@ from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import CapacityProviderError, MutationContext
 from eyvan.capacity.drivers.onprem_ssh import (
     MARKER_SCRIPT,
+    WORKER_TOKEN_FILE,
     OnPremSshCapacityDriver,
     OpenSshCommandRunner,
     RemoteResult,
@@ -444,6 +445,6 @@ def test_real_script_leaves_a_token_push_without_a_start_pending(tmp_path):
 
     assert driver.apply_capacity("cell-a", desired, context("apply")).state is CapacityStatus.HEALTHY
     for host in ("rack-a", "rack-b"):
-        assert (rack.root / host / "state" / "worker-secret").exists()
+        assert (rack.root / host / "state" / WORKER_TOKEN_FILE).exists()
         assert (rack.root / host / "state" / "eyvan-cell.marker.started").read_text().strip() == "pending"
     assert rack.events() == []

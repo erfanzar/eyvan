@@ -45,6 +45,9 @@ from eyvan.worker.runtime.registry import ExecutionDriverResolver
 
 H200 = "hgx-h200-8g"
 EIGHT = tuple(f"nvidia{index}" for index in range(8))
+#: Generated per run, so no credential-looking literal lives in the repository.
+WORKER_TOKEN = secrets.token_hex(16)
+ROOT_TOKEN = secrets.token_hex(20)
 
 
 def _dev(tmp_path: Path, *names: str) -> Path:
@@ -202,7 +205,7 @@ def _worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *nodes: str) -> Tes
         "check_gpu_readiness",
         functools.partial(check_gpu_readiness, dev_root=root),
     )
-    app = native_worker.create_native_worker_app(state_dir=tmp_path / "state", secret="worker-secret")
+    app = native_worker.create_native_worker_app(state_dir=tmp_path / "state", secret=WORKER_TOKEN)
     return TestClient(app)
 
 
@@ -212,7 +215,7 @@ def test_the_worker_reports_a_short_host_as_not_ready(tmp_path: Path, monkeypatc
     response = client.get(
         "/api/v1/accelerators",
         params={"expected_gpu_devices": 8},
-        headers={"Authorization": "Bearer worker-secret"},
+        headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
     )
 
     assert response.status_code == 200
@@ -229,7 +232,7 @@ def test_the_worker_reports_a_full_host_as_ready(tmp_path: Path, monkeypatch: py
     body = client.get(
         "/api/v1/accelerators",
         params={"expected_gpu_devices": 8},
-        headers={"Authorization": "Bearer worker-secret"},
+        headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
     ).json()
 
     assert body["ready"] is True
@@ -370,7 +373,7 @@ def _resolver_against(
         return real_client(base_url=kwargs["base_url"], transport=httpx.MockTransport(handler))
 
     monkeypatch.setattr(native_remote.httpx, "Client", client_factory)
-    return ExecutionDriverResolver(backend="eyvan-native", native_worker_token="root-secret"), paths
+    return ExecutionDriverResolver(backend="eyvan-native", native_worker_token=ROOT_TOKEN), paths
 
 
 def test_an_h200_cell_whose_host_is_short_is_not_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
