@@ -782,7 +782,7 @@ def test_the_marker_script_writes_the_pushed_token_root_only_before_starting(tmp
 
     marker = tmp_path / "state" / "eyvan-cell.marker"
     command, log = _launcher(tmp_path)
-    token = "a" * 64
+    token = secrets.token_hex(32)
 
     claimed = _sh(marker, "claim", "cell-a", 1, command=command, secret=token)
 
@@ -804,19 +804,20 @@ def test_the_marker_script_reclaims_without_restarting_an_unchanged_worker(tmp_p
 
     marker = tmp_path / "eyvan-cell.marker"
     command, log = _launcher(tmp_path)
-    assert _sh(marker, "claim", "cell-a", 1, command=command, secret="a" * 64).returncode == 0
+    first, unchanged, moved, foreign = (secrets.token_hex(32) for _ in range(4))
+    assert _sh(marker, "claim", "cell-a", 1, command=command, secret=first).returncode == 0
 
-    assert _sh(marker, "reclaim", "cell-a", 1, command=command, secret="b" * 64).returncode == 0
+    assert _sh(marker, "reclaim", "cell-a", 1, command=command, secret=unchanged).returncode == 0
     assert _runs(log) == ["unset"]
-    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "a" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == first
 
-    assert _sh(marker, "reclaim", "cell-a", 2, "e" * 32, command=command, secret="c" * 64).returncode == 0
+    assert _sh(marker, "reclaim", "cell-a", 2, "e" * 32, command=command, secret=moved).returncode == 0
     assert _runs(log) == ["unset", "unset"]
-    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "c" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == moved
 
-    assert _sh(marker, "reclaim", "cell-b", 9, command=command, secret="d" * 64).returncode == 3
+    assert _sh(marker, "reclaim", "cell-b", 9, command=command, secret=foreign).returncode == 3
     assert _runs(log) == ["unset", "unset"]
-    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == "c" * 64
+    assert (tmp_path / WORKER_TOKEN_FILE).read_text() == moved
 
 
 def test_the_marker_script_finishes_a_pending_start_and_spares_a_legacy_claim(tmp_path) -> None:

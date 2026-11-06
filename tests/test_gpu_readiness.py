@@ -280,7 +280,7 @@ def test_the_accelerator_route_requires_the_worker_credential(tmp_path: Path, mo
 
 def _remote(handler: tp.Callable[[httpx.Request], httpx.Response]) -> NativeRemoteExecutor:
     client = httpx.Client(base_url="http://10.0.0.20:8100", transport=httpx.MockTransport(handler))
-    return NativeRemoteExecutor("http://10.0.0.20:8100", secret="s", client=client)
+    return NativeRemoteExecutor("http://10.0.0.20:8100", secret=WORKER_TOKEN, client=client)
 
 
 def _report(ready: bool, detail: str) -> httpx.Response:
@@ -330,7 +330,7 @@ def test_a_multi_host_cell_names_the_host_that_is_short() -> None:
 
     endpoints = ("http://10.0.0.20:8100", "http://10.0.0.21:8100")
     clients = [httpx.Client(base_url=endpoint, transport=httpx.MockTransport(handler)) for endpoint in endpoints]
-    executor = NativeSliceExecutor(endpoints, secret="s", clients=clients)
+    executor = NativeSliceExecutor(endpoints, secret=WORKER_TOKEN, clients=clients)
 
     ready, detail = executor.gpu_readiness(8)
 

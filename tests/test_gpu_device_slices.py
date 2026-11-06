@@ -17,6 +17,7 @@ argv and environment Eyvan hands Docker and systemd.
 from __future__ import annotations
 
 import csv
+import secrets
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,8 @@ from eyvan.worker.runtime.native_worker import create_native_worker_app, parse_g
 from eyvan.worker.runtime.systemd_transient import SystemdTransientServiceExecutor, validate_gpu_devices
 
 _IMAGE = "registry.example/easydel:latest"
+#: Generated per run, so no credential-looking literal lives in the repository.
+WORKER_TOKEN = secrets.token_hex(16)
 
 
 def _context(key: str = "submit-1") -> MutationContext:
@@ -338,7 +341,7 @@ def test_worker_cli_reads_the_flag_or_its_environment_default(monkeypatch, tmp_p
     captured: list[dict] = []
     monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
     monkeypatch.setattr(native_worker, "create_native_worker_app", lambda **kwargs: captured.append(kwargs))
-    base = ["--secret", "test-secret", "--state-dir", str(tmp_path), "--systemd-transient"]
+    base = ["--secret", WORKER_TOKEN, "--state-dir", str(tmp_path), "--systemd-transient"]
 
     assert native_worker.main([*base, "--gpu-devices", "7,6"]) == 0
     assert captured[-1]["gpu_devices"] == (6, 7)
@@ -372,7 +375,9 @@ def test_worker_cli_names_a_bad_device_list(monkeypatch, tmp_path: Path, capsys,
         env_file.write_text(json.dumps(runtime_env), encoding="utf-8")
         extra = ["--runtime-env-file", str(env_file)]
     with pytest.raises(SystemExit) as error:
-        native_worker.main(["--secret", "s", "--state-dir", str(tmp_path), "--systemd-transient", *extra, *arguments])
+        native_worker.main(
+            ["--secret", WORKER_TOKEN, "--state-dir", str(tmp_path), "--systemd-transient", *extra, *arguments]
+        )
     assert error.value.code == 2
     assert message in capsys.readouterr().err
 
@@ -382,10 +387,10 @@ def test_worker_cli_refuses_a_device_list_without_the_systemd_executor(monkeypat
 
     monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
     with pytest.raises(SystemExit):
-        native_worker.main(["--secret", "s", "--state-dir", str(tmp_path), "--gpu-devices", "0"])
+        native_worker.main(["--secret", WORKER_TOKEN, "--state-dir", str(tmp_path), "--gpu-devices", "0"])
     assert "--gpu-devices requires --systemd-transient" in capsys.readouterr().err
     with pytest.raises(ValueError, match="GPU devices require systemd_transient"):
-        create_native_worker_app(state_dir=tmp_path, secret="s", gpu_devices=(0,))
+        create_native_worker_app(state_dir=tmp_path, secret=WORKER_TOKEN, gpu_devices=(0,))
 
 
 def test_exec_beside_a_sliced_workload_is_confined_like_the_workload(tmp_path: Path) -> None:

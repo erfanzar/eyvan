@@ -407,7 +407,7 @@ def test_real_script_pushes_the_agents_token_and_restarts_only_on_identity_chang
     desired["provider_options"]["push_worker_token"] = True
 
     def token_file(host):
-        return rack.root / host / "state" / "worker-secret"
+        return rack.root / host / "state" / WORKER_TOKEN_FILE
 
     def agent_token(observation):
         return derive_native_worker_token(
