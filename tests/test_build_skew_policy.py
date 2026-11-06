@@ -320,7 +320,7 @@ def test_a_held_pool_cell_is_supply_on_its_way_back_not_a_reason_to_launch() -> 
 
     from eyvan.capacity.planning import CapacitySimulation
 
-    pool = cpu_pool()
+    pool = cpu_pool().model_copy(update={"capacity_backend": "manual", "provider": "manual"})
     held = _idle_cell(pool, 1).model_copy(update={"build_skew": "worker bbbbbbbbbbbb"})
     workload = generic_cpu_workload()
     now = utcnow()
@@ -331,6 +331,25 @@ def test_a_held_pool_cell_is_supply_on_its_way_back_not_a_reason_to_launch() -> 
 
     assert demand[pool.id].virtual_worker_counts == ()
     assert held.id in simulation.acquiring_cell_ids
+
+
+def test_a_held_cell_eyvan_provisioned_is_not_counted_as_returning() -> None:
+    """A cloud cell is never upgraded in place, so counting it would wait forever."""
+
+    from test_capacity_planning import _idle_cell, cpu_pool, generic_cpu_workload
+
+    from eyvan.capacity.planning import CapacitySimulation
+
+    pool = cpu_pool()
+    held = _idle_cell(pool, 1).model_copy(update={"build_skew": "worker bbbbbbbbbbbb"})
+    workload = generic_cpu_workload()
+
+    simulation = CapacitySimulation.build((pool,), (held,), (workload,), (), utcnow())
+    result = CoreSchedulingService().schedule((workload,), simulation.cells)
+    demand = simulation.demand((pool,), (held,), result)
+
+    assert held.id not in simulation.acquiring_cell_ids
+    assert demand[pool.id].virtual_worker_counts != ()
 
 
 class _RestartingAgent(_UpgradeableAgent):

@@ -165,6 +165,21 @@ Changes planned for the first public release.
   environment is built on it with uv, including the accelerator stack.
 - Second and third clouds added under the conformance suite, with late-arriving
   and timed-out capacity modelled.
+- Build skew: under the default `EYVAN_BUILD_SKEW_POLICY=auto`, a cell on
+  hardware the operator owns (`manual`, `onprem-ssh`, `gcp-attach`) running
+  another build is held out of scheduling instead of drained, and returns once
+  its agent and every worker report the plane's build. `recycle`, `refuse` and
+  `warn` set one answer for every cell.
+- GPU readiness is checked on every cell with a catalog GPU shape, cloud GPU
+  shapes included. A worker older than `/api/v1/accelerators` is not checked
+  until it is upgraded, so upgrade the agent before or after its workers.
+- `runtime.container`, `runtime.init_commands` and `runtime.artifacts` on an
+  `onprem-ssh` or `manual` pool are now warned about, since those backends never
+  ship them; they will be refused in a later release.
+- GPU containers get a private IPC namespace with a 16 GiB `/dev/shm` unless the
+  container block sets `ipc` or `shm_size`.
+- `onprem-ssh` writes the per-cell worker token to its hosts only when the pool
+  sets `push_worker_token: true`.
 
 ### Fixed
 

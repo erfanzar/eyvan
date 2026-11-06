@@ -11,6 +11,7 @@ import warnings
 import pytest
 from pydantic import ValidationError
 
+import eyvan.capacity.drivers.base as capacity_base
 from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity.fleet_config import EyvanFleetConfig, GpuNodeType, TpuNodeType
 from eyvan.server.api.schemas import FleetApplyRequest
@@ -1110,9 +1111,12 @@ _HOST_RUNTIME = {
 @pytest.mark.parametrize("backend", ["onprem-ssh", "manual"])
 @pytest.mark.parametrize("field", sorted(_HOST_RUNTIME))
 @pytest.mark.parametrize("placement", ["fleet", "pool"])
-def test_host_runtime_is_refused_where_the_backend_would_silently_drop_it(backend, field, placement) -> None:
+def test_host_runtime_is_refused_where_the_backend_would_silently_drop_it(
+    backend, field, placement, monkeypatch
+) -> None:
     """Accepted and never applied was the bug: the error names the field, the backend, and the fix."""
 
+    monkeypatch.setattr(capacity_base, "REFUSE_UNSHIPPED_HOST_RUNTIME", True)
     raw = _host_owned_fleet(backend)
     runtime = {field: _HOST_RUNTIME[field]}
     if placement == "fleet":
@@ -1132,6 +1136,19 @@ def test_host_runtime_is_refused_where_the_backend_would_silently_drop_it(backen
 
 
 @pytest.mark.parametrize("backend", ["onprem-ssh", "manual"])
+def test_host_runtime_is_only_warned_about_for_now(backend, caplog) -> None:
+    """Existing fleet files keep loading for one release; the warning names what to remove."""
+
+    raw = _host_owned_fleet(backend)
+    raw["runtime"] = {"container": _HOST_RUNTIME["container"]}
+
+    with caplog.at_level("WARNING"):
+        EyvanFleetConfig.model_validate(raw)
+
+    assert "runtime.container" in caplog.text and "will be refused in a future release" in caplog.text
+
+
+@pytest.mark.parametrize("backend", ["onprem-ssh", "manual"])
 def test_runtime_the_plane_applies_itself_stays_accepted_on_operator_owned_hosts(backend) -> None:
     """``runtime.env`` reaches workloads at dispatch and ``python`` gates submission, on every backend."""
 
@@ -1144,10 +1161,12 @@ def test_runtime_the_plane_applies_itself_stays_accepted_on_operator_owned_hosts
     assert pool["runtime"]["python"] == "3.12"
 
 
-def test_the_pool_api_refuses_host_runtime_the_backend_never_ships() -> None:
+def test_the_pool_api_refuses_host_runtime_the_backend_never_ships(monkeypatch) -> None:
     """The API is a second writer of the same pool; it gets the same refusal."""
 
     from eyvan.server.api.schemas import CapacityPoolUpsertRequest
+
+    monkeypatch.setattr(capacity_base, "REFUSE_UNSHIPPED_HOST_RUNTIME", True)
 
     payload = EyvanFleetConfig.model_validate(_host_owned_fleet("onprem-ssh")).pool_payloads()[0]
     CapacityPoolUpsertRequest.model_validate(payload)

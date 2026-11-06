@@ -254,10 +254,14 @@ class NativeRemoteExecutor:
 
         Only the worker can look at its host's ``/dev``; the agent supplies the
         count from the cell's catalog row. Never raises. A worker that cannot
-        answer -- unreachable, or a build that predates the route -- is reported
-        not ready: the cell declared GPUs, and "could not check" must not be read
-        as "checked and fine", which is how the P100 cell came to run a workload
-        on a host whose driver could not open its GPU.
+        answer is reported not ready: the cell declared GPUs, and "could not
+        check" must not be read as "checked and fine", which is how a cell came
+        to run a workload on a host whose driver could not open its GPU.
+
+        The one exception is a worker whose build predates the route (404). It
+        is judged as before the check existed, so upgrading the agent ahead of
+        its workers does not take a fleet out of service; the check applies
+        once the worker is upgraded.
         """
 
         try:
@@ -270,7 +274,7 @@ class NativeRemoteExecutor:
         except httpx.HTTPError as exc:
             return False, f"native worker GPU readiness could not be read: {exc}"
         if response.status_code == 404:
-            return False, "native worker does not report GPU readiness (it predates /api/v1/accelerators); upgrade it"
+            return True, "native worker predates /api/v1/accelerators; GPU readiness not checked until it is upgraded"
         if response.status_code != 200:
             return False, f"native worker GPU readiness returned HTTP {response.status_code}"
         try:

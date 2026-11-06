@@ -192,7 +192,7 @@ worker per cell.
 One machine can carry several cells: run one native worker per slice, each with
 its own port (`worker_port`) and `--state-dir`, and give each the host GPUs it
 owns with `--gpu-devices` (default: `EYVAN_NATIVE_WORKER_GPU_DEVICES`; empty or
-unset means unsliced). An eight-GPU host cut 1/1/2/4:
+unset means unsliced). For example, an eight-GPU host cut 1/1/2/4:
 
 ```bash
 eyvan-native-worker --systemd-transient --port 8101 --state-dir /var/lib/eyvan/cell-a --gpu-devices 0
@@ -206,7 +206,12 @@ eyvan-native-worker --systemd-transient --port 8104 --state-dir /var/lib/eyvan/c
 `nvidia-smi -q` prints each GPU's `Minor Number` if in doubt. The list is
 sorted and must be non-empty, non-negative and duplicate-free. Nothing checks
 that two workers on one host name disjoint lists; that is the operator's
-layout.
+layout. A four-GPU host split in two is `--gpu-devices 0,1` and `--gpu-devices 2,3`.
+
+When the pool's `accelerator_type` names a catalog row, set the pool's
+`gpu_devices_per_host` (`manual` and `onprem-ssh`) to the slice size, so ranks
+are planned on the slice's GPUs rather than the whole host's. A slice is held
+to its own devices in readiness; other GPUs on the host do not affect it.
 
 What the list does:
 
@@ -325,10 +330,10 @@ Native workloads run as `eyvan-workload`, which must open `/dev/nvidiactl`,
 `/dev/nvidia-uvm` and every `/dev/nvidiaN` read-write. The GCP bootstrap grants
 this with `setfacl`, which a reboot or driver reload undoes; on a host Eyvan
 does not create, install a udev rule instead so the grant is reapplied each time
-the nodes appear:
+the nodes appear. Install the `acl` package (it provides `setfacl`) with the
+host's package manager, then:
 
 ```bash
-sudo apt-get install -y acl
 sudo tee /etc/udev/rules.d/70-eyvan-nvidia.rules >/dev/null <<'RULE'
 KERNEL=="nvidia[0-9]*|nvidiactl|nvidia-uvm|nvidia-uvm-tools|nvidia-modeset", \
   RUN+="/usr/bin/setfacl -m u:eyvan-workload:rw /dev/%k"

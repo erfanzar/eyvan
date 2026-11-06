@@ -35,11 +35,14 @@ from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import (
     CELL_ACCELERATOR_METADATA_KEY,
+    GPU_DEVICES_PER_HOST_OPTION,
     CellCapabilities,
     CellObservation,
     MutationContext,
     StaleMutationError,
     describe_cell_accelerator,
+    gpu_devices_per_host_option,
+    sliced_cell_accelerator,
 )
 from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
@@ -127,7 +130,10 @@ class ManualCapacityDriver:
         # rather than turning a name into a device count. Derived either way,
         # including the removal: a copy persisted by some other build must not
         # outlive this build's ability to state it.
-        accelerator = describe_cell_accelerator(accelerator_type=record.accelerator_type)
+        accelerator = sliced_cell_accelerator(
+            describe_cell_accelerator(accelerator_type=record.accelerator_type),
+            record.metadata.get(GPU_DEVICES_PER_HOST_OPTION),
+        )
         if accelerator is None:
             metadata.pop(CELL_ACCELERATOR_METADATA_KEY, None)
         else:
@@ -257,6 +263,7 @@ class ManualCapacityDriver:
 
         accelerator_type, capacity_class, region, zone, hosts = self._validate_desired(desired)
         agent_endpoint = self._optional_string(desired, "agent_endpoint")
+        slice_devices = gpu_devices_per_host_option(self._nested_options(desired))
         with self._mutation_lock, self.state.exclusive():
 
             def mutate(record: FleetCellRecord) -> None:
@@ -276,6 +283,10 @@ class ManualCapacityDriver:
                 # the same UID so the per-cell worker token stays stable and
                 # already-running workers keep authenticating.
                 record.metadata["management_uid"] = stable_id("manual", cell_id)
+                if slice_devices is None:
+                    record.metadata.pop(GPU_DEVICES_PER_HOST_OPTION, None)
+                else:
+                    record.metadata[GPU_DEVICES_PER_HOST_OPTION] = slice_devices
                 if agent_endpoint is None:
                     record.metadata.pop("agent_endpoint", None)
                 else:

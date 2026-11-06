@@ -158,6 +158,11 @@ def evaluate_gpu_readiness(
         raise ValueError("expected GPU device count must be a non-negative integer or absent")
     wanted = expected_devices or 0
     missing = sorted(set(required_indices) - set(observed.indices))
+    declared = wanted
+    if required_indices:
+        # A slice is held to its own devices: the rest of the host belongs to
+        # other cells, so neither their count nor their health is this cell's.
+        wanted = 0
     if observed.driver_present_but_no_device and (wanted or required_indices):
         return GpuReadiness(
             False,
@@ -185,6 +190,13 @@ def evaluate_gpu_readiness(
         return GpuReadiness(
             False,
             "configured GPU devices have no device node: " + ", ".join(f"/dev/nvidia{index}" for index in missing),
+            observed,
+        )
+    if required_indices and len(required_indices) < declared:
+        return GpuReadiness(
+            False,
+            f"this worker's GPU slice has {len(required_indices)} devices but its cell declares {declared}; "
+            "set the pool's gpu_devices_per_host to the slice size",
             observed,
         )
     if not wanted and not required_indices:
@@ -252,6 +264,7 @@ def inaccessible_nvidia_devices(
     dev_root: Path | str = Path("/dev"),
     *,
     acl_reader: tp.Callable[[str], bytes | None] = _read_acl,
+    indices: tp.Collection[int] | None = None,
 ) -> tuple[str, ...]:
     """Return the NVIDIA nodes ``user`` cannot open read-write, by mode and ACL.
 
@@ -285,8 +298,11 @@ def inaccessible_nvidia_devices(
         return ()
     blocked: list[str] = []
     for name in names:
-        if not (_DEVICE_NODE.match(name) or name in _CONTROL_NODES):
+        device = _DEVICE_NODE.match(name)
+        if not (device or name in _CONTROL_NODES):
             continue
+        if device and indices is not None and int(device.group(1)) not in indices:
+            continue  # another cell's GPU
         path = str(root / name)
         try:
             status = os.stat(path)
@@ -301,6 +317,45 @@ def inaccessible_nvidia_devices(
     return tuple(blocked)
 
 
+_DEVICE_MINOR = re.compile(r"^Device Minor:\s*(\d+)", re.MULTILINE)
+
+
+def gpu_index_minor_mismatches(
+    indices: tp.Sequence[int], proc_root: Path | str = Path("/proc/driver/nvidia/gpus")
+) -> tuple[str, ...]:
+    """Return slice devices whose NVML index and ``/dev/nvidiaN`` minor differ.
+
+    A slice names its GPUs by device minor (``--device /dev/nvidiaN``, the
+    cgroup rule), while ``--gpus device=N`` and ``nvidia-smi`` count by NVML
+    index, which follows PCI bus order. The two agree wherever the driver
+    probed in bus order; where they do not, one slice would be handed two
+    different GPUs. The driver lists every GPU under ``proc_root`` by bus id
+    with its minor, so sorting those ids gives the NVML order. Anything
+    unreadable is reported as no mismatch: this narrows a check, it never
+    invents a failure.
+    """
+
+    root = Path(proc_root)
+    try:
+        buses = sorted(entry.name.lower() for entry in root.iterdir())
+    except OSError:
+        return ()
+    minors: list[int] = []
+    for bus in buses:
+        try:
+            match = _DEVICE_MINOR.search((root / bus / "information").read_text())
+        except OSError:
+            return ()
+        if match is None:
+            return ()
+        minors.append(int(match.group(1)))
+    return tuple(
+        f"NVML index {index} is /dev/nvidia{minors[index]}"
+        for index in indices
+        if index < len(minors) and minors[index] != index
+    )
+
+
 def check_gpu_readiness(
     expected_devices: int | None,
     *,
@@ -308,6 +363,7 @@ def check_gpu_readiness(
     workload_user: str | None = None,
     dev_root: Path | str = Path("/dev"),
     acl_reader: tp.Callable[[str], bytes | None] = _read_acl,
+    proc_root: Path | str = Path("/proc/driver/nvidia/gpus"),
 ) -> GpuReadiness:
     """Observe this host and hold it to a declared GPU count and device access.
 
@@ -318,6 +374,7 @@ def check_gpu_readiness(
             ``None`` on a path that opens devices as root (the container path).
         dev_root: Device directory, for tests.
         acl_reader: ACL source, for tests.
+        proc_root: The driver's per-GPU directory, for tests.
 
     Returns:
         The verdict. Cheap enough to run on every readiness poll: one directory
@@ -329,9 +386,21 @@ def check_gpu_readiness(
         expected_devices=expected_devices,
         required_indices=required_indices,
     )
+    if verdict.ready and required_indices:
+        mismatched = gpu_index_minor_mismatches(required_indices, proc_root)
+        if mismatched:
+            return GpuReadiness(
+                False,
+                "this host's GPU numbering differs between NVML and /dev ("
+                + "; ".join(mismatched)
+                + "), so a slice would not get the GPUs it names; slice by device minor only where they agree",
+                verdict.observed,
+            )
     if not verdict.ready or workload_user is None or not (expected_devices or required_indices):
         return verdict
-    blocked = inaccessible_nvidia_devices(workload_user, dev_root, acl_reader=acl_reader)
+    blocked = inaccessible_nvidia_devices(
+        workload_user, dev_root, acl_reader=acl_reader, indices=set(required_indices) or None
+    )
     if blocked:
         return GpuReadiness(
             False,
@@ -347,6 +416,7 @@ __all__ = (
     "ObservedNvidiaDevices",
     "check_gpu_readiness",
     "evaluate_gpu_readiness",
+    "gpu_index_minor_mismatches",
     "inaccessible_nvidia_devices",
     "observe_nvidia_devices",
 )

@@ -302,13 +302,19 @@ def test_the_remote_driver_passes_the_count_and_returns_the_reason() -> None:
     assert seen == ["8"]
 
 
-def test_a_worker_that_predates_the_route_is_not_read_as_healthy() -> None:
-    """Could-not-check must not become checked-and-fine for a cell that declared GPUs."""
+def test_a_worker_that_predates_the_route_keeps_its_old_readiness() -> None:
+    """An agent upgraded before its workers must not take the fleet out of service."""
 
     ready, detail = _remote(lambda _request: httpx.Response(404)).gpu_readiness(8)
 
-    assert not ready
-    assert "predates /api/v1/accelerators" in detail
+    assert ready
+    assert "predates /api/v1/accelerators" in detail and "not checked" in detail
+
+
+def test_a_worker_that_cannot_answer_is_not_read_as_healthy() -> None:
+    """Could-not-check must not become checked-and-fine for a cell that declared GPUs."""
+
+    assert not _remote(lambda _request: httpx.Response(503)).gpu_readiness(8)[0]
 
 
 def test_a_multi_host_cell_names_the_host_that_is_short() -> None:
@@ -416,3 +422,62 @@ def test_cells_without_a_catalog_gpu_shape_never_ask_about_gpus(
         resolver.close()
 
     assert "/api/v1/accelerators" not in paths
+
+
+# ------------------------------------------------------------------ GPU slices
+
+
+def test_a_slice_is_not_failed_by_another_cells_missing_gpu(tmp_path: Path) -> None:
+    """One GPU gone from the host must not take every slice on it out of service."""
+
+    root = _dev(tmp_path, "nvidia0", "nvidia1", "nvidia2", "nvidia3", "nvidia5", "nvidia6", "nvidia7", "nvidiactl")
+
+    verdict = check_gpu_readiness(4, required_indices=(0, 1, 2, 3), dev_root=root)
+
+    assert verdict.ready, verdict.detail
+
+
+def test_a_slice_smaller_than_its_cell_declares_names_the_setting(tmp_path: Path) -> None:
+    root = _dev(tmp_path, *EIGHT, "nvidiactl")
+
+    verdict = check_gpu_readiness(8, required_indices=(4, 5, 6, 7), dev_root=root)
+
+    assert not verdict.ready
+    assert "gpu_devices_per_host" in verdict.detail
+
+
+def test_device_access_is_checked_only_on_the_slices_own_gpus(tmp_path: Path) -> None:
+    me = pwd.getpwuid(os.getuid()).pw_name
+    root = _dev(tmp_path, *EIGHT, "nvidiactl")
+    os.chmod(root / "nvidia7", 0o444)  # another cell's GPU
+
+    assert inaccessible_nvidia_devices(me, root, acl_reader=lambda _path: None, indices={0, 1}) == ()
+    assert check_gpu_readiness(
+        2, required_indices=(0, 1), workload_user=me, dev_root=root, acl_reader=lambda _path: None
+    ).ready
+
+
+def _proc(tmp_path: Path, minors_by_bus: dict[str, int]) -> Path:
+    root = tmp_path / "proc"
+    for bus, minor in minors_by_bus.items():
+        (root / bus).mkdir(parents=True)
+        (root / bus / "information").write_text(f"Model: \t GPU\nDevice Minor: \t {minor}\n")
+    return root
+
+
+def test_a_slice_is_refused_where_nvml_and_dev_numbering_differ(tmp_path: Path) -> None:
+    root = _dev(tmp_path, "nvidia0", "nvidia1", "nvidiactl")
+    proc = _proc(tmp_path, {"0000:08:00.0": 1, "0000:7e:00.0": 0})
+
+    verdict = check_gpu_readiness(1, required_indices=(0,), dev_root=root, proc_root=proc)
+
+    assert not verdict.ready
+    assert "NVML index 0 is /dev/nvidia1" in verdict.detail
+
+
+def test_a_slice_is_ready_where_the_numbering_agrees_or_cannot_be_read(tmp_path: Path) -> None:
+    root = _dev(tmp_path, "nvidia0", "nvidia1", "nvidiactl")
+    agreeing = _proc(tmp_path, {"0000:08:00.0": 0, "0000:7e:00.0": 1})
+
+    assert check_gpu_readiness(1, required_indices=(1,), dev_root=root, proc_root=agreeing).ready
+    assert check_gpu_readiness(1, required_indices=(1,), dev_root=root, proc_root=tmp_path / "absent").ready

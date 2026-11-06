@@ -670,7 +670,9 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         # An empty variable reads as unset, so a unit template can always carry
         # the name and leave it blank on an unsliced host.
         default=os.getenv("EYVAN_NATIVE_WORKER_GPU_DEVICES") or None,
-        help="host GPU indices this cell owns, e.g. 4,5,6,7, when several cells share one host's GPUs",
+        help=(
+            "NVIDIA GPUs this cell owns, by /dev/nvidiaN index, e.g. 4,5,6,7, when several cells share one host's GPUs"
+        ),
     )
     parser.add_argument("--mtls-mode", default=os.getenv("EYVAN_MUTUAL_TLS_MODE", "off"))
     parser.add_argument("--mtls-trust-bundle", default=os.getenv("EYVAN_MUTUAL_TLS_TRUST_BUNDLE", ""))

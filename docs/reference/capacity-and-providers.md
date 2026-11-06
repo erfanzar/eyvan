@@ -170,10 +170,13 @@ pools:
       # Synchronous: `systemctl restart` returns once the unit has started.
       start_command: [systemctl, restart, eyvan-native-worker]
       stop_command: [systemctl, stop, eyvan-native-worker]
+      push_worker_token: true   # write the per-cell token to {state_dir}/worker-secret
 ```
 
-Declare `start_command`: without it the token file is still refreshed, but a
-running worker keeps the old token until something restarts it.
+`push_worker_token` is off by default, for hosts that manage `worker-secret`
+themselves. With it on, declare `start_command`: without one the token file is
+still refreshed, but a running worker keeps the old token until something
+restarts it, and the host records the start as pending.
 
 The worker runs each job as `EYVAN_NATIVE_WORKLOAD_USER` (default
 `eyvan-workload`) in `EYVAN_NATIVE_WORKLOAD_DIRECTORY` (default

@@ -184,6 +184,12 @@ class _HostRuntime(tp.Protocol):
     def artifacts(self) -> tp.Sequence[object]: ...
 
 
+#: Whether host runtime an operator-owned backend never ships is refused (True)
+#: or only warned about (False). Warned for one release so existing fleet files
+#: keep loading; refused from the next.
+REFUSE_UNSHIPPED_HOST_RUNTIME = False
+
+
 def validate_host_runtime_write_boundary(
     *,
     capacity_backend: str | None,
@@ -197,6 +203,8 @@ def validate_host_runtime_write_boundary(
     without the image, and nothing said why. Refusing it where the pool is
     written -- fleet YAML and the pool API alike -- is the only point at which
     the operator is still looking at the field that will not take effect.
+
+    Warns instead while :data:`REFUSE_UNSHIPPED_HOST_RUNTIME` is false.
 
     Raises:
         ValueError: Naming the first such field, the backend, and what to
@@ -213,10 +221,14 @@ def validate_host_runtime_write_boundary(
     for name, instead in _HOST_RUNTIME_FIELDS:
         if declared[name]:
             backend = (capacity_backend or "").strip().lower().replace("_", "-")
-            raise ValueError(
+            message = (
                 f"{boundary} declares runtime.{name}, but capacity backend {backend!r} never ships it to its "
                 f"hosts (Eyvan does not install software on hardware it does not own); remove it and {instead}"
             )
+            if REFUSE_UNSHIPPED_HOST_RUNTIME:
+                raise ValueError(message)
+            logger.warning("%s. This is ignored now and will be refused in a future release.", message)
+            return
 
 
 def providers_hosting_multi_worker_cells() -> frozenset[str]:
@@ -730,6 +742,47 @@ def describe_cell_accelerator(
         devices_per_host=shape.devices_per_host,
         gpu_model=shape.gpu_model,
     )
+
+
+#: Pool option for operator-owned hosts split into GPU slices: the GPUs one cell
+#: owns, when that is fewer than the host's catalog row carries.
+GPU_DEVICES_PER_HOST_OPTION: tp.Final = "gpu_devices_per_host"
+
+
+def gpu_devices_per_host_option(options: tp.Mapping[str, JsonValue]) -> int | None:
+    """Validate the optional per-cell GPU count of a sliced operator-owned pool."""
+
+    value = options.get(GPU_DEVICES_PER_HOST_OPTION)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{GPU_DEVICES_PER_HOST_OPTION} must be a positive integer when set")
+    return value
+
+
+def sliced_cell_accelerator(accelerator: CellAccelerator | None, devices: JsonValue) -> CellAccelerator | None:
+    """Narrow a catalog GPU description to the slice one cell owns.
+
+    ``devices`` is the pool's ``gpu_devices_per_host``, or ``None`` for a cell
+    that owns its whole host. A count above the catalog row's cannot be true of
+    that hardware, so the accelerator is reported as unknown rather than either
+    number being trusted.
+    """
+
+    if accelerator is None or devices is None or accelerator.kind != "gpu":
+        return accelerator
+    if isinstance(devices, bool) or not isinstance(devices, int) or devices <= 0:
+        return None
+    if accelerator.devices_per_host is not None and devices > accelerator.devices_per_host:
+        logger.warning(
+            "%s=%d exceeds the %d GPUs catalog row %r carries; reporting the accelerator as unknown",
+            GPU_DEVICES_PER_HOST_OPTION,
+            devices,
+            accelerator.devices_per_host,
+            accelerator.accelerator_type,
+        )
+        return None
+    return replace(accelerator, devices_per_host=devices)
 
 
 def read_cell_accelerator(metadata: tp.Mapping[str, JsonValue]) -> CellAccelerator | None:

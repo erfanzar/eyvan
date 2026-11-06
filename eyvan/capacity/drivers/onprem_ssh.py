@@ -101,6 +101,7 @@ from eyvan._internal.json_types import JsonObject, JsonValue, is_json_object
 from eyvan.capacity import CapacityStatus
 from eyvan.capacity.drivers.base import (
     CELL_ACCELERATOR_METADATA_KEY,
+    GPU_DEVICES_PER_HOST_OPTION,
     CapacityProviderError,
     CapacityProviderFailureCode,
     CellCapabilities,
@@ -108,6 +109,8 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
     describe_cell_accelerator,
+    gpu_devices_per_host_option,
+    sliced_cell_accelerator,
 )
 from eyvan.capacity.fleet_state import (
     FleetCellNotRegisteredError,
@@ -622,6 +625,7 @@ class OnPremSshCapacityDriver:
             "start_command": list(self._command(options, "start_command")),
             "stop_command": list(self._command(options, "stop_command")),
             "push_worker_token": self._push_worker_token(options),
+            GPU_DEVICES_PER_HOST_OPTION: gpu_devices_per_host_option(options),
         }
 
     # ---- durable record helpers, shared in shape with manual.py and k8s -----
@@ -982,7 +986,10 @@ class OnPremSshCapacityDriver:
         # build never outlives this build's ability to state it. This is what
         # makes an ``hgx-h200-8g`` cell GPU-coordinated in a gang and what its
         # worker's GPU readiness probe is held to.
-        accelerator = describe_cell_accelerator(accelerator_type=record.accelerator_type)
+        accelerator = sliced_cell_accelerator(
+            describe_cell_accelerator(accelerator_type=record.accelerator_type),
+            record.metadata.get(GPU_DEVICES_PER_HOST_OPTION),
+        )
         if accelerator is None:
             metadata.pop(CELL_ACCELERATOR_METADATA_KEY, None)
         else:
@@ -1166,6 +1173,10 @@ class OnPremSshCapacityDriver:
                     record.metadata["start_command"] = list(start_command)
                     record.metadata["stop_command"] = validated["stop_command"]
                     record.metadata["push_worker_token"] = validated["push_worker_token"]
+                    if validated[GPU_DEVICES_PER_HOST_OPTION] is None:
+                        record.metadata.pop(GPU_DEVICES_PER_HOST_OPTION, None)
+                    else:
+                        record.metadata[GPU_DEVICES_PER_HOST_OPTION] = validated[GPU_DEVICES_PER_HOST_OPTION]
                     # Host identity survives a drain changing the durable fence.
                     record.metadata["claim_fence"] = marker_fingerprint(context.fencing_token)
                     # Derived, not random: a replay or a second store applying

@@ -736,14 +736,19 @@ class CapacitySimulation:
                 failed_request = cell.state is CellState.UNAVAILABLE and cell.provider_failure_code is not None
                 target = stalled_pools if failed_request else owned_pools
                 target.setdefault(cell.autoscale_request_workload_id, set()).add(pool.id)
+            held_returning = (
+                bool(cell.build_skew)
+                and backend_capabilities(cell.capacity_backend or pool.capacity_backend).existing_hardware
+            )
             if supplies and cell.state is CellState.READY and cell.build_skew is None:
                 scheduler_cells.append(cell)
-            elif supplies and (cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE} or cell.build_skew):
-                # A cell held for build skew is supply on its way back, like one
-                # still registering: it returns as soon as its host is upgraded in
-                # place. Read as absent, the pool would ask its backend for a
-                # second cell -- which, on operator-owned hosts, is a claim on the
-                # very machine the held cell already holds.
+            elif supplies and (cell.state in {CellState.REGISTERING, CellState.UNAVAILABLE} or held_returning):
+                # A cell held for build skew on operator-owned hardware is supply
+                # on its way back, like one still registering: it returns as soon
+                # as its host is upgraded in place. Read as absent, the pool would
+                # ask its backend for a second cell -- a claim on the very machine
+                # the held cell already holds. A held cell Eyvan provisioned is not
+                # upgraded in place, so it is not counted and a replacement can launch.
                 acquiring_cell_ids[cell.id] = cell.worker_count
                 scheduler_cells.append(cell.model_copy(update={"state": CellState.READY, "build_skew": None}))
             elif cell.id in active_lease_cells:

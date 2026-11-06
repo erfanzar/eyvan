@@ -107,7 +107,7 @@ def test_the_h200_row_is_not_marked_qualified() -> None:
     text = CATALOG_PATH.read_text(encoding="utf-8")
 
     assert "NOTHING BELOW IS HARDWARE-QUALIFIED FOR GPU" in text
-    assert "NOT QUALIFIED. No Eyvan workload has run on an H200." in text
+    assert "NOT QUALIFIED. One single-host run so far" in text
 
 
 def test_a_cell_declaring_the_h200_type_is_described_with_its_device_count() -> None:
@@ -295,3 +295,45 @@ def test_two_h200_cells_on_two_nodes_form_a_gpu_coordinated_gang(tmp_path) -> No
         "cell-0": 8,
         "cell-1": 8,
     }
+
+
+@pytest.mark.parametrize("backend", ["manual", "onprem-ssh"])
+def test_a_sliced_pool_publishes_its_slice_size(tmp_path, backend) -> None:
+    """A 4-GPU slice of an 8-GPU host must plan four devices per rank, not eight."""
+
+    if backend == "manual":
+        driver = ManualCapacityDriver(FleetStateStore(LocalBackend(tmp_path / "fleet.json")))
+        desired = {
+            "provider": "manual",
+            "capacity_backend": "manual",
+            "executor": "eyvan-native",
+            "accelerator_type": H200,
+            "capacity_class": "on_demand",
+            "region": "on-prem",
+            "provider_options": {"hosts": ["http://10.0.0.20:8100"], "gpu_devices_per_host": 4},
+        }
+    else:
+        driver, desired = _onprem(tmp_path, H200)
+        desired["provider_options"]["gpu_devices_per_host"] = 4
+
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    accelerator = read_cell_accelerator(driver.observe("cell-a").metadata)
+    assert accelerator is not None and accelerator.gpu_devices_per_host == 4
+
+
+def test_a_slice_larger_than_the_host_leaves_the_accelerator_unknown(tmp_path) -> None:
+    driver, desired = _onprem(tmp_path, H200)
+    desired["provider_options"]["gpu_devices_per_host"] = 16
+
+    driver.apply_capacity("cell-a", desired, _context("apply"))
+
+    assert CELL_ACCELERATOR_METADATA_KEY not in driver.observe("cell-a").metadata
+
+
+def test_a_non_integer_slice_size_is_refused(tmp_path) -> None:
+    driver, desired = _onprem(tmp_path, H200)
+    desired["provider_options"]["gpu_devices_per_host"] = "4"
+
+    with pytest.raises(ValueError, match="gpu_devices_per_host must be a positive integer"):
+        driver.apply_capacity("cell-a", desired, _context("apply"))

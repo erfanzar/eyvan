@@ -417,8 +417,9 @@ shapes:
   # `nvidia-h200-141gb`) so one accelerator is not spelled two ways in one
   # catalog.
   #
-  # NOT QUALIFIED. No Eyvan workload has run on an H200. This is a transcription
-  # of NVIDIA's product page, not evidence that a run on such a node works.
+  # NOT QUALIFIED. One single-host run so far (GPU readiness, slices side by
+  # side, an 8-GPU NCCL all-reduce in a container); multi-host work has not run.
+  # The rest is a transcription of NVIDIA's product page.
 
   - accelerator_type: hgx-h200-8g
     kind: gpu
