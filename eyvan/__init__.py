@@ -14,6 +14,7 @@ if tp.TYPE_CHECKING:
     from eyvan.config import EyvanSettings
     from eyvan.records import CapacityClass
     from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
+    from eyvan.sdk.client.easydel_setup import EasyDeLSetup
     from eyvan.sdk.client.jobs import CpuConfig, GpuConfig, SetupScript
     from eyvan.sdk.execution import (
         EyvanJob,
@@ -32,6 +33,7 @@ __all__ = (
     "CapacityClass",
     "ClientIdentity",
     "CpuConfig",
+    "EasyDeLSetup",
     "EyvanCallableSubmitter",
     "EyvanClient",
     "EyvanFleetConfig",
@@ -131,6 +133,10 @@ def __getattr__(name: str):
         from eyvan.sdk.client.jobs import SetupScript
 
         return _cache_export(name, SetupScript)
+    if name == "EasyDeLSetup":
+        from eyvan.sdk.client.easydel_setup import EasyDeLSetup
+
+        return _cache_export(name, EasyDeLSetup)
     if name == "execute":
         from eyvan.sdk.execution import execute
 

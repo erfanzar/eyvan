@@ -26,6 +26,7 @@ from eyvan.records import (
     WorkloadSetup,
     WorkloadState,
 )
+from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 
 R_co = tp.TypeVar("R_co", covariant=True)
 
@@ -158,14 +159,20 @@ class SetupScript:
         return WorkloadSetup(script=text, args=self.args)
 
 
-def workload_setup(setup: SetupScript | WorkloadSetup | str | None) -> WorkloadSetup | None:
+#: Every value a config's ``setup`` field accepts.
+SetupValue: tp.TypeAlias = "SetupScript | EasyDeLSetup | WorkloadSetup | str | None"
+
+
+def workload_setup(setup: SetupValue) -> WorkloadSetup | EasyDeLSetup | None:
     """Normalize a config's ``setup`` value to its wire form.
 
     A plain string is inline bash, except a single ``https://`` token, which is
-    a script URL. Use ``SetupScript`` to pass arguments or pin a hash.
+    a script URL. Use ``SetupScript`` to pass arguments or pin a hash. An
+    ``EasyDeLSetup`` is kept as is: its branch is resolved to a commit when the
+    job is submitted, not when the decorator is defined.
     """
 
-    if setup is None or isinstance(setup, WorkloadSetup):
+    if setup is None or isinstance(setup, (WorkloadSetup, EasyDeLSetup)):
         return setup
     if isinstance(setup, SetupScript):
         return setup.to_workload_setup()
@@ -174,7 +181,15 @@ def workload_setup(setup: SetupScript | WorkloadSetup | str | None) -> WorkloadS
         if stripped.startswith("https://") and not any(character.isspace() for character in stripped):
             return WorkloadSetup(url=stripped)
         return WorkloadSetup(script=setup)
-    raise ValueError("setup must be a bash string, an https:// URL, or a SetupScript")
+    raise ValueError("setup must be a bash string, an https:// URL, a SetupScript or an EasyDeLSetup")
+
+
+def setup_request_of(setup: WorkloadSetup | EasyDeLSetup | None) -> WorkloadSetup | None:
+    """Return the wire form of a normalized ``setup``, resolving an ``EasyDeLSetup`` now."""
+
+    if isinstance(setup, EasyDeLSetup):
+        return setup.to_workload_setup()
+    return setup
 
 
 #: Marks a ``TpuConfig`` whose caller did not name a capacity class. Resolved to
@@ -242,9 +257,9 @@ class TpuConfig:
     chips_indexes: tuple[int, ...] | None = None
     #: A bash step run on every host before the callable loads, inside the job's
     #: environment (``$EYVAN_PYTHON`` is its interpreter). Inline bash, an
-    #: ``https://`` URL, or a ``SetupScript`` with args; cached per host by the
-    #: script's content and args.
-    setup: SetupScript | WorkloadSetup | str | None = None
+    #: ``https://`` URL, a ``SetupScript`` with args, or the built-in
+    #: ``EasyDeLSetup``; cached per host by the script's content and args.
+    setup: SetupValue = None
     #: Whether the caller named ``capacity_class``. Derived, never passed: only
     #: an unnamed class may be substituted by a fleet's reserved capacity.
     capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
@@ -262,7 +277,7 @@ class TpuConfig:
     def setup_request(self) -> WorkloadSetup | None:
         """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
 
-        return self.setup if isinstance(self.setup, WorkloadSetup) else None
+        return setup_request_of(tp.cast("WorkloadSetup | EasyDeLSetup | None", self.setup))
 
     def _validate_chips(self) -> None:
         indexes = self.chips_indexes
@@ -345,7 +360,7 @@ class GpuConfig:
     #: adding one library should not mean rebuilding an image.
     dependencies: tuple[str, ...] = ()
     #: A bash step run before the callable loads. See ``TpuConfig.setup``.
-    setup: SetupScript | WorkloadSetup | str | None = None
+    setup: SetupValue = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
@@ -356,7 +371,7 @@ class GpuConfig:
     def setup_request(self) -> WorkloadSetup | None:
         """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
 
-        return self.setup if isinstance(self.setup, WorkloadSetup) else None
+        return setup_request_of(tp.cast("WorkloadSetup | EasyDeLSetup | None", self.setup))
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,7 +410,7 @@ class CpuConfig:
     #: adding one library should not mean rebuilding an image.
     dependencies: tuple[str, ...] = ()
     #: A bash step run before the callable loads. See ``TpuConfig.setup``.
-    setup: SetupScript | WorkloadSetup | str | None = None
+    setup: SetupValue = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)
@@ -406,7 +421,7 @@ class CpuConfig:
     def setup_request(self) -> WorkloadSetup | None:
         """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
 
-        return self.setup if isinstance(self.setup, WorkloadSetup) else None
+        return setup_request_of(tp.cast("WorkloadSetup | EasyDeLSetup | None", self.setup))
 
 
 @dataclass(frozen=True, slots=True)

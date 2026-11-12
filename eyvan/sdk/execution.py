@@ -35,6 +35,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
 from eyvan.capacity.providers.gcp.runtime.supervisor import ensure_gcp_native_runtime, runtime_profile_path_for
 from eyvan.records import CapacityClass
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
+from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.client.identity import resolve_control_plane_identity
 from eyvan.sdk.client.jobs import (
@@ -819,6 +820,7 @@ __all__ = (
     "CallableSubmission",
     "CallableSubmitter",
     "CpuConfig",
+    "EasyDeLSetup",
     "Executable",
     "ExecutionContext",
     "EyvanJob",

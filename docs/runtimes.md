@@ -229,6 +229,32 @@ TpuConfig("v6e-8", setup=local)
 
 `GpuConfig` and `CpuConfig` take the same `setup=`.
 
+For EasyDeL there is a built-in step, `EasyDeLSetup`:
+
+```python
+from eyvan import EasyDeLSetup, TpuConfig
+
+easydel = EasyDeLSetup(branch="vnext-into-main", repo="erfanzar/EasyDeL")
+TpuConfig("v6e-8", setup=easydel)
+```
+
+`branch` defaults to `vnext-into-main` and `repo` to `erfanzar/EasyDeL`; `repo`
+also accepts an `https://` git URL. `branch` may be a branch, a tag or a full
+commit. It is resolved to one commit when the job is submitted, not when the
+decorator runs, so every host installs the same code and a host's cached
+install is reused only for that commit; pushing to the branch makes the next
+job install again. For EasyDeL's uv workspace (a root `pyproject.toml` with
+`[tool.uv.workspace]` and a `uv.lock`), the repository's own lock is exported
+for every member and installed into the job's interpreter: every package under
+`libs/` comes from that checkout, and every other dependency at the version the
+lock pins. A plain `pip install .` of that root would take the members from
+PyPI, and `uv sync` would build a separate `.venv`, so neither is used. Without
+a workspace lock, every `libs/*` package is installed from the checkout in one
+resolver call; a single package at the repository root also works. `accelerator` picks the extras (`tpu`, the
+default, `cuda`, or `cpu` for none), and `torch_cpu=True` also installs CPU-only
+torch, which EasyDeL uses to read Hugging Face checkpoints. The hosts need
+`git`.
+
 - The step runs as the job user, not root, inside the job's own environment:
   `VIRTUAL_ENV` and `PATH` point at it, and `EYVAN_PYTHON` names its
   interpreter. Install into that interpreter. System changes such as apt
