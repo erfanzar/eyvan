@@ -48,6 +48,7 @@ from eyvan.sdk.client.jobs import (
     GpuConfig,
     JobBackend,
     JobCompletion,
+    SetupScript,
     TpuConfig,
     reject_remote_callable_signing_key,
 )
@@ -827,6 +828,7 @@ __all__ = (
     "GpuConfig",
     "JobBackend",
     "JobCompletion",
+    "SetupScript",
     "TpuConfig",
     "execute",
     "get_context",

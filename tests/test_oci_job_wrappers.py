@@ -73,6 +73,25 @@ def test_a_callable_with_dependencies_has_both_layers_rewritten(tmp_path: Path) 
     assert f"{STAGED}/dependency_entry.py" in parts and f"{STAGED}/eyvan_oci_callable_worker.py" in parts
 
 
+def test_a_setup_step_survives_the_container_rewrite_as_one_argument(tmp_path: Path) -> None:
+    """An inline setup script may itself contain shell syntax; it is data, not composition."""
+
+    import json
+
+    from eyvan.records import WorkloadSetup
+
+    setup = WorkloadSetup(script="cd /tmp && echo 'a; b' | cat\n", args=("--ref", "a b"))
+    entrypoint = _ControllerWorkloadCommands._dependency_entrypoint((), "python train.py", setup)
+
+    rendered, staged_dir = _rendered(tmp_path, entrypoint)
+
+    parts = shlex.split(rendered)
+    assert parts[:3] == ["python", "-I", f"{STAGED}/dependency_entry.py"]
+    assert json.loads(parts[parts.index("--setup") + 1]) == setup.model_dump(mode="json")
+    assert parts[-2:] == ["python", "train.py"]
+    assert (staged_dir / "dependency_entry.py").is_file()
+
+
 def test_unrelated_and_shell_composed_commands_are_left_alone(tmp_path: Path) -> None:
     for entrypoint in ("python train.py --steps 20", "python -m mypkg.train", "python -m json.tool x && echo ok"):
         rendered, _ = _rendered(tmp_path / str(abs(hash(entrypoint))), entrypoint)

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import typing as tp
 import uuid
@@ -32,6 +33,7 @@ from eyvan.records import (
     WorkloadAttemptTopology,
     WorkloadDispatchReservation,
     WorkloadRecord,
+    WorkloadSetup,
     WorkloadState,
     WorkloadTopologyCell,
     WorkspaceRef,
@@ -556,7 +558,7 @@ class _ControllerWorkloadCommands:
         return tuple(zip(concrete_leases, concrete_cells, strict=True))
 
     @staticmethod
-    def _dependency_entrypoint(dependencies: tp.Sequence[str], command: str) -> str:
+    def _dependency_entrypoint(dependencies: tp.Sequence[str], command: str, setup: WorkloadSetup | None = None) -> str:
         """Wrap a command so its declared packages are installed before it runs.
 
         Returns ``command`` unchanged when nothing is declared, so a job that
@@ -570,11 +572,15 @@ class _ControllerWorkloadCommands:
         truncates a file called ``=0.4``.
         """
 
-        if not dependencies:
+        if not dependencies and setup is None:
             return command
         parts = ["python", *_WRAPPER_INTERPRETER_FLAGS, "-m", "eyvan.worker.runtime.dependency_entry"]
         for requirement in dependencies:
             parts.extend(("--require", requirement))
+        if setup is not None:
+            # One JSON argument: the wrapper is standard-library only (it is
+            # staged standalone into OCI images) and must not import records.
+            parts.extend(("--setup", json.dumps(setup.model_dump(mode="json"), sort_keys=True)))
         parts.append("--")
         return " ".join(shlex.quote(part) for part in parts) + " " + _exec_argument(command)
 
@@ -851,7 +857,7 @@ class _ControllerWorkloadCommands:
             # Outermost, so the packages are in place before anything else runs
             # -- including the workspace entry, which is itself `python -m`. The
             # wrapper `exec`s, so PATH survives into the job.
-            return self._dependency_entrypoint(workload.spec.dependencies, command), environment
+            return self._dependency_entrypoint(workload.spec.dependencies, command, workload.spec.setup), environment
 
         artifact_uri = execution.artifact_uri
         result_uri = execution.result_uri
@@ -968,7 +974,10 @@ class _ControllerWorkloadCommands:
         # same reason: the wrapper `exec`s, so the callable worker starts under
         # the prepared environment and the pickled callable's imports resolve
         # against the packages the submitter asked for.
-        return self._dependency_entrypoint(workload.spec.dependencies, shlex.join(parts)), environment
+        return (
+            self._dependency_entrypoint(workload.spec.dependencies, shlex.join(parts), workload.spec.setup),
+            environment,
+        )
 
     @staticmethod
     def _outbox_dispatch_reservation(command: OutboxRecord) -> WorkloadDispatchReservation | None:

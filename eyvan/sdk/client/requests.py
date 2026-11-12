@@ -17,6 +17,7 @@ from eyvan.records import (
     CapacityClass,
     PriorityBand,
     TpuChipRequest,
+    WorkloadSetup,
     WorkloadState,
     WorkspaceRef,
 )
@@ -60,10 +61,13 @@ def pool_workload_request(
     named_assets: tuple[str, ...] = (),
     dependencies: tuple[str, ...] = (),
     tpu_chips: TpuChipRequest | None = None,
+    setup: WorkloadSetup | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
     chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
+    if setup is not None:
+        chip_fields["setup"] = setup
     return PoolWorkloadSubmitRequest(
         **chip_fields,
         org_id=org_id,
@@ -119,6 +123,7 @@ def pool_callable_request(
     dependencies: tuple[str, ...] = (),
     atomic: bool = False,
     tpu_chips: TpuChipRequest | None = None,
+    setup: WorkloadSetup | None = None,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload.
 
@@ -130,6 +135,8 @@ def pool_callable_request(
     reject_remote_callable_signature(execution.signature)
     reject_remote_callable_signing_environment(environment)
     chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
+    if setup is not None:
+        chip_fields["setup"] = setup
     return PoolCallableSubmitRequest(
         **chip_fields,
         org_id=org_id,

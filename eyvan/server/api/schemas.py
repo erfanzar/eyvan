@@ -49,6 +49,7 @@ from eyvan.records import (
     WarmWindow,
     WorkloadDefinition,
     WorkloadRecord,
+    WorkloadSetup,
     WorkspaceRef,
     validate_secret_mount_contract,
 )
@@ -268,12 +269,17 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: Run on some chips of one host of a chip-sharing pool instead of the
     #: whole slice. Omitted from the wire document while unset.
     tpu_chips: TpuChipRequest | None = None
+    #: A bash step run on every host before the command, inside the job's
+    #: environment. Omitted from the wire document while unset.
+    setup: WorkloadSetup | None = None
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         document = handler(self)
         if self.tpu_chips is None:
             document.pop("tpu_chips", None)
+        if self.setup is None:
+            document.pop("setup", None)
         return document
 
     @model_validator(mode="after")
@@ -337,6 +343,9 @@ class PoolCallableSubmitRequest(ApiModel):
     #: Logical names of large inputs this job pulls. A hint only: cells that
     #: recently ran something naming the same asset are preferred.
     named_assets: tuple[str, ...] = ()
+    #: A bash step run on every host before the callable loads, inside the
+    #: job's environment. Omitted by the SDK when unset.
+    setup: WorkloadSetup | None = None
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:

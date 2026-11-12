@@ -29,6 +29,7 @@ from eyvan.records import (
     WorkloadEstimate,
     WorkloadProgress,
     WorkloadRecord,
+    WorkloadSetup,
     WorkloadState,
 )
 from eyvan.sdk.client.identity import ClientIdentity
@@ -198,6 +199,7 @@ class EyvanClient:
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
+        setup: WorkloadSetup | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -225,6 +227,7 @@ class EyvanClient:
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
             dependencies=dependencies,
+            setup=setup,
         )
         response = self._mutating_request(
             "POST",
@@ -263,6 +266,7 @@ class EyvanClient:
         dependencies: tuple[str, ...] = (),
         atomic: bool = False,
         tpu_chips: TpuChipRequest | None = None,
+        setup: WorkloadSetup | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -293,6 +297,7 @@ class EyvanClient:
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
             dependencies=dependencies,
+            setup=setup,
         )
         response = self._mutating_request(
             "POST",

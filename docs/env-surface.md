@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-223 variables are currently referenced. Names set on workload
+224 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -222,6 +222,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_CONTAINER_RUNTIME` | `eyvan/worker/runtime/container` |
 | `EYVAN_CONTAINER_STOP_POLL_S` | `eyvan/worker/runtime/container` |
 | `EYVAN_CONTAINER_STOP_SETTLE_S` | `eyvan/worker/runtime/container` |
+| `EYVAN_PYTHON` | `eyvan/worker/runtime/dependency_entry` |
 | `EYVAN_RUNTIME_ENV_DIR` | `eyvan/worker/runtime/dependency_entry` |
 | `EYVAN_LOCAL_RUNTIME_DIR` | `eyvan/worker/runtime/local_process` |
 | `EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED` | `eyvan/worker/runtime/log_records` |

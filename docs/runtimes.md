@@ -207,6 +207,49 @@ automatically.
 `@execute(..., workspace="src/")` ships a source tree to the worker's
 working directory for the callable to import.
 
+### Per-job setup step
+
+`setup=` runs a bash script on every host the job lands on, after its
+`dependencies` are installed and before the callable (or command) starts:
+
+```python
+from eyvan import SetupScript, TpuConfig
+
+# Inline bash.
+TpuConfig("v6e-8", setup="$EYVAN_PYTHON -m pip install 'git+https://github.com/me/lib@abc123'")
+
+# A script fetched on each host, with arguments and an optional pin.
+fetched = SetupScript("https://example.com/eyvan_setup.sh", args=["--ref", "abc123"], sha256=None)
+TpuConfig("v6e-8", setup=fetched)
+
+# A local file, read at submission and shipped inline.
+local = SetupScript("scripts/eyvan_setup.sh", args=["--ref", "abc123"])
+TpuConfig("v6e-8", setup=local)
+```
+
+`GpuConfig` and `CpuConfig` take the same `setup=`.
+
+- The step runs as the job user, not root, inside the job's own environment:
+  `VIRTUAL_ENV` and `PATH` point at it, and `EYVAN_PYTHON` names its
+  interpreter. Install into that interpreter. System changes such as apt
+  packages or kernel settings belong in the fleet's `runtime.init_commands`.
+- URLs must be `https://`. A redirect that leaves https is refused, and so is a
+  script larger than 1 MiB. With `sha256`, a fetched script whose bytes differ
+  fails the job. Without it, the bytes fetched at run time are what the cache
+  is keyed by, so a script that changed behind its URL runs again.
+- The result is cached per host with the job's environment, keyed by the exact
+  script content plus its arguments. A second job or rank with the same step
+  reuses it; changing either builds a new environment. Jobs without `setup=`
+  keep their existing cache keys.
+- Output is not captured: it goes to the job's log (`eyvan workload logs`). A
+  non-zero exit fails the job before it starts, discards the half-built
+  environment, and counts against `max_failure_retries`.
+- On a multi-host job the step does not see the multi-host JAX join marker, so
+  any Python it runs cannot try to join the gang. The job itself still joins.
+- Unset, `setup` is omitted from the request and the stored workload, so the
+  payload is unchanged. Inline scripts are capped at 32 KiB and take at most 64
+  arguments.
+
 ## Local components
 
 `eyvan runtime init` stages the local native runtime profile

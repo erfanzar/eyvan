@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from eyvan.records import TpuChipRequest
+from eyvan.records import TpuChipRequest, WorkloadSetup
 from eyvan.server.service._control_plane.shared import (
     DEFAULT_MAX_RETRIES,
     CommandExecution,
@@ -108,6 +108,7 @@ class SubmissionMixin:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         tpu_chips: TpuChipRequest | None = None,
+        setup: WorkloadSetup | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -156,6 +157,8 @@ class SubmissionMixin:
                 "dependencies": list(dependencies),
                 # Only when asked for, so every whole-slice fingerprint is unchanged.
                 **({"tpu_chips": tpu_chips.model_dump(mode="json")} if tpu_chips is not None else {}),
+                # Likewise: a different setup step is a different job.
+                **({"setup": setup.model_dump(mode="json")} if setup is not None else {}),
             }
         )
         async with self.repository.transaction() as tx:
@@ -286,6 +289,7 @@ class SubmissionMixin:
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
                 dependencies=dependencies,
+                setup=setup,
             )
             return await self._store_workload(
                 tx,

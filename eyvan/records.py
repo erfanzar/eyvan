@@ -1347,6 +1347,67 @@ class TpuChipRequest(EyvanModel):
         return self
 
 
+#: Bounds on a per-job setup step. An inline script travels inside the workload
+#: record, so it is capped like any other persisted text.
+MAX_SETUP_SCRIPT_BYTES = 32 * 1024
+MAX_SETUP_ARGS = 64
+MAX_SETUP_ARG_LENGTH = 4096
+_SETUP_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class WorkloadSetup(EyvanModel):
+    """A bash step run on every host of a job, inside the job's own environment.
+
+    Exactly one of ``script`` (inline bash) or ``url`` (an ``https://`` script
+    fetched on the host) is set. ``args`` are passed to the script; ``sha256``,
+    when given, refuses a fetched script whose bytes differ. The worker runs it
+    after the job's ``dependencies`` are installed, with ``EYVAN_PYTHON`` naming
+    the job interpreter, and caches the result by script content and args.
+    """
+
+    script: str | None = Field(default=None, max_length=MAX_SETUP_SCRIPT_BYTES)
+    url: str | None = Field(default=None, max_length=2048)
+    args: tuple[str, ...] = ()
+    sha256: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        for name in ("script", "url", "sha256"):
+            if document.get(name) is None:
+                document.pop(name, None)
+        if not document.get("args"):
+            document.pop("args", None)
+        return document
+
+    @model_validator(mode="after")
+    def validate_setup(self) -> WorkloadSetup:
+        if (self.script is None) == (self.url is None):
+            raise ValueError("a setup step needs exactly one of an inline script or an https:// URL")
+        if self.script is not None:
+            if not self.script.strip():
+                raise ValueError("a setup script must not be empty")
+            if "\x00" in self.script:
+                raise ValueError("a setup script must not contain null bytes")
+            if len(self.script.encode("utf-8")) > MAX_SETUP_SCRIPT_BYTES:
+                raise ValueError(f"a setup script must be at most {MAX_SETUP_SCRIPT_BYTES} bytes")
+            if self.sha256 is not None:
+                raise ValueError("sha256 pins a fetched script; an inline script is already exact")
+        if self.url is not None:
+            # https only: the script runs as the job, so a plain-http fetch would
+            # let anything on the path between the host and the server run code.
+            if not self.url.startswith("https://") or any(c in self.url for c in " \t\r\n\x00"):
+                raise ValueError("a setup URL must be an https:// URL without whitespace")
+        if self.sha256 is not None and not _SETUP_SHA256.fullmatch(self.sha256):
+            raise ValueError("setup sha256 must be 64 lowercase hex characters")
+        if len(self.args) > MAX_SETUP_ARGS:
+            raise ValueError(f"a setup step takes at most {MAX_SETUP_ARGS} arguments")
+        for argument in self.args:
+            if len(argument) > MAX_SETUP_ARG_LENGTH or "\x00" in argument:
+                raise ValueError(f"setup arguments must be at most {MAX_SETUP_ARG_LENGTH} characters, no null bytes")
+        return self
+
+
 class CommandExecution(EyvanModel):
     """A shell command submitted to a cell execution backend."""
 
@@ -1565,12 +1626,17 @@ class WorkloadDefinition(EyvanModel):
     #: default and every spec written before chip sharing -- is omitted from the
     #: wire document, so existing payloads and fingerprints are unchanged.
     tpu_chips: TpuChipRequest | None = None
+    #: A bash step run on every host before the job, inside its environment.
+    #: Omitted from the wire document while unset, like ``tpu_chips``.
+    setup: WorkloadSetup | None = None
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         document = handler(self)
         if self.tpu_chips is None:
             document.pop("tpu_chips", None)
+        if self.setup is None:
+            document.pop("setup", None)
         return document
 
     @model_validator(mode="after")

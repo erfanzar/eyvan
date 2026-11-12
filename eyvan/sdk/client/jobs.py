@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import typing as tp
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from eyvan.artifacts import StoredCallableArtifact
 from eyvan.domain.accelerators import sort_accelerator_types
@@ -21,6 +23,7 @@ from eyvan.records import (
     CapacityClass,
     TpuChipRequest,
     WorkloadRecord,
+    WorkloadSetup,
     WorkloadState,
 )
 
@@ -115,6 +118,65 @@ def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, mult
     return accelerator_type
 
 
+@dataclass(frozen=True, slots=True)
+class SetupScript:
+    """A per-job setup step: a bash script and the arguments it is run with.
+
+    ``source`` is an ``https://`` URL, fetched on each host, or a local file
+    path, read here at submission and shipped inline. ``sha256`` pins the
+    script's bytes: a fetched or local script that differs is refused.
+    """
+
+    source: str
+    args: tuple[str, ...] = ()
+    sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.args, (str, bytes)) or not isinstance(self.args, (list, tuple)):
+            raise ValueError("SetupScript args must be a list of strings")
+        if any(not isinstance(argument, str) for argument in self.args):
+            raise ValueError("SetupScript args must be strings")
+        object.__setattr__(self, "args", tuple(self.args))
+
+    def to_workload_setup(self) -> WorkloadSetup:
+        """Return the wire form, reading a local file now so the host needs no copy of it."""
+
+        source = self.source.strip() if isinstance(self.source, str) else ""
+        if not source:
+            raise ValueError("SetupScript needs an https:// URL or a local file path")
+        if source.startswith("https://"):
+            return WorkloadSetup(url=source, args=self.args, sha256=self.sha256)
+        if "://" in source:
+            raise ValueError("a SetupScript URL must be https://; the script runs as the job")
+        path = Path(source).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ValueError(f"cannot read setup script {source!r}: {error}") from error
+        if self.sha256 is not None and hashlib.sha256(text.encode("utf-8")).hexdigest() != self.sha256:
+            raise ValueError(f"setup script {source!r} does not match its sha256")
+        return WorkloadSetup(script=text, args=self.args)
+
+
+def workload_setup(setup: SetupScript | WorkloadSetup | str | None) -> WorkloadSetup | None:
+    """Normalize a config's ``setup`` value to its wire form.
+
+    A plain string is inline bash, except a single ``https://`` token, which is
+    a script URL. Use ``SetupScript`` to pass arguments or pin a hash.
+    """
+
+    if setup is None or isinstance(setup, WorkloadSetup):
+        return setup
+    if isinstance(setup, SetupScript):
+        return setup.to_workload_setup()
+    if isinstance(setup, str):
+        stripped = setup.strip()
+        if stripped.startswith("https://") and not any(character.isspace() for character in stripped):
+            return WorkloadSetup(url=stripped)
+        return WorkloadSetup(script=setup)
+    raise ValueError("setup must be a bash string, an https:// URL, or a SetupScript")
+
+
 #: Marks a ``TpuConfig`` whose caller did not name a capacity class. Resolved to
 #: spot in ``__post_init__``, so every reader still sees a real ``CapacityClass``.
 _UNSET_CAPACITY_CLASS: tp.Final[CapacityClass] = tp.cast(CapacityClass, object())
@@ -178,6 +240,11 @@ class TpuConfig:
     #: ``index // chips_per_host``). Implies ``chips=len(chips_indexes)``; all
     #: indexes must sit on one host. The job waits while any of them is busy.
     chips_indexes: tuple[int, ...] | None = None
+    #: A bash step run on every host before the callable loads, inside the job's
+    #: environment (``$EYVAN_PYTHON`` is its interpreter). Inline bash, an
+    #: ``https://`` URL, or a ``SetupScript`` with args; cached per host by the
+    #: script's content and args.
+    setup: SetupScript | WorkloadSetup | str | None = None
     #: Whether the caller named ``capacity_class``. Derived, never passed: only
     #: an unnamed class may be substituted by a fleet's reserved capacity.
     capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
@@ -189,6 +256,13 @@ class TpuConfig:
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
         object.__setattr__(self, "type", normalized)
         self._validate_chips()
+        object.__setattr__(self, "setup", workload_setup(self.setup))
+
+    @property
+    def setup_request(self) -> WorkloadSetup | None:
+        """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
+
+        return self.setup if isinstance(self.setup, WorkloadSetup) else None
 
     def _validate_chips(self) -> None:
         indexes = self.chips_indexes
@@ -270,10 +344,19 @@ class GpuConfig:
     #: pickled function's imports resolve against them -- which is the point:
     #: adding one library should not mean rebuilding an image.
     dependencies: tuple[str, ...] = ()
+    #: A bash step run before the callable loads. See ``TpuConfig.setup``.
+    setup: SetupScript | WorkloadSetup | str | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
+        object.__setattr__(self, "setup", workload_setup(self.setup))
+
+    @property
+    def setup_request(self) -> WorkloadSetup | None:
+        """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
+
+        return self.setup if isinstance(self.setup, WorkloadSetup) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,10 +394,19 @@ class CpuConfig:
     #: pickled function's imports resolve against them -- which is the point:
     #: adding one library should not mean rebuilding an image.
     dependencies: tuple[str, ...] = ()
+    #: A bash step run before the callable loads. See ``TpuConfig.setup``.
+    setup: SetupScript | WorkloadSetup | str | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
+        object.__setattr__(self, "setup", workload_setup(self.setup))
+
+    @property
+    def setup_request(self) -> WorkloadSetup | None:
+        """Return the wire form of ``setup``, or ``None`` when the job has no setup step."""
+
+        return self.setup if isinstance(self.setup, WorkloadSetup) else None
 
 
 @dataclass(frozen=True, slots=True)

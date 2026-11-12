@@ -14,7 +14,7 @@ if tp.TYPE_CHECKING:
     from eyvan.config import EyvanSettings
     from eyvan.records import CapacityClass
     from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
-    from eyvan.sdk.client.jobs import CpuConfig, GpuConfig
+    from eyvan.sdk.client.jobs import CpuConfig, GpuConfig, SetupScript
     from eyvan.sdk.execution import (
         EyvanJob,
         EyvanJobError,
@@ -41,6 +41,7 @@ __all__ = (
     "EyvanSettings",
     "EyvanUnavailableError",
     "GpuConfig",
+    "SetupScript",
     "TpuConfig",
     "execute",
     "in_job_context",
@@ -126,6 +127,10 @@ def __getattr__(name: str):
         from eyvan.sdk.client.jobs import CpuConfig
 
         return _cache_export(name, CpuConfig)
+    if name == "SetupScript":
+        from eyvan.sdk.client.jobs import SetupScript
+
+        return _cache_export(name, SetupScript)
     if name == "execute":
         from eyvan.sdk.execution import execute
 

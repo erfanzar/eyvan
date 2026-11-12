@@ -61,22 +61,114 @@ FALLBACK_CACHE_DIR = ".eyvan-runtime-envs"
 COMPLETE_MARKER = ".eyvan-complete"
 
 
-def environment_key(requirements: tp.Sequence[str]) -> str:
+def environment_key(requirements: tp.Sequence[str], setup_identity: str | None = None) -> str:
     """Return a versioned identity for requirements and their parent interpreter.
 
     Sorted and de-duplicated first, because the order somebody typed them in is
     not part of what they asked for -- and two identical requests that hash
-    differently mean two environments and two installs.
+    differently mean two environments and two installs. A setup step joins the
+    identity only when present, so every environment built without one keeps
+    the key it always had.
     """
 
-    identity = {
+    identity: dict[str, tp.Any] = {
         "format": 2,
         "interpreter": os.path.realpath(sys.executable),
         "version": list(sys.version_info),
         "parent_sites": _parent_site_packages(),
         "requirements": sorted({item.strip() for item in requirements if item.strip()}),
     }
+    if setup_identity is not None:
+        identity["setup"] = setup_identity
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+
+
+#: Largest setup script fetched from a URL. A setup script installs things; one
+#: larger than this is almost certainly not the file somebody meant to point at.
+MAX_FETCHED_SETUP_BYTES = 1024 * 1024
+_SETUP_FETCH_TIMEOUT_S = 60.0
+#: Where the job interpreter is named for the setup script.
+SETUP_PYTHON_ENV = "EYVAN_PYTHON"
+
+
+class SetupStep(tp.NamedTuple):
+    """A resolved setup step: the exact script bytes and the arguments it runs with."""
+
+    script: str
+    args: tuple[str, ...]
+
+    @property
+    def identity(self) -> str:
+        """Content address of the step: what decides whether a cached run is reusable."""
+
+        body = json.dumps({"script": self.script, "args": list(self.args)}, sort_keys=True)
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _fetch_setup_script(url: str) -> str:
+    """Download a setup script over https, refusing a redirect that leaves https."""
+
+    import urllib.request
+
+    if not url.startswith("https://"):
+        raise RuntimeError(f"setup URL {url!r} must be https://")
+    try:
+        with urllib.request.urlopen(url, timeout=_SETUP_FETCH_TIMEOUT_S) as response:
+            if not str(response.geturl()).startswith("https://"):
+                raise RuntimeError(f"setup URL {url!r} redirected away from https")
+            body = response.read(MAX_FETCHED_SETUP_BYTES + 1)
+    except OSError as error:
+        raise RuntimeError(f"could not fetch setup script {url}: {error}") from error
+    if len(body) > MAX_FETCHED_SETUP_BYTES:
+        raise RuntimeError(f"setup script {url} is larger than {MAX_FETCHED_SETUP_BYTES} bytes")
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"setup script {url} is not UTF-8 text") from error
+
+
+def resolve_setup(document: tp.Mapping[str, tp.Any]) -> SetupStep:
+    """Turn the wire form of a setup step into the exact script that will run.
+
+    A fetched script is pinned by ``sha256`` when one was given; without one,
+    the bytes fetched now are still what the cache is keyed by, so a script
+    that changed behind its URL runs again rather than being trusted stale.
+    """
+
+    args = tuple(str(item) for item in document.get("args") or ())
+    script = document.get("script")
+    url = document.get("url")
+    if (script is None) == (url is None):
+        raise RuntimeError("a setup step needs exactly one of an inline script or a URL")
+    if url is not None:
+        script = _fetch_setup_script(str(url))
+        pinned = document.get("sha256")
+        if pinned is not None and hashlib.sha256(script.encode("utf-8")).hexdigest() != pinned:
+            raise RuntimeError(f"setup script {url} does not match its pinned sha256")
+    return SetupStep(script=str(script), args=args)
+
+
+def _run_setup(environment: Path, setup: SetupStep) -> None:
+    """Run the setup step inside ``environment``, streaming its output into the job's log."""
+
+    script_path = environment / ".eyvan-setup.sh"
+    script_path.write_text(setup.script, encoding="utf-8")
+    shell = shutil.which("bash") or "/bin/sh"
+    child_environment = activate(environment)
+    child_environment[SETUP_PYTHON_ENV] = str(environment / "bin" / "python")
+    # The multi-host join belongs to the job. With the marker present, any
+    # Python the step starts (``$EYVAN_PYTHON -m pip`` is enough) would load the
+    # multi-host ``sitecustomize`` and try to join the gang from here -- the
+    # same reason the wrapper itself runs with ``-I``. The job still gets it.
+    child_environment.pop("EYVAN_JAX_MULTIHOST", None)
+    print(f"eyvan: running setup step ({setup.identity[:12]})", file=sys.stderr, flush=True)
+    # Not captured: the step's output is the job's output, so a failing install
+    # is readable in `eyvan workload logs` instead of being summarized away.
+    completed = subprocess.run(
+        [shell, str(script_path), *setup.args], env=child_environment, cwd=str(environment), check=False
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"the setup step exited with status {completed.returncode}")
 
 
 def cache_root() -> Path:
@@ -148,11 +240,16 @@ def _install_commands(environment: Path, requirements: tp.Sequence[str]) -> list
             # working one. `--python sys.executable` pins the interpreter that
             # will unpickle the callable; left to uv, it may choose another.
             [uv, "venv", "--python", sys.executable, "--system-site-packages", str(environment)],
-            [uv, "pip", "install", "--python", str(environment / "bin" / "python"), *requirements],
+            # A setup-only job declares no packages, and an empty install is an error.
+            *(
+                [[uv, "pip", "install", "--python", str(environment / "bin" / "python"), *requirements]]
+                if requirements
+                else []
+            ),
         ]
     return [
         [sys.executable, "-m", "venv", "--system-site-packages", str(environment)],
-        [str(environment / "bin" / "python"), "-m", "pip", "install", *requirements],
+        *([[str(environment / "bin" / "python"), "-m", "pip", "install", *requirements]] if requirements else []),
     ]
 
 
@@ -195,7 +292,7 @@ def _inherit_running_environment(environment: Path) -> None:
     (purelib / PARENT_PATH_FILE).write_text("".join(f"{path}\n" for path in parents), encoding="utf-8")
 
 
-def prepare(requirements: tp.Sequence[str], *, root: Path | None = None) -> Path:
+def prepare(requirements: tp.Sequence[str], *, root: Path | None = None, setup: SetupStep | None = None) -> Path:
     """Return an environment holding ``requirements``, building it if needed.
 
     Raises:
@@ -207,7 +304,7 @@ def prepare(requirements: tp.Sequence[str], *, root: Path | None = None) -> Path
 
     base = root if root is not None else cache_root()
     base.mkdir(parents=True, exist_ok=True)
-    environment = base / environment_key(requirements)
+    environment = base / environment_key(requirements, setup.identity if setup is not None else None)
     marker = environment / COMPLETE_MARKER
     if marker.exists():
         return environment
@@ -235,6 +332,14 @@ def prepare(requirements: tp.Sequence[str], *, root: Path | None = None) -> Path
                 # installed into it, so the job's own pins are resolved against
                 # -- and layered over -- what the running interpreter provides.
                 _inherit_running_environment(environment)
+        if setup is not None:
+            # After the packages, so the step can build on them; before the
+            # marker, so a step that failed or was killed is rerun, not trusted.
+            try:
+                _run_setup(environment, setup)
+            except BaseException:
+                shutil.rmtree(environment, ignore_errors=True)
+                raise
         marker.write_text("\n".join(requirements), encoding="utf-8")
     return environment
 
@@ -259,6 +364,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="eyvan-dependency-entry")
     parser.add_argument("--require", action="append", default=[], metavar="REQUIREMENT")
+    parser.add_argument("--setup", default=None, metavar="JSON")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -271,11 +377,20 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         del command[0]
     if not command:
         parser.error("a command to execute is required")
-    if not arguments.require:
-        parser.error("at least one --require is needed; without one this wrapper does nothing")
+    if not arguments.require and arguments.setup is None:
+        parser.error("at least one --require or a --setup is needed; without one this wrapper does nothing")
 
     try:
-        environment = prepare(arguments.require)
+        setup = None
+        if arguments.setup is not None:
+            try:
+                document = json.loads(arguments.setup)
+            except ValueError as error:
+                raise RuntimeError(f"--setup is not valid JSON: {error}") from error
+            if not isinstance(document, dict):
+                raise RuntimeError("--setup must be a JSON object")
+            setup = resolve_setup(document)
+        environment = prepare(arguments.require, setup=setup)
     except RuntimeError as error:
         # Non-zero before the job starts. The alternative is an ImportError
         # minutes later on an accelerator, blamed on the user's code.

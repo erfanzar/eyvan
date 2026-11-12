@@ -5044,6 +5044,16 @@
             "title": "Secret Mounts",
             "type": "object"
           },
+          "setup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkloadSetup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tpu_chips": {
             "anyOf": [
               {
@@ -5411,6 +5421,16 @@
             },
             "title": "Secret Mounts",
             "type": "object"
+          },
+          "setup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkloadSetup"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "tpu_chips": {
             "anyOf": [
@@ -8774,6 +8794,16 @@
             "title": "Secret Mounts",
             "type": "object"
           },
+          "setup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkloadSetup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tpu_chips": {
             "anyOf": [
               {
@@ -9615,6 +9645,57 @@
           "created_by"
         ],
         "title": "WorkloadRecord",
+        "type": "object"
+      },
+      "WorkloadSetup": {
+        "additionalProperties": false,
+        "description": "A bash step run on every host of a job, inside the job's own environment.\n\nExactly one of ``script`` (inline bash) or ``url`` (an ``https://`` script\nfetched on the host) is set. ``args`` are passed to the script; ``sha256``,\nwhen given, refuses a fetched script whose bytes differ. The worker runs it\nafter the job's ``dependencies`` are installed, with ``EYVAN_PYTHON`` naming\nthe job interpreter, and caches the result by script content and args.",
+        "properties": {
+          "args": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "script": {
+            "anyOf": [
+              {
+                "maxLength": 32768,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "title": "WorkloadSetup",
         "type": "object"
       },
       "WorkloadSpendRecord": {

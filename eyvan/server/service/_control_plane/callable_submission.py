@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.domain.tpu_chips import chip_request_error
-from eyvan.records import ResourceVector, TpuChipRequest
+from eyvan.records import ResourceVector, TpuChipRequest, WorkloadSetup
 from eyvan.server.service._control_plane.shared import (
     CALLABLE_SIGNING_KEY_ENV,
     DEFAULT_MAX_RETRIES,
@@ -100,6 +100,7 @@ class CallableSubmissionMixin:
         dependencies: tuple[str, ...] = (),
         atomic: bool = False,
         tpu_chips: TpuChipRequest | None = None,
+        setup: WorkloadSetup | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on ``pods`` workers, packed or atomic.
@@ -168,6 +169,8 @@ class CallableSubmissionMixin:
                 # Only when asked for, so every whole-slice fingerprint (and
                 # therefore every stored replay) stays what it was.
                 **({"tpu_chips": tpu_chips.model_dump(mode="json")} if tpu_chips is not None else {}),
+                # Likewise: a different setup step is a different job.
+                **({"setup": setup.model_dump(mode="json")} if setup is not None else {}),
             }
         )
         async with self.repository.transaction() as tx:
@@ -361,6 +364,7 @@ class CallableSubmissionMixin:
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
                 dependencies=dependencies,
+                setup=setup,
             )
             return await self._store_workload(
                 tx,
@@ -582,6 +586,7 @@ class CallableSubmissionMixin:
         placement: PlacementMode = PlacementMode.ATOMIC,
         alternate_pool_templates: tuple[str, ...] = (),
         tpu_chips: TpuChipRequest | None = None,
+        setup: WorkloadSetup | None = None,
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
 
@@ -645,4 +650,5 @@ class CallableSubmissionMixin:
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
             dependencies=dependencies,
+            setup=setup,
         )

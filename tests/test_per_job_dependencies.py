@@ -455,7 +455,7 @@ def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path, monk
 
     environment = tmp_path / "env"
     environment.mkdir()
-    monkeypatch.setattr(dependency_entry, "prepare", lambda requirements: environment)
+    monkeypatch.setattr(dependency_entry, "prepare", lambda requirements, **_options: environment)
 
     class Executed(BaseException):
         """What `os.execvp` would have run, instead of replacing the process."""
