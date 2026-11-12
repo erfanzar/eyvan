@@ -36,6 +36,36 @@ territory.
 | `eyvan gcp browse [--project P] [--json]` | list existing TPU VMs and unreachable locations; a terminal can pick and confirm attachment, while JSON/non-TTY use only lists |
 | `eyvan gcp connect --tpu NAME [--project P] [--zone Z] --dry-run` | preview attaching an existing TPU without creating, stopping or deleting it |
 | `eyvan gcp connect --ssh user@host --dry-run` | discover a TPU slice or preview a prepared CPU native-worker host; CPU/memory overrides are optional |
+| `eyvan race tpu TYPE --project P [--zone Z] [--keep-first] [--account EMAIL] [--json]` | request one TPU shape in every zone that offers it, report who grants it, then delete everything |
+| `eyvan race sweep RUN_ID [--project P]` | delete whatever a race left behind and confirm its zones are clean |
+
+### Race for a TPU shape
+
+Quota is not queue access: a zone can show a large Spot quota and still refuse
+the request (code 7), leave it waiting, or suspend it after a few minutes. `eyvan
+race tpu` asks every zone at once:
+
+```bash
+eyvan race tpu v6e-8 --project my-project --account me@example.com --yes
+eyvan race tpu v6e-8 --project my-project --zone us-east5-b --keep-first --yes
+eyvan race sweep 0a1b2c3d
+```
+
+Without `--zone`, every zone of the project whose catalog offers the shape is
+raced. Spot is the default (`--on-demand` switches). By default it only
+measures: each grant is deleted as soon as it is seen. `--keep-first` keeps the
+first grant, stops the others, and prints the `eyvan gcp connect` and delete
+commands; the kept TPU bills until deleted. `--account` mints the token as that
+account for this process only; gcloud's configured account is not changed.
+`--timeout` (minutes, default 30) bounds the wait per zone.
+
+Every request is named `eyvan-race-<run id>-<zone>` and labelled `eyvan-race`.
+Cleanup waits a request out of `PROVISIONING` (where the API refuses deletes),
+and a final sweep lists every raced zone again; a zone that cannot be listed is
+reported as unknown, not clean. Ctrl-C stops the race but not the cleanup. The
+receipt is written to `~/.eyvan/races/<run id>.json` (or `--receipt`), and
+`eyvan race sweep` reads it. Without `--yes` the command asks before creating
+anything and refuses to run unattended.
 
 ### Attach existing hardware
 

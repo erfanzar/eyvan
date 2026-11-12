@@ -39,6 +39,7 @@ from eyvan.sdk.commands.mcp import register_mcp_commands
 from eyvan.sdk.commands.operations import register_operation_commands
 from eyvan.sdk.commands.proof import register_proof_commands
 from eyvan.sdk.commands.query import register_query_commands
+from eyvan.sdk.commands.race import register_race_commands
 from eyvan.sdk.commands.research import register_research_commands
 from eyvan.sdk.commands.resources import register_resource_commands
 from eyvan.sdk.commands.runtime import register_runtime_commands
@@ -173,6 +174,7 @@ for register_commands in (
     register_mcp_commands,
     register_proof_commands,
     register_query_commands,
+    register_race_commands,
     register_resource_commands,
     register_runtime_commands,
     register_service_commands,
