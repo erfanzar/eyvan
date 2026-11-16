@@ -452,6 +452,42 @@ def test_the_tool_server_refuses_other_paths_and_stops_on_release() -> None:
     assert _unreachable(declaration.url)
 
 
+def test_a_refused_request_tells_the_client_the_connection_is_closing() -> None:
+    """The server drops the socket after a 404/413; a pooled client must be told so.
+
+    Without ``Connection: close`` the client keeps the socket and its next request
+    meets "Server disconnected without sending a response" -- timing dependent,
+    which is how it failed only on one hosted Python version.
+    """
+
+    declaration = ToolDeclaration(TOOLS)
+    try:
+        with httpx.Client(trust_env=False) as client:
+            other = declaration.url.rsplit("/", 1)[0] + "/not-it"
+            refused = client.post(other, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            assert refused.status_code == 404
+            assert refused.headers.get("connection") == "close"
+            # Declared oversized, body never sent: the server must refuse from the header alone.
+            import socket
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(declaration.url)
+            with socket.create_connection((parts.hostname, parts.port), timeout=5) as raw:
+                raw.sendall(
+                    f"POST {parts.path} HTTP/1.1\r\nHost: {parts.netloc}\r\n"
+                    f"Content-Length: {64 * 1024 * 1024}\r\n\r\n".encode()
+                )
+                head = raw.recv(4096).decode("latin-1").lower()
+            assert head.startswith("http/1.1 413")
+            assert "connection: close" in head
+            kept = client.post(declaration.url, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            assert kept.status_code == 200 and kept.headers.get("connection") != "close"
+            for _ in range(20):  # a reused stale socket would fail here
+                assert client.get(declaration.url).status_code == 405
+    finally:
+        declaration.release()
+
+
 # ---------------------------------------------------- models and status
 
 

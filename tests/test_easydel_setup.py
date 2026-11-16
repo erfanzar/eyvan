@@ -24,9 +24,9 @@ from eyvan.records import WorkloadSetup
 from eyvan.sdk.client import easydel_setup
 from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 
-MAIN = "090a03b2e0b3606bd38e0e3fcfdc640cd7e6e246"
-BRANCH = "580a86a72ba7fe9c7ee6b040d2672c55089dfad6"
-VNEXT = "17513c559175ba0eb61ac98b1a8ce2f0d2a2a54f"
+MAIN = "090a03b2e0b3606bd38e0e3fcfdc640cd7e6e246"  # pragma: allowlist secret
+BRANCH = "580a86a72ba7fe9c7ee6b040d2672c55089dfad6"  # pragma: allowlist secret
+VNEXT = "17513c559175ba0eb61ac98b1a8ce2f0d2a2a54f"  # pragma: allowlist secret
 TAG_OBJECT = "1" * 40
 TAG_COMMIT = "2" * 40
 

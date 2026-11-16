@@ -122,11 +122,16 @@ try {
   assert(cookie?.httpOnly && cookie?.secure && cookie?.sameSite === "Lax");
   assert(!(await page.evaluate(() => globalThis.document.cookie)).includes("eyvan_session"));
   assert.equal(await page.evaluate(() => globalThis.sessionStorage.length), 0);
-  const unexpectedStorage = await page.evaluate(() =>
-    Object.entries(globalThis.localStorage).filter(
-      ([key, value]) => key !== "eyvan.rail.collapsed" || !["0", "1"].includes(value),
-    ),
-  );
+  // Only layout preferences may be in web storage, each with the exact value shape
+  // it is written in, so a credential stored under any key still fails this check.
+  const unexpectedStorage = await page.evaluate(() => {
+    const allowed = {
+      "eyvan.rail.collapsed": /^[01]$/,
+      "eyvan.assistant.open": /^[01]$/,
+      "eyvan.assistant.width": /^[0-9]{3,4}$/,
+    };
+    return Object.entries(globalThis.localStorage).filter(([key, value]) => !allowed[key]?.test(value));
+  });
   assert.deepEqual(unexpectedStorage, []);
   assert.equal(await page.evaluate(async () => (await globalThis.fetch("/api/v1/session")).status), 200);
   receipt.checks.push("HttpOnly Secure Lax cookie, no web-storage credentials, authenticated fetch");

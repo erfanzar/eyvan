@@ -357,6 +357,10 @@ class _McpHandler(BaseHTTPRequestHandler):
         if body:
             self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # The socket is dropped after this response. Say so, or a pooled
+            # client reuses it and its next request meets a closed connection.
+            self.send_header("Connection", "close")
         self.end_headers()
         if body:
             self.wfile.write(body)

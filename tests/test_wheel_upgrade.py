@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-BASELINE = "0e82bebcd8d96f08bd7e1df460208f73a2e948fa"
+BASELINE = "0e82bebcd8d96f08bd7e1df460208f73a2e948fa"  # pragma: allowlist secret
 ROOT = Path(__file__).resolve().parents[1]
 
 
