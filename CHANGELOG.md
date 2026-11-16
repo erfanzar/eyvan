@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-11-16
+
+### Added
+
+- Per-job setup step: `TpuConfig`, `GpuConfig` and `CpuConfig` accept
+  `setup=` as inline bash, an `https://` script URL, or
+  `SetupScript(url_or_local_path, args=[...], sha256=...)`. It runs on every
+  host the job lands on, after its `dependencies`, as the job user, inside the
+  job's environment with `EYVAN_PYTHON` naming its interpreter; it is cached per
+  host by script content and arguments, its output goes to the job log, and a
+  non-zero exit fails the job. Unset, requests and records are unchanged.
+- `EasyDeLSetup(branch="vnext-into-main", repo="erfanzar/EasyDeL")`: a built-in
+  setup step that resolves the branch to one commit at submission and installs
+  every `libs/` package of EasyDeL's uv workspace from that checkout at the
+  versions its `uv.lock` pins.
+- `eyvan race tpu TYPE --project P` requests one TPU shape in every zone that
+  offers it at once, reports which zones grant, refuse or stall and how fast,
+  and deletes everything it created (`--keep-first` keeps the first grant).
+  `eyvan race sweep RUN_ID` cleans up after an interrupted race.
+
+### Fixed
+
+- The setup step does not see the multi-host JAX join marker, so Python it
+  starts cannot try to join the job's gang.
+- The Claude Code assistant's loopback tool server announces
+  `Connection: close` on the responses after which it drops the socket.
+
 ## [0.0.2] — 2026-11-03
 
 ### Changed
@@ -239,5 +266,6 @@ First public release.
   IDs removed from the tree.
 
 [Unreleased]: https://github.com/erfanzar/eyvan/commits/main
+[0.0.3]: https://pypi.org/project/eyvan/0.0.3/
 [0.0.2]: https://pypi.org/project/eyvan/0.0.2/
 [0.0.1]: https://pypi.org/project/eyvan/0.0.1/
