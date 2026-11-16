@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -201,7 +202,9 @@ def _run_script(tmp_path: Path, repo: Path, commit: str, *extra: str) -> tuple[s
     python = binaries / "jobpython"
     python.write_text(
         '#!/bin/sh\nif [ "$2" = "-" ]; then cat >/dev/null; echo verified; exit 0; fi\n'
-        f'exec {shutil.which("python3") or "python3"} "$@"\n',
+        # The interpreter running the tests, not whatever `python3` PATH finds:
+        # a job's EYVAN_PYTHON is always >= 3.11, and a bare macOS python3 is 3.9.
+        f'exec "{sys.executable}" "$@"\n',
         encoding="utf-8",
     )
     python.chmod(0o755)
