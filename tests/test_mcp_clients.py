@@ -13,9 +13,11 @@ or written (``HOME`` points into ``tmp_path``).
 from __future__ import annotations
 
 import json
+import re
 import stat
 import tomllib
 import typing as tp
+from datetime import UTC, datetime
 
 import click
 import pytest
@@ -125,7 +127,12 @@ def test_claude_code_user_scope_entry_is_merged_into_claude_json(tmp_path) -> No
     assert entry["headers"]["X-Eyvan-Org"] == "acme" and entry["headers"]["X-Eyvan-Project"] == "r"
     assert entry["headers"]["Authorization"].startswith("Bearer eyv_")
     assert _authenticates(http, entry["headers"])
-    assert any(item["name"].startswith("claude-code-mcp-") for item in _tokens(http, login))
+    minted = [item for item in _tokens(http, login) if item["name"].startswith("agent-claude-code-")]
+    assert len(minted) == 1
+    assert re.fullmatch(r"agent-claude-code-\d{8}-\d{4}-.+", minted[0]["name"]) and len(minted[0]["name"]) <= 64
+    days = (datetime.fromisoformat(minted[0]["expires_at"]) - datetime.now(UTC)).total_seconds() / 86400
+    assert 89 < days <= 90  # the dashboard's Connect-an-agent default, not "never"
+    assert "expires in 90 days" in result.output
 
     before = path.read_bytes()
     refused = CliRunner().invoke(mcp, ["install", "--client", "claude-code"], obj=session)
@@ -136,6 +143,40 @@ def test_claude_code_user_scope_entry_is_merged_into_claude_json(tmp_path) -> No
     again = json.loads(path.read_text(encoding="utf-8"))
     assert set(again["mcpServers"]) == {"other", "eyvan"} and again["projects"] == existing["projects"]
     assert again["mcpServers"]["eyvan"]["headers"]["Authorization"] != entry["headers"]["Authorization"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_days", "note"),
+    [(["--expires-in-days", "30"], 30, "expires in 30 days"), (["--no-expiry"], None, "never expires")],
+)
+def test_install_token_lifetime_is_chosen_explicitly(
+    tmp_path, extra: list[str], expected_days: int | None, note: str
+) -> None:
+    http, login, session, _client = _team(tmp_path)
+    path = tmp_path / "cursor.json"
+    result = CliRunner().invoke(mcp, ["install", "--client", "cursor", "--path", str(path), *extra], obj=session)
+    assert result.exit_code == 0, result.output
+    assert note in result.output
+    (minted,) = [item for item in _tokens(http, login) if item["name"].startswith("agent-cursor-")]
+    if expected_days is None:
+        assert minted["expires_at"] is None
+    else:
+        days = (datetime.fromisoformat(minted["expires_at"]) - datetime.now(UTC)).total_seconds() / 86400
+        assert expected_days - 1 < days <= expected_days
+
+
+def test_install_refuses_an_out_of_range_lifetime(tmp_path) -> None:
+    _http, _login, session, client = _team(tmp_path)
+    result = CliRunner().invoke(
+        mcp, ["install", "--client", "cursor", "--path", str(tmp_path / "c.json"), "--expires-in-days", "0"], obj=session
+    )
+    assert result.exit_code == 2
+    assert ("POST", "/api/v1/team/tokens") not in client.calls
+
+
+def test_agent_token_name_is_bounded_and_stamped() -> None:
+    name = mcp_module.agent_token_name("claude-code", "h" * 200, datetime(2026, 11, 18, 9, 5))
+    assert name.startswith("agent-claude-code-20261118-0905-") and len(name) == 64
 
 
 def test_cursor_entry_and_a_fresh_file(tmp_path) -> None:
@@ -245,7 +286,7 @@ def test_the_minted_token_is_revoked_when_the_write_fails(tmp_path, monkeypatch,
     assert result.exit_code != 0 and "disk full" in result.output and "revoked" in result.output
     assert "eyv_" not in result.output
     assert not path.exists()
-    minted = [item for item in _tokens(http, login) if item["name"].startswith(f"{client_key}-mcp-")]
+    minted = [item for item in _tokens(http, login) if item["name"].startswith(f"agent-{client_key}-")]
     assert len(minted) == 1 and minted[0]["revoked_at"] is not None
     assert ("DELETE", f"/api/v1/team/tokens/{minted[0]['id']}") in client.calls
 
@@ -261,7 +302,7 @@ def test_an_interrupt_after_minting_still_revokes_the_token(tmp_path, monkeypatc
     result = CliRunner().invoke(mcp, ["install", "--client", "cursor", "--path", str(path)], obj=session)
     assert result.exit_code != 0 and "eyv_" not in result.output
     assert not path.exists()
-    minted = [item for item in _tokens(http, login) if item["name"].startswith("cursor-mcp-")]
+    minted = [item for item in _tokens(http, login) if item["name"].startswith("agent-cursor-")]
     assert len(minted) == 1 and minted[0]["revoked_at"] is not None
     assert ("DELETE", f"/api/v1/team/tokens/{minted[0]['id']}") in client.calls
 
@@ -281,7 +322,7 @@ def test_a_mint_answer_without_the_token_revokes_the_record(tmp_path) -> None:
     result = CliRunner().invoke(mcp, ["install", "--client", "xerxes", "--path", str(path)], obj=session)
     assert result.exit_code != 0 and "unexpected answer" in result.output
     assert not path.exists()
-    minted = [item for item in _tokens(http, login) if item["name"].startswith("xerxes-mcp-")]
+    minted = [item for item in _tokens(http, login) if item["name"].startswith("agent-xerxes-")]
     assert len(minted) == 1 and minted[0]["revoked_at"] is not None
 
 

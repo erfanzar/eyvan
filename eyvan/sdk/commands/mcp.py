@@ -41,6 +41,7 @@ import tomllib
 import typing as tp
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -58,6 +59,20 @@ _MAX_DOCUMENT_BYTES = 1_048_576
 _MAX_CLAUDE_DOCUMENT_BYTES = 64 * 1_048_576
 #: Server names Claude Code, Codex and Cursor accept as plain keys.
 _PORTABLE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: Lifetime of a token minted by ``eyvan mcp install``; the same default as the
+#: dashboard's Connect-an-agent panel. ``--no-expiry`` is the explicit opt-out.
+DEFAULT_AGENT_TOKEN_DAYS = 90
+
+
+def agent_token_name(client_key: str, host: str, now: datetime | None = None) -> str:
+    """Return ``agent-<client>-<YYYYMMDD-HHMM>-<host>`` (local time, at most 64 characters).
+
+    The prefix and stamp match the dashboard's agent tokens, so a token list shows
+    which agent and when; the host says which machine's config holds it.
+    """
+
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M")
+    return f"agent-{client_key}-{stamp}-{host}"[:64]
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,6 +550,14 @@ def _revoke(session: CliSession, minted: dict[str, tp.Any] | None, notes: list[s
 @click.option("--path", "path_text", type=click.Path(dir_okay=False), help="Config file to update (default per client).")
 @_NAME
 @click.option("--yes", is_flag=True, help="Replace an existing entry of the same name.")
+@click.option(
+    "--expires-in-days",
+    type=click.IntRange(1, 3650),
+    default=DEFAULT_AGENT_TOKEN_DAYS,
+    show_default=True,
+    help="Days until the minted token expires (the dashboard's Connect-an-agent default).",
+)
+@click.option("--no-expiry", is_flag=True, help="Mint a token that never expires (revoke it yourself).")
 @click.option("--json", "as_json", is_flag=True, help="Report the result as JSON (secrets redacted).")
 @click.pass_obj
 def mcp_install(
@@ -544,6 +567,8 @@ def mcp_install(
     path_text: str | None,
     name: str,
     yes: bool,
+    expires_in_days: int,
+    no_expiry: bool,
     as_json: bool,
 ) -> None:
     """Write this plane into an MCP client's config with a fresh personal token (team mode).
@@ -586,8 +611,12 @@ def mcp_install(
     # file is one nobody knows to revoke.
     try:
         if team_mode:
-            token_name = f"{client.key}-mcp-{socket.gethostname()}"[:64]
-            payload = session.client.request("POST", "/api/v1/team/tokens", json={"name": token_name})
+            token_name = agent_token_name(client.key, socket.gethostname())
+            payload = session.client.request(
+                "POST",
+                "/api/v1/team/tokens",
+                json={"name": token_name, "expires_in_days": None if no_expiry else expires_in_days},
+            )
             raw_record = payload.get("record") if isinstance(payload, dict) else None
             record: dict[str, tp.Any] = raw_record if isinstance(raw_record, dict) else {}
             if record.get("id"):
@@ -598,8 +627,9 @@ def mcp_install(
             if minted is None:
                 minted = {"id": None, "name": token_name}
             secret = raw_token
+            lifetime = "never expires" if no_expiry else f"expires in {expires_in_days} days"
             notes.append(
-                f"minted personal token {minted['id']} ({minted['name']}); revoke it with "
+                f"minted personal token {minted['id']} ({minted['name']}, {lifetime}); revoke it with "
                 f"`eyvan tokens revoke {minted['id']}`"
             )
         else:

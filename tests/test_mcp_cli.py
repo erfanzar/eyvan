@@ -152,7 +152,7 @@ def test_install_writes_owner_only_merges_and_never_prints_the_token(tmp_path) -
         item["name"]
         for item in http.get("/api/v1/team/tokens", headers={"Authorization": f"Bearer {minted}"}).json()["tokens"]
     ]
-    assert any(name.startswith("xerxes-mcp-") for name in names)
+    assert any(name.startswith("agent-xerxes-") for name in names)
 
     # A second install refuses to overwrite and changes nothing.
     before = path.read_bytes()

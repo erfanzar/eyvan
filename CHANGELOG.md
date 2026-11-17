@@ -44,10 +44,12 @@ or `team: true`.
   personal token, with that user's permissions. Routes that create accounts or
   credentials, grant durable authority, run raw queries or act on the plane host
   are refused (see `eyvan/server/api/mcp_api_bridge.py`).
-- `eyvan mcp install --client xerxes|claude-code|codex|cursor` mints a named
-  token and writes the client's config file, and revokes the token if the write
-  fails. The dashboard's "Connect an agent" panel shows the same configuration;
-  its tokens default to 90 days.
+- `eyvan mcp install --client xerxes|claude-code|codex|cursor` mints a token
+  named `agent-<client>-<YYYYMMDD-HHMM>-<host>` and writes the client's config
+  file, and revokes the token if the write fails. The token expires after 90
+  days (`--expires-in-days N` to change, `--no-expiry` to opt out). The
+  dashboard's "Connect an agent" panel shows the same configuration with the
+  same 90-day default.
 - `eyvan team up`: a one-command team plane installer for the host it runs on.
 
 ### Changed
