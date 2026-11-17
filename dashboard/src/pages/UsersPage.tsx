@@ -3,24 +3,39 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Copy, KeyRound, UserPlus } from "lucide-react";
+import { AlertTriangle, KeyRound, UserPlus } from "lucide-react";
 import { Fragment, useCallback, useEffect, useState, type FormEvent } from "react";
 
+import { CopyOnce } from "../components/CopyOnce";
 import type {
   TeamInvite,
   TeamInviteCreated,
   TeamInviteInput,
+  TeamTier,
   TeamToken,
   TeamTokenCreated,
   TeamUser,
   TeamUserRules,
 } from "../types";
+import { ConnectAgentPanel } from "./ConnectAgentPanel";
+
+const TIERS: { id: TeamTier; label: string }[] = [
+  { id: "admin", label: "Admin" },
+  { id: "trusted", label: "Trusted" },
+  { id: "user", label: "User" },
+];
 
 export interface TeamClient {
   listTeamUsers: (signal?: AbortSignal) => Promise<TeamUser[]>;
   setTeamUserDisabled: (subject: string, disabled: boolean) => Promise<TeamUser>;
   /** Optional so older callers and tests that never edit rules still type-check. */
   setTeamUserRules?: (subject: string, rules: TeamUserRules) => Promise<TeamUser>;
+  setTeamUserTier?: (
+    subject: string,
+    tier: TeamTier,
+    orgId: string | null,
+    projectId: string | null,
+  ) => Promise<TeamUser>;
   listTeamInvites: (signal?: AbortSignal) => Promise<TeamInvite[]>;
   createTeamInvite: (input: TeamInviteInput) => Promise<TeamInviteCreated>;
   revokeTeamInvite: (inviteId: string) => Promise<TeamInvite>;
@@ -52,6 +67,7 @@ const message = (error: unknown, fallback: string) => (error instanceof Error ? 
 export function rulesSummary(rules: TeamUserRules | undefined): string {
   if (!rules) return "no rules";
   const parts = [
+    rules.max_tpu_units != null ? `max ${rules.max_tpu_units} TPU` : null,
     rules.allowed_fleets ? `fleets: ${rules.allowed_fleets.join(", ") || "none"}` : null,
     rules.approval_tpu_threshold !== null ? `approval above ${rules.approval_tpu_threshold} TPU` : null,
     rules.guaranteed_tpu_units !== null ? `guaranteed ${rules.guaranteed_tpu_units} TPU` : null,
@@ -80,6 +96,7 @@ function RulesEditor({
   const [fleets, setFleets] = useState(current?.allowed_fleets?.join(", ") ?? "");
   const [threshold, setThreshold] = useState(current?.approval_tpu_threshold?.toString() ?? "");
   const [guarantee, setGuarantee] = useState(current?.guaranteed_tpu_units?.toString() ?? "");
+  const [maxTpu, setMaxTpu] = useState(current?.max_tpu_units?.toString() ?? "");
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
 
@@ -96,6 +113,7 @@ function RulesEditor({
         allowed_fleets: names.length ? names : null,
         approval_tpu_threshold: optionalCount(threshold),
         guaranteed_tpu_units: optionalCount(guarantee),
+        max_tpu_units: optionalCount(maxTpu),
       };
     } catch (failure) {
       setProblem(message(failure, "Check the numbers"));
@@ -127,6 +145,13 @@ function RulesEditor({
         <span>Guaranteed TPU units (above it is borrowed; empty = none)</span>
         <input inputMode="numeric" value={guarantee} onChange={(event) => setGuarantee(event.target.value)} />
       </label>
+      <label className="field">
+        <span>Max TPU units (empty = no limit)</span>
+        <input inputMode="numeric" value={maxTpu} onChange={(event) => setMaxTpu(event.target.value)} />
+        <small className="field-hint">
+          Hard cap on TPU units in use or queued. A plain user can run @eyvan.execute only after a max is set.
+        </small>
+      </label>
       <div className="field">
         <span>&nbsp;</span>
         <div>
@@ -148,27 +173,6 @@ function RulesEditor({
 }
 const when = (value: string | null) => (value ? new Date(value).toLocaleString() : "—");
 
-function CopyOnce({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <div className="panel-note" role="status">
-      <strong>{label}</strong> (shown once):{" "}
-      <code className="monospace" data-testid="secret-once">
-        {value}
-      </code>{" "}
-      <button
-        className="button button-secondary"
-        type="button"
-        onClick={() => {
-          void navigator.clipboard?.writeText(value).then(() => setCopied(true));
-        }}
-      >
-        <Copy size={14} aria-hidden="true" /> {copied ? "Copied" : "Copy"}
-      </button>
-    </div>
-  );
-}
-
 export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }: UsersPageProps) {
   const [users, setUsers] = useState<TeamUser[]>([]);
   const [invites, setInvites] = useState<TeamInvite[]>([]);
@@ -178,11 +182,14 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
 
   const [email, setEmail] = useState("");
   const [subject, setSubject] = useState("");
-  const [role, setRole] = useState<string>("project_submitter");
+  const [tier, setTier] = useState<TeamTier>("user");
+  // Empty = use the tier; a role chosen under "Advanced" replaces it (never both).
+  const [role, setRole] = useState<string>("");
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState<string | null>(null);
 
   const [editingRules, setEditingRules] = useState<string | null>(null);
+  const [confirmAdmin, setConfirmAdmin] = useState<string | null>(null);
 
   const [tokenName, setTokenName] = useState("");
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -228,15 +235,23 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
     setInviteBusy(true);
     setError(null);
     setInviteLink(null);
-    const scoped = role !== "fleet_admin";
+    const base = { email: email.trim(), subject: (subject.trim() || email.split("@", 1)[0]).toLowerCase() };
     try {
-      const created = await client.createTeamInvite({
-        email: email.trim(),
-        subject: (subject.trim() || email.split("@", 1)[0]).toLowerCase(),
-        role,
-        org_id: scoped ? defaultOrg : null,
-        project_id: role.startsWith("project_") ? defaultProject : null,
-      });
+      const created = await client.createTeamInvite(
+        role
+          ? {
+              ...base,
+              role,
+              org_id: role !== "fleet_admin" ? defaultOrg : null,
+              project_id: role.startsWith("project_") ? defaultProject : null,
+            }
+          : {
+              ...base,
+              tier,
+              org_id: tier === "admin" ? null : defaultOrg,
+              project_id: tier === "admin" ? null : defaultProject,
+            },
+      );
       setInviteLink(created.url);
       setEmail("");
       setSubject("");
@@ -299,15 +314,38 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
               />
             </label>
             <label className="field">
-              <span>Role</span>
-              <select value={role} onChange={(event) => setRole(event.target.value)}>
-                {ROLES.map((name) => (
-                  <option key={name} value={name}>
-                    {name.replace("_", " ")}
+              <span>Tier</span>
+              <select
+                aria-label="Tier"
+                value={tier}
+                onChange={(event) => setTier(event.target.value as TeamTier)}
+                disabled={!!role}
+              >
+                {TIERS.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
                   </option>
                 ))}
               </select>
+              <small className="field-hint">
+                Admin manages the plane; Trusted runs jobs freely; User runs @eyvan.execute only after an admin sets a
+                TPU max.
+              </small>
             </label>
+            <details className="field">
+              <summary>Advanced: custom role</summary>
+              <label className="field">
+                <span>Role</span>
+                <select aria-label="Role" value={role} onChange={(event) => setRole(event.target.value)}>
+                  <option value="">Use the tier</option>
+                  {ROLES.map((name) => (
+                    <option key={name} value={name}>
+                      {name.replace("_", " ")}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </details>
             <div className="field">
               <span>&nbsp;</span>
               <button className="button button-primary" type="submit" disabled={inviteBusy || !email.trim()}>
@@ -340,6 +378,7 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
                     <th>User</th>
                     <th>Email</th>
                     <th>Status</th>
+                    <th>Tier</th>
                     <th>Rules</th>
                     <th>Created</th>
                     <th aria-label="Actions" />
@@ -352,6 +391,35 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
                         <td className="monospace">{user.subject}</td>
                         <td>{user.email}</td>
                         <td>{user.disabled ? "disabled" : "active"}</td>
+                        <td>
+                          {client.setTeamUserTier && user.tier ? (
+                            <select
+                              aria-label={`Tier for ${user.subject}`}
+                              value={user.tier}
+                              onChange={(event) => {
+                                const next = event.target.value as TeamTier;
+                                if (next === "admin") {
+                                  // Controlled select: it stays on the old tier until confirmed.
+                                  setConfirmAdmin(user.subject);
+                                  return;
+                                }
+                                setConfirmAdmin(null);
+                                void act(async () => {
+                                  // Called as a method: the real client class needs its `this`.
+                                  await client.setTeamUserTier?.(user.subject, next, defaultOrg, defaultProject);
+                                });
+                              }}
+                            >
+                              {TIERS.map((item) => (
+                                <option key={item.id} value={item.id}>
+                                  {item.label}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            (user.tier ?? "—")
+                          )}
+                        </td>
                         <td data-testid={`rules-${user.subject}`}>{rulesSummary(user.rules)}</td>
                         <td>{when(user.created_at)}</td>
                         <td>
@@ -375,9 +443,41 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
                           </button>
                         </td>
                       </tr>
+                      {confirmAdmin === user.subject && (
+                        <tr>
+                          <td colSpan={7}>
+                            <div
+                              className="panel-note"
+                              role="alertdialog"
+                              aria-label={`Confirm admin for ${user.subject}`}
+                            >
+                              Make {user.subject} a fleet admin? They will be able to manage everyone and every fleet.{" "}
+                              <button
+                                className="button button-primary"
+                                type="button"
+                                onClick={() => {
+                                  setConfirmAdmin(null);
+                                  void act(async () => {
+                                    await client.setTeamUserTier?.(user.subject, "admin", defaultOrg, defaultProject);
+                                  });
+                                }}
+                              >
+                                Confirm
+                              </button>{" "}
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                onClick={() => setConfirmAdmin(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                       {editingRules === user.subject && client.setTeamUserRules && (
                         <tr>
-                          <td colSpan={6}>
+                          <td colSpan={7}>
                             <RulesEditor
                               user={user}
                               onCancel={() => setEditingRules(null)}
@@ -522,6 +622,8 @@ export function UsersPage({ client, canAdminister, defaultOrg, defaultProject }:
           </div>
         )}
       </section>
+
+      <ConnectAgentPanel client={client} onMinted={reload} />
     </div>
   );
 }

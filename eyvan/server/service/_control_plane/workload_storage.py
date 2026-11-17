@@ -106,14 +106,23 @@ class WorkloadStorageMixin:
                     f"parent workload {parent_workload_id!r} is at generation {parent.generation}, not the "
                     f"{expected_parent_generation} the capability was issued for; resubmit against the current attempt"
                 )
+        owner = created_by or principal.subject
+        if isinstance(spec.execution, CallableExecution):
+            # The team-mode callable rule needs the owner's account, so it is
+            # decided here, inside the transaction every submission path shares;
+            # off team mode it returns at once (the project rule already ran).
+            await self._require_team_callable(  # type: ignore[attr-defined]
+                tx, subject=owner, org_id=org_id, project_id=project_id
+            )
         # Team governance (off unless team mode): may refuse, or hold the job
         # for a fleet admin's approval behind the existing ``schedulable`` gate.
         verdict = await self._governance_admission(  # type: ignore[attr-defined]
             tx,
             spec=spec,
-            subject=created_by or principal.subject,
+            subject=owner,
             operation=operation,
             top_level=parent_workload_id is None and schedulable and coordination_kind is None and not depends_on,
+            holds_capacity=coordination_kind is None,
         )
         held = verdict is not None and verdict.action == "hold"
         workload_id = _new_id("wl")

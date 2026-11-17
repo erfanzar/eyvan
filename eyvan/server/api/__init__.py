@@ -20,6 +20,7 @@ if tp.TYPE_CHECKING:
     from eyvan.config import EyvanSettings
     from eyvan.server.api.auth import TokenVerifier
     from eyvan.server.api.server_bind import ServerBindPolicy
+    from eyvan.server.api.server_startup import ServerStartupSettings
     from eyvan.server.persistence.base import Repository
     from eyvan.server.service.control_plane import ControlPlaneService
     from eyvan.soak_evidence import SoakEvidenceStore
@@ -39,6 +40,7 @@ def create_app(
     platform_config: EyvanPlatformConfig | None = None,
     soak_evidence: SoakEvidenceStore | None = None,
     quota_discovery: TpuQuotaDiscovery | None = None,
+    server_startup: ServerStartupSettings | None = None,
 ) -> FastAPI:
     """Import and build the control-plane application on demand.
 
@@ -61,6 +63,7 @@ def create_app(
         platform_config=platform_config,
         soak_evidence=soak_evidence,
         quota_discovery=quota_discovery,
+        server_startup=server_startup,
     )
 
 

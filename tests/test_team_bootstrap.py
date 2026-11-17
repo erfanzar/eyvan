@@ -97,15 +97,16 @@ def test_eyvan_server_bootstrap_admin_runs_as_a_real_process(tmp_path: Path) -> 
     }
     environment.update(
         HOME=str(tmp_path / "home"),
-        EYVAN_TEAM_MODE="1",
         EYVAN_REPOSITORY_BACKEND="local",
         EYVAN_PUBLIC_URL="https://plane.example.com",
+        EYVAN_PLATFORM_CONFIG_PATH=str(tmp_path / "absent-platform.yaml"),
     )
     command = [
         sys.executable,
         "-c",
         "from eyvan.server.api.app import main; main()",
         "bootstrap-admin",
+        "--team",
         "--local-state-path",
         str(state),
         "--username",

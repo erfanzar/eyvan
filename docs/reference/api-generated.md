@@ -147,6 +147,7 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/team/users/{subject}/disable` | Disable Team User | 200, 422 |
 | POST | `/api/v1/team/users/{subject}/enable` | Enable Team User | 200, 422 |
 | PUT | `/api/v1/team/users/{subject}/rules` | Set Team User Rules | 200, 422 |
+| PUT | `/api/v1/team/users/{subject}/tier` | Set Team User Tier | 200, 422 |
 | POST | `/api/v1/team/workloads/{workload_id}/reclaim` | Reclaim Team Workload | 200, 422 |
 | GET | `/api/v1/tracking/health` | Tracking Health | 200 |
 | GET | `/api/v1/tracking/runs` | Tracking Runs | 200, 422 |

@@ -169,6 +169,16 @@ class StateSession(RepositorySession):
         )
         return sorted(items, key=lambda item: (item.created_at, item.id))
 
+    async def list_workloads_created_by(
+        self, created_by: str, *, states: frozenset[WorkloadState] | None = None
+    ) -> list[WorkloadRecord]:
+        items = (
+            item
+            for item in self._state.workloads.values()
+            if item.created_by == created_by and (states is None or item.state in states)
+        )
+        return sorted(items, key=lambda item: (item.created_at, item.id))
+
     async def put_workload(self, workload: WorkloadRecord) -> None:
         self._state.workloads[workload.id] = workload
 

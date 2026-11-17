@@ -55,6 +55,7 @@ from eyvan.server.api.server_bind import ServerBindPolicy
 from eyvan.server.api.server_startup import (
     StartupConfigurationSource,
     format_requirement_bullets,
+    server_environment_settings,
     unsatisfied_startup_requirements,
 )
 from eyvan.server.service.pricing_resolver import audit_price_drift
@@ -190,6 +191,8 @@ class DoctorCommandService:
     renderer: JsonRenderer = field(default_factory=JsonRenderer)
     server_bind_host: str = DEFAULT_SERVER_BIND_HOST
     as_json: bool = False
+    #: The ``eyvan-server --team`` flag the previewed server will be started with.
+    team: bool = False
 
     def _server_startup_check(self) -> CheckResult:
         """Report every setting a server bound to ``server_bind_host`` would refuse without.
@@ -224,13 +227,16 @@ class DoctorCommandService:
                 f"a server started here on {bind.host} needs no further configuration",
             )
         try:
-            settings = EyvanSettings.from_env()
+            # The same resolution eyvan-server performs: EYVAN_*, then the
+            # platform file's ``team``, then the flag. A team mode turned on only
+            # by the file must be preflighted exactly as the server will enforce it.
+            settings = server_environment_settings(team=self.team)
         except ValueError as error:
             return CheckResult(
                 SERVER_STARTUP_CHECK,
                 CheckStatus.FAIL,
-                f"the EYVAN_* environment does not parse: {error}",
-                "correct the setting named above; the server reads the same variables",
+                f"the EYVAN_* environment or platform file does not parse: {error}",
+                "correct the setting named above; the server reads the same variables and file",
             )
         missing = unsatisfied_startup_requirements(
             bind,
@@ -955,12 +961,17 @@ def _fleet_names(payload: JsonValue) -> tuple[str, ...]:
     show_default=True,
     help="Bind address to preflight a server for; the same value `eyvan-server --host` takes.",
 )
+@click.option(
+    "--team",
+    is_flag=True,
+    help="Preflight a server started with `eyvan-server --team` (the platform file's `team: true` is read anyway).",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def doctor(session: CliSession, server_host: str, as_json: bool) -> None:
+def doctor(session: CliSession, server_host: str, team: bool, as_json: bool) -> None:
     """Check credentials, connectivity, and fleet readiness before submitting."""
 
-    DoctorCommandService(session, server_bind_host=server_host, as_json=as_json).run()
+    DoctorCommandService(session, server_bind_host=server_host, as_json=as_json, team=team).run()
 
 
 def register_doctor_commands(group: click.Group) -> None:

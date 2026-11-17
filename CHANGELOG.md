@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade note: team mode is a flag now
+
+`EYVAN_TEAM_MODE` is gone. Turn team mode on with `eyvan-server --team` (also
+`eyvan-server bootstrap-admin --team` and `eyvan doctor --team`), or with
+`team: true` in the platform file (`/etc/eyvan/platform.yaml`, or the path in
+`EYVAN_PLATFORM_CONFIG_PATH`).
+
+If `EYVAN_TEAM_MODE` is still set, whatever its value, `eyvan-server`,
+`bootstrap-admin` and `eyvan doctor` now refuse to start and tell you which
+switch to use. Without that refusal, a 0.0.3 team plane would come back with team
+mode quietly off:
+
+- Personal `eyv_` tokens and team session cookies would no longer be accepted,
+  so team users could not sign in.
+- Per-user TPU caps and approval holds would not apply to anyone who could still
+  authenticate: OIDC users and the bootstrap token.
+- On a loopback bind, development-header authentication (on by default there
+  unless `EYVAN_DEV_AUTH_ENABLED` says otherwise) would keep working, now without
+  caps or holds.
+
+Before upgrading, remove the variable from the unit or env file and add `--team`
+or `team: true`.
+
+### Added
+
+- Team tiers: admin, trusted and user, set from the dashboard's Users page
+  (making someone admin asks for confirmation) or `eyvan users tier`.
+- A hard per-user TPU cap (`max_tpu_units`). It counts every queued, held and
+  running workload of the user across projects, and is checked when a job is
+  submitted, released from approval or retried. Every tier may run
+  `@eyvan.execute` callables; a plain user only once an admin has set a cap, and
+  only within it. Callables on CPU or GPU pools use no TPU units, so the cap
+  does not bound them.
+- The MCP endpoint lets an external agent call the plane's API with a user's
+  personal token, with that user's permissions. Routes that create accounts or
+  credentials, grant durable authority, run raw queries or act on the plane host
+  are refused (see `eyvan/server/api/mcp_api_bridge.py`).
+- `eyvan mcp install --client xerxes|claude-code|codex|cursor` mints a named
+  token and writes the client's config file, and revokes the token if the write
+  fails. The dashboard's "Connect an agent" panel shows the same configuration;
+  its tokens default to 90 days.
+- `eyvan team up`: a one-command team plane installer for the host it runs on.
+
+### Changed
+
+- `PUT /api/v1/team/users/{subject}/rules` keeps a rule the request leaves out
+  instead of clearing it; send `null` to clear. An older client can no longer
+  clear a TPU cap by accident.
+- The last enabled fleet admin can no longer be removed by revoking their grant
+  or by disabling the account.
+
 ## [0.0.3] — 2026-11-16
 
 ### Added

@@ -20,8 +20,9 @@ different defaults; see Part 2. Full setup details are in `docs/install.md`:
    `eyvan grant add`. The dashboard uses a BFF: the server completes the
    authorization-code/PKCE exchange and keeps provider tokens server-side.
    Bootstrap identity uses the generated bearer token instead of an OIDC issuer;
-   team accounts require `EYVAN_TEAM_MODE`. Development headers are not a network
-   authentication option.
+   team accounts are turned on by `eyvan-server --team` or `team: true` in the
+   platform file (`/etc/eyvan/platform.yaml`); there is no environment variable
+   for it. Development headers are not a network authentication option.
 4. **Listener TLS** — `EYVAN_TLS_CERT_FILE` and `EYVAN_TLS_KEY_FILE`, or the
    explicit `EYVAN_INSECURE_PLAINTEXT_BIND=1` acknowledgement. TLS termination at a
    proxy does not waive this listener requirement.

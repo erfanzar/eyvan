@@ -97,6 +97,8 @@ class EyvanSettings:
     dev_auth_enabled: bool = False
     #: Opt-in team accounts (users, invites, password sign-in, personal API
     #: tokens). False keeps every existing route, auth path and wire shape.
+    #: Never read from the environment: ``eyvan-server --team`` or ``team: true``
+    #: in the platform file turn it on (``eyvan._internal.platform.resolve_team_mode``).
     team_mode: bool = False
     #: Opt-in durable security audit; false preserves the existing event stream.
     auth_audit_enabled: bool = False
@@ -732,7 +734,6 @@ class EyvanSettings:
             oidc_audience=os.getenv("EYVAN_OIDC_AUDIENCE", defaults.oidc_audience),
             oidc_jwks_url=os.getenv("EYVAN_OIDC_JWKS_URL"),
             dev_auth_enabled=truthy("EYVAN_DEV_AUTH_ENABLED"),
-            team_mode=truthy("EYVAN_TEAM_MODE", defaults.team_mode),
             auth_audit_enabled=truthy("EYVAN_AUTH_AUDIT_ENABLED", defaults.auth_audit_enabled),
             correlation_enabled=truthy("EYVAN_CORRELATION_ENABLED", defaults.correlation_enabled),
             min_client_version=os.getenv("EYVAN_MIN_CLIENT_VERSION") or None,

@@ -47,7 +47,8 @@ All under `/api/v1` unless noted:
 
 A presented bearer token takes precedence over cookies and development auth:
 
-- **Team tokens** — with team mode enabled, `eyv_...` bearer tokens resolve
+- **Team tokens** — with team mode enabled (`eyvan-server --team`, or
+  `team: true` in the platform file), `eyv_...` bearer tokens resolve
   against team accounts. Invalid, expired, or revoked tokens return 401; they do
   not fall through to OIDC.
 - **Bootstrap token** — a head started with bootstrap identity accepts its

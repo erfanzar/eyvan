@@ -479,10 +479,10 @@ def test_rules_route_is_admin_only_and_reports_rules() -> None:
     assert refused.status_code == 403, refused.text
     response = http.put("/api/v1/team/users/alice/rules", json=body, headers=ADMIN_HEADERS)
     assert response.status_code == 200, response.text
-    assert response.json()["rules"] == body
+    assert response.json()["rules"] == {**body, "max_tpu_units": None}
     assert "password_hash" not in response.text
     listed = http.get("/api/v1/team/users", headers=ADMIN_HEADERS).json()["users"]
-    assert [user["rules"] for user in listed if user["subject"] == "alice"] == [body]
+    assert [user["rules"] for user in listed if user["subject"] == "alice"] == [{**body, "max_tpu_units": None}]
     bad = http.put("/api/v1/team/users/alice/rules", json={"approval_tpu_threshold": -1}, headers=ADMIN_HEADERS)
     assert bad.status_code == 422
 

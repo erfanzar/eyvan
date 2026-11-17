@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from eyvan.domain.governance import enabled_fleet_admins
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
     AuthorizationError,
@@ -309,7 +310,14 @@ class TenancyMixin:
             raise InputError(str(exc)) from exc
         self._require_grant_administration(principal, grant)
         async with self.repository.transaction() as tx:
+            guard = getattr(self, "governance_enabled", False) and grant.role is Role.FLEET_ADMIN
+            before = await self._enabled_fleet_admin_subjects(tx) if guard else set()
             removed = await tx.delete_role_grant(record_key)
+            if removed and subject in before and not await self._enabled_fleet_admin_subjects(tx):
+                # Rolled back with the transaction: the grant is not deleted.
+                raise ConflictError(
+                    f"{subject!r} is the last enabled fleet admin; make someone else an admin before revoking this"
+                )
             if removed:
                 await tx.append_event(
                     AuditEvent(
@@ -372,6 +380,12 @@ class TenancyMixin:
                 or (item.grant.org_id, item.grant.project_id) in administered_projects
             )
         ]
+
+    @staticmethod
+    async def _enabled_fleet_admin_subjects(tx: RepositorySession) -> set[str]:
+        """Enabled team accounts holding an active ``fleet_admin`` grant, as this transaction sees them."""
+
+        return enabled_fleet_admins(await tx.list_users(), await tx.list_role_grants(), utcnow())
 
     async def active_grants_for(self, subject: str, *, now: datetime | None = None) -> tuple[RoleGrant, ...]:
         """Return the unexpired durable grants held by one subject.

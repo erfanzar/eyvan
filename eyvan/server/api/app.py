@@ -38,7 +38,7 @@ from eyvan._internal.client_version import CLIENT_VERSION_HEADER, is_client_supp
 from eyvan._internal.correlation import canonical_correlation_id
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan._internal.observability import EyvanMetrics
-from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config
+from eyvan._internal.platform import EyvanPlatformConfig, load_platform_config, refuse_removed_team_variable
 from eyvan.artifacts._capability_tokens import InvalidCapabilityToken
 from eyvan.artifacts.managed import (
     ArtifactAction,
@@ -569,6 +569,7 @@ def create_app(
     platform_config: EyvanPlatformConfig | None = None,
     soak_evidence: SoakEvidenceStore | None = None,
     quota_discovery: TpuQuotaDiscovery | None = None,
+    server_startup: ServerStartupSettings | None = None,
 ) -> FastAPI:
     """Build an application with injectable auth, service, and persistence adapters.
 
@@ -578,10 +579,20 @@ def create_app(
     ``quota_discovery`` is constructed on first use rather than here, so a plane
     that never opens the capacity panel never builds a provider client and an
     injected one is the only thing an offline test can reach.
+
+    ``server_startup`` is the already-validated startup policy ``eyvan-server``
+    resolved from its environment, platform file and flags; it replaces
+    ``settings`` and carries its own bind.
     """
 
     # Pin this process's identity to the tree it started from; see build_identity.
     build_identity()
+    if server_startup is not None:
+        if settings is not None or automatic_loopback_auth:
+            raise ValueError("server_startup already carries the settings; pass one or the other")
+        if server_bind is not None and server_bind != server_startup.bind:
+            raise ValueError("server_bind must match the bind server_startup was validated for")
+        server_bind = server_startup.bind
     server_bind = server_bind or ServerBindPolicy.from_host("127.0.0.1")
     quota_cache = TpuQuotaCache(ttl_s=TPU_QUOTA_CACHE_TTL_S, deadline_s=TPU_QUOTA_READ_DEADLINE_S)
     resolved_quota_discovery: list[TpuQuotaDiscovery] = [quota_discovery] if quota_discovery is not None else []
@@ -603,9 +614,12 @@ def create_app(
             settings=settings,
             development_auth_mode=DevelopmentAuthMode.LOOPBACK_DEFAULT,
         )
+    elif server_startup is not None:
+        startup = server_startup
     elif settings is not None:
         startup = ServerStartupSettings.from_settings(server_bind, settings)
     else:
+        # The reload factories land here: EYVAN_* plus the platform file's ``team``.
         startup = ServerStartupSettings.from_environment(server_bind)
     settings = startup.settings
     local_development_credential = (
@@ -1809,7 +1823,7 @@ def create_app(
         project_id: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> dict[str, str]:
-        service.authorize_callable_artifact(principal, org_id=org_id, project_id=project_id)
+        await service.authorize_callable_upload(principal, org_id=org_id, project_id=project_id)
         try:
             uri = callable_uri(digest)
         except ValueError as exc:
@@ -1839,7 +1853,7 @@ def create_app(
         callable-trust check as the callable itself rather than a weaker one.
         """
 
-        service.authorize_callable_artifact(principal, org_id=org_id, project_id=project_id)
+        await service.authorize_callable_upload(principal, org_id=org_id, project_id=project_id)
         try:
             uri = workspace_uri(digest)
         except ValueError as exc:
@@ -4229,8 +4243,14 @@ def create_local_daemon_app(
     artifact_store_uri: str,
     runtime_profile_path: Path | None = None,
     settings: EyvanSettings | None = None,
+    team: bool = False,
 ) -> FastAPI:
-    """Build one local daemon with endpoint-matched transfer URLs and isolated persistence."""
+    """Build one local daemon with endpoint-matched transfer URLs and isolated persistence.
+
+    ``team`` is the supervisor's ``--team``. A supervised local daemon is an
+    isolated loopback profile, so it takes team mode only from that flag, not
+    from a host-wide platform file.
+    """
 
     if runtime_profile_path is not None:
         if settings is not None:
@@ -4250,6 +4270,8 @@ def create_local_daemon_app(
         local_artifact_token_key_path=local_artifact_token_key_path,
         artifact_store_uri=configured_artifact_store_uri,
     )
+    if team:
+        daemon_settings = replace(daemon_settings, team_mode=True)
     platform_config = (
         EyvanPlatformConfig(default_agent_endpoint=DEFAULT_LOCAL_CELL_AGENT_URL)
         if runtime_profile_path is not None
@@ -4282,6 +4304,11 @@ def main() -> None:
         action="store_true",
         help="allow a network bind to serve plaintext HTTP (equivalent to EYVAN_INSECURE_PLAINTEXT_BIND=1)",
     )
+    parser.add_argument(
+        "--team",
+        action="store_true",
+        help="run team accounts (users, invites, sign-in); the same as `team: true` in the platform file",
+    )
     parser.add_argument("--local-daemon", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--public-url", help=argparse.SUPPRESS)
     parser.add_argument("--local-state-path", type=Path, help=argparse.SUPPRESS)
@@ -4304,12 +4331,14 @@ def main() -> None:
         control_plane_ca_b64()
     except ControlPlaneCAError as exc:
         parser.error(str(exc))
-    if args.insecure_plaintext:
-        if os.getenv("EYVAN_TLS_CERT_FILE") or os.getenv("EYVAN_TLS_KEY_FILE"):
-            parser.error("--insecure-plaintext conflicts with EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE")
-        # The startup policy reads the environment; make the flag equivalent to
-        # the documented opt-in, including under --reload subprocesses.
-        os.environ["EYVAN_INSECURE_PLAINTEXT_BIND"] = "1"
+    if args.insecure_plaintext and (os.getenv("EYVAN_TLS_CERT_FILE") or os.getenv("EYVAN_TLS_KEY_FILE")):
+        parser.error("--insecure-plaintext conflicts with EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE")
+    if args.reload and (args.team or args.insecure_plaintext):
+        # A reload worker is a fresh process that rebuilds the app from an import
+        # string; flags given here cannot reach it without writing os.environ,
+        # which is exactly what neither flag may do. The platform file's
+        # ``team: true`` still applies under --reload.
+        parser.error("--reload does not support --team or --insecure-plaintext")
     server_bind = ServerBindPolicy.from_host(args.host)
     required_local_options = (
         args.public_url,
@@ -4320,15 +4349,34 @@ def main() -> None:
     if not args.local_daemon:
         if any(option is not None for option in (*required_local_options, args.runtime_profile)):
             parser.error("local daemon options require --local-daemon")
+        if args.reload:
+            uvicorn.run(
+                server_bind.application_factory,
+                factory=True,
+                host=server_bind.host,
+                port=args.port,
+                reload=True,
+                log_config=server_log_config(args.log_level),
+                log_level=args.log_level.value,
+                **uvicorn_tls_kwargs(EyvanSettings.from_env()),
+            )
+            return
+        # Settings are resolved once (EYVAN_*, platform file, flags), validated
+        # once, and the very app built from them is what uvicorn serves.
+        try:
+            startup = ServerStartupSettings.from_environment(
+                server_bind, team=args.team, insecure_plaintext=args.insecure_plaintext
+            )
+            application = create_app(server_startup=startup)
+        except ValueError as exc:
+            raise SystemExit(f"eyvan-server: {exc}") from exc
         uvicorn.run(
-            server_bind.application_factory,
-            factory=True,
+            application,
             host=server_bind.host,
             port=args.port,
-            reload=args.reload,
             log_config=server_log_config(args.log_level),
             log_level=args.log_level.value,
-            **uvicorn_tls_kwargs(EyvanSettings.from_env()),
+            **uvicorn_tls_kwargs(startup.settings),
         )
         return
     if args.reload:
@@ -4340,6 +4388,7 @@ def main() -> None:
     assert args.local_artifact_token_key_path is not None
     assert args.artifact_store_uri is not None
     try:
+        refuse_removed_team_variable()
         application = create_local_daemon_app(
             server_bind=server_bind,
             port=args.port,
@@ -4348,6 +4397,7 @@ def main() -> None:
             local_artifact_token_key_path=args.local_artifact_token_key_path,
             artifact_store_uri=args.artifact_store_uri,
             runtime_profile_path=args.runtime_profile,
+            team=args.team,
         )
     except ValueError as exc:
         parser.error(str(exc))

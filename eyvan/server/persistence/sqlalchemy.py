@@ -728,6 +728,25 @@ class SqlAlchemySession:
             key=lambda item: (item.created_at, item.id),
         )
 
+    async def list_workloads_created_by(
+        self, created_by: str, *, states: frozenset[WorkloadState] | None = None
+    ) -> list[WorkloadRecord]:
+        """One owner's workloads, filtered in SQL.
+
+        ``created_by`` lives only in the JSON document (no column, so no index and
+        no migration); the indexed ``state`` column narrows the scan first.
+        """
+
+        statement = select(WorkloadRow).where(WorkloadRow.data["created_by"].as_string() == created_by)
+        if states is not None:
+            statement = statement.where(WorkloadRow.state.in_(sorted(item.value for item in states)))
+        rows = (await self.session.scalars(statement)).all()
+        items = _decode_rows(WorkloadRecord, rows, table="workloads")
+        return sorted(
+            (item for item in items if item.created_by == created_by and (states is None or item.state in states)),
+            key=lambda item: (item.created_at, item.id),
+        )
+
     async def put_workload(self, workload: WorkloadRecord) -> None:
         await self.session.merge(
             WorkloadRow(

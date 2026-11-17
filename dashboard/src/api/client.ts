@@ -73,6 +73,7 @@ import type {
   OpenRouterSignInInput,
   OpenRouterSignInStart,
   TeamRequest,
+  TeamTier,
   TeamInvite,
   TeamInviteCreated,
   TeamInviteInput,
@@ -850,6 +851,19 @@ export class EyvanApiClient {
     });
   }
 
+  /** Move one account to a tier (fleet admins); trusted/user need the project scope to grant roles in. */
+  async setTeamUserTier(
+    subject: string,
+    tier: TeamTier,
+    orgId: string | null,
+    projectId: string | null,
+  ): Promise<TeamUser> {
+    return this.attachmentRequest<TeamUser>(`/api/v1/team/users/${encodeURIComponent(subject)}/tier`, {
+      method: "PUT",
+      body: JSON.stringify({ tier, org_id: orgId, project_id: projectId }),
+    });
+  }
+
   async listTeamInvites(signal?: AbortSignal): Promise<TeamInvite[]> {
     if (this.forceDemo) return [];
     return (await this.attachmentRequest<{ invites: TeamInvite[] }>("/api/v1/team/invites", { signal })).invites;
@@ -858,6 +872,7 @@ export class EyvanApiClient {
   async createTeamInvite(input: TeamInviteInput): Promise<TeamInviteCreated> {
     const body: Record<string, string> = { email: input.email, subject: input.subject };
     if (input.role) body.role = input.role;
+    if (input.tier) body.tier = input.tier;
     if (input.org_id) body.org_id = input.org_id;
     if (input.project_id) body.project_id = input.project_id;
     return this.attachmentRequest<TeamInviteCreated>("/api/v1/team/invites", {

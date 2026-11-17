@@ -68,12 +68,19 @@ export interface TeamUser {
   created_by: string;
   /** Governance rules; a null field means "no rule". Older planes omit the whole object. */
   rules?: TeamUserRules;
+  /** Derived by the plane: admin, trusted or user. Older planes omit it. */
+  tier?: TeamTier;
+  trusted?: boolean;
 }
+
+export type TeamTier = "admin" | "trusted" | "user";
 
 export interface TeamUserRules {
   allowed_fleets: string[] | null;
   approval_tpu_threshold: number | null;
   guaranteed_tpu_units: number | null;
+  /** Hard cap on TPU units in use or queued; null means no limit. */
+  max_tpu_units: number | null;
 }
 
 export interface TeamRoleGrant {
@@ -107,7 +114,9 @@ export interface TeamToken {
 export interface TeamInviteInput {
   email: string;
   subject: string;
-  role: string | null;
+  /** Send either a tier or a custom role, never both. */
+  role?: string | null;
+  tier?: TeamTier;
   org_id: string | null;
   project_id: string | null;
 }

@@ -633,6 +633,19 @@ class Permission(StrEnum):
     MANAGE_FLEET = "manage_fleet"
 
 
+class TeamTier(StrEnum):
+    """How much a team-mode account is trusted. Derived, never stored.
+
+    ``admin`` is whoever holds an active ``fleet_admin`` grant; otherwise
+    ``trusted`` when the account carries ``UserRecord.trusted``; otherwise
+    ``user``. Deriving it keeps the grant table the one source of authority.
+    """
+
+    ADMIN = "admin"
+    TRUSTED = "trusted"
+    USER = "user"
+
+
 class CapacityClass(StrEnum):
     """Canonical capacity purchase classes used at the API boundary."""
 
@@ -832,15 +845,25 @@ class UserRecord(EyvanModel):
     #: be reclaimed (checkpoint first, then requeue) by someone still within
     #: their own guarantee. ``None`` means no guarantee: everything is borrowed.
     guaranteed_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+    #: The ``trusted`` tier: may run ``@eyvan.execute`` callables in any project
+    #: it can submit to and is never held for approval. Fleet admins are the
+    #: ``admin`` tier through their grant, not through this flag.
+    trusted: bool = False
+    #: Hard ceiling on the TPU units this person may have in use or queued at
+    #: once, across every org and project. ``None`` is no ceiling; a plain
+    #: ``user`` may run callables only once a fleet admin has set one.
+    max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         # An account with no rules serializes exactly as it did before rules
         # existed, so stored documents and older readers are unaffected.
         document = handler(self)
-        for name in ("allowed_fleets", "approval_tpu_threshold", "guaranteed_tpu_units"):
+        for name in ("allowed_fleets", "approval_tpu_threshold", "guaranteed_tpu_units", "max_tpu_units"):
             if getattr(self, name) is None:
                 document.pop(name, None)
+        if not self.trusted:
+            document.pop("trusted", None)
         return document
 
     @model_validator(mode="after")
@@ -865,6 +888,15 @@ class InviteRecord(EyvanModel):
     expires_at: Annotated[datetime, AwareDatetime]
     accepted_at: Annotated[datetime, AwareDatetime] | None = None
     revoked: bool = False
+    #: Copied onto the account on acceptance (the ``trusted`` tier).
+    trusted: bool = False
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if not self.trusted:
+            document.pop("trusted", None)
+        return document
 
     def open_at(self, moment: datetime) -> bool:
         """Return whether this invite can still be accepted at ``moment``."""

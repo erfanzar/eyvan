@@ -40,11 +40,13 @@ from pydantic import ValidationError
 from eyvan._version import __version__
 from eyvan.config import EyvanSettings
 from eyvan.records import Permission, Principal, WorkloadRecord
+from eyvan.server.api import mcp_api_bridge
 from eyvan.server.api.assistant import TOOL_SPECS as ASSISTANT_TOOL_SPECS
 from eyvan.server.api.assistant import AssistantTools
 from eyvan.server.api.auth import DEFAULT_DEVELOPMENT_SCOPE, authenticated_principal
 from eyvan.server.api.research_routes import plan_document
 from eyvan.server.api.schemas import WorkloadSubmitRequest
+from eyvan.server.local.auth import LOCAL_DEVELOPMENT_CREDENTIAL_HEADER
 from eyvan.server.local.daemon import LocalDaemonError
 from eyvan.server.local.tracker import LocalTrackerError, read_tracker_record, read_tracker_token
 from eyvan.server.service.errors import (
@@ -100,9 +102,17 @@ class McpToolError(Exception):
     (and a test) can tell a refusal from a missing record.
     """
 
-    def __init__(self, message: str, *, status: int | None = None, kind: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        kind: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
+        self.idempotency_key = idempotency_key
         self.status = status
         self.kind = kind
 
@@ -112,6 +122,8 @@ class McpToolError(Exception):
             payload["type"] = self.kind
         if self.status is not None:
             payload["status"] = self.status
+        if self.idempotency_key is not None:
+            payload["idempotency_key"] = self.idempotency_key
         return payload
 
 
@@ -134,6 +146,9 @@ class McpScope:
     app: FastAPI | None = None
     #: Grants the credential itself carried, before durable grants were merged in.
     credential_grants: tuple[tp.Any, ...] | None = None
+    #: The MCP HTTP request itself: the API bridge forwards only its authentication
+    #: and scope headers and its original client address, never anything else.
+    request: Request | None = None
 
     def require(self) -> tuple[str, str]:
         """Return the scope, or explain how to name one when it is ambiguous."""
@@ -207,18 +222,54 @@ def _with_scope(schema: dict[str, tp.Any]) -> dict[str, tp.Any]:
     return {**schema, "properties": properties}
 
 
-def bounded_text(value: tp.Any, limit: int = MAX_RESULT_CHARS) -> str:
-    """Serialize ``value`` as compact JSON, cut to ``limit`` characters with a visible note."""
+#: Any team bearer token (``eyv_`` + base64url), wherever it appears in a result.
+_TEAM_TOKEN_TEXT: tp.Final = re.compile(r"eyv_[A-Za-z0-9_-]{16,}")
+REDACTED: tp.Final = "<redacted>"
 
-    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+
+def redact_secrets(text: str, secrets: tp.Iterable[str] = ()) -> str:
+    """``text`` without the caller's credential values or any team token."""
+
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
+    return _TEAM_TOKEN_TEXT.sub(f"eyv_{REDACTED}", text)
+
+
+def _caller_secrets(request: Request | None) -> tuple[str, ...]:
+    """The credential values the caller presented (Authorization and local development credential)."""
+
+    if request is None:
+        return ()
+    values: list[str] = []
+    authorization = request.headers.get("authorization", "").strip()
+    if authorization:
+        values.append(authorization)
+        token = authorization.partition(" ")[2].strip()
+        if token:
+            values.append(token)
+    credential = request.headers.get(LOCAL_DEVELOPMENT_CREDENTIAL_HEADER, "").strip()
+    if credential:
+        values.append(credential)
+    # Very short values would redact ordinary words; real credentials are long.
+    return tuple(value for value in values if len(value) >= 8)
+
+
+def _bounded(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     note = f" ...[truncated: {len(text)} characters; narrow the request (filters, tail, keys, points)]"
     return text[: max(0, limit - len(note))] + note
 
 
-def _tool_result(value: tp.Any, *, error: bool = False) -> dict[str, tp.Any]:
-    return {"content": [{"type": "text", "text": bounded_text(value)}], "isError": error}
+def bounded_text(value: tp.Any, limit: int = MAX_RESULT_CHARS, *, secrets: tp.Iterable[str] = ()) -> str:
+    """Serialize ``value`` as compact JSON with credentials redacted, cut to ``limit`` characters."""
+
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+    return _bounded(redact_secrets(text, secrets), limit)
+
+
+def _redacted_result(value: tp.Any, *, error: bool = False, secrets: tp.Iterable[str] = ()) -> dict[str, tp.Any]:
+    return {"content": [{"type": "text", "text": bounded_text(value, secrets=secrets)}], "isError": error}
 
 
 def _service_status(exc: EyvanServiceError) -> int:
@@ -729,6 +780,122 @@ register_tool(
 )
 
 
+# ------------------------------------------------------------------ generic API access
+
+
+async def _api_operations(
+    service: ControlPlaneService, principal: Principal, scope: McpScope, args: dict[str, tp.Any]
+) -> tp.Any:
+    if scope.app is None:
+        raise McpToolError("this plane publishes no API catalogue", status=503)
+    area = _string(args, "area", limit=64)
+    search = _string(args, "search", limit=200)
+    return mcp_api_bridge.list_operations(scope.app, area=area, search=search)
+
+
+async def _api_dispatch(scope: McpScope, method: str, args: dict[str, tp.Any]) -> tp.Any:
+    request = scope.request
+    if request is None:
+        raise McpToolError("the API tools are only available over the MCP HTTP endpoint", status=503)
+    dev_auth = bool(scope.settings is not None and scope.settings.dev_auth_enabled)
+    if not request.headers.get("authorization") and not dev_auth:
+        # A cookie session is never forwarded, so the routed call would carry no identity.
+        raise McpToolError(
+            "the API tools act with your bearer token; connect with an `Authorization: Bearer <token>` header",
+            status=401,
+        )
+    try:
+        return await mcp_api_bridge.dispatch(
+            request,
+            method=method,
+            path=args.get("path"),
+            query=args.get("query"),
+            body=args.get("body"),
+            idempotency_key=args.get("idempotency_key"),
+            dev_auth=dev_auth,
+            default_scope=(scope.org_id, scope.project_id),
+        )
+    except mcp_api_bridge.ApiBridgeError as exc:
+        raise McpToolError(exc.message, status=exc.status, kind=exc.kind, idempotency_key=exc.idempotency_key) from None
+
+
+async def _api_get(
+    service: ControlPlaneService, principal: Principal, scope: McpScope, args: dict[str, tp.Any]
+) -> tp.Any:
+    return await _api_dispatch(scope, "GET", args)
+
+
+async def _api_call(
+    service: ControlPlaneService, principal: Principal, scope: McpScope, args: dict[str, tp.Any]
+) -> tp.Any:
+    method = args.get("method")
+    if not isinstance(method, str) or method.upper() not in mcp_api_bridge.WRITE_METHODS:
+        raise McpToolError("method must be POST, PUT, PATCH or DELETE (use eyvan_api_get to read)", status=400)
+    return await _api_dispatch(scope, method.upper(), args)
+
+
+_API_PATH: tp.Final = {
+    "type": "string",
+    "description": "A concrete /api/v1/... path matching a template from eyvan_api_operations (no query string).",
+}
+_API_QUERY: tp.Final = {
+    "type": "object",
+    "description": "Query parameters; org_id/project_id default to your MCP scope when the operation takes them.",
+}
+register_tool(
+    McpTool(
+        name="eyvan_api_operations",
+        description=(
+            "List the plane's HTTP API operations you can call through eyvan_api_get / eyvan_api_call: method, path "
+            "template, summary, parameters and request-body schema (shown when the match is narrow). Filter by area "
+            "(a tag such as workloads, fleets, governance) and/or a search string."
+        ),
+        input_schema=_schema(
+            {
+                "area": {"type": "string", "description": "Only this API area (tag)."},
+                "search": {"type": "string", "description": "Case-insensitive text to find in path or summary."},
+            }
+        ),
+        handler=_api_operations,
+        annotations=dict(_READ_ONLY),
+    )
+)
+register_tool(
+    McpTool(
+        name="eyvan_api_get",
+        description=(
+            "Call one GET operation of this plane's API as you (same permission checks as the REST API) and return "
+            "{status, body}. Only operations listed by eyvan_api_operations are reachable."
+        ),
+        input_schema=_schema({"path": _API_PATH, "query": _API_QUERY}, ["path"]),
+        handler=_api_get,
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    )
+)
+register_tool(
+    McpTool(
+        name="eyvan_api_call",
+        description=(
+            "Call one POST/PUT/PATCH/DELETE operation of this plane's API NOW, as you, with the REST API's own "
+            "permission checks and audit, and return {status, body}. Only operations listed by eyvan_api_operations "
+            "are reachable. Routes that take an Idempotency-Key get idempotency_key (default: a fresh one, returned)."
+        ),
+        input_schema=_schema(
+            {
+                "method": {"type": "string", "enum": ["POST", "PUT", "PATCH", "DELETE"]},
+                "path": _API_PATH,
+                "query": _API_QUERY,
+                "body": {"description": "JSON request body, as the operation's body_schema describes."},
+                "idempotency_key": {"type": "string", "description": "Retry-safe key; reuse it to retry safely."},
+            },
+            ["method", "path"],
+        ),
+        handler=_api_call,
+        annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+    )
+)
+
+
 # ------------------------------------------------------------------ JSON-RPC
 
 
@@ -756,7 +923,16 @@ async def call_tool(
     principal: Principal,
     scope: McpScope,
 ) -> dict[str, tp.Any]:
-    """Run one tool as ``principal`` and shape its outcome as an MCP ``tools/call`` result."""
+    """Run one tool as ``principal`` and shape its outcome as an MCP ``tools/call`` result.
+
+    Every result and error text is redacted for the caller's own credential
+    values and any team token, so nothing the agent sees echoes them.
+    """
+
+    secrets = _caller_secrets(scope.request)
+
+    def _tool_result(value: tp.Any, *, error: bool = False) -> dict[str, tp.Any]:
+        return _redacted_result(value, error=error, secrets=secrets)
 
     args = dict(arguments)
     properties = tool.input_schema.get("properties") or {}
@@ -953,6 +1129,7 @@ def register_mcp_routes(app: FastAPI, *, settings: EyvanSettings, service: Contr
             settings=settings,
             app=request.app,
             credential_grants=getattr(request.state, "credential_grants", None),
+            request=request,
         )
         result = await call_tool(tool, arguments, service=service, principal=principal, scope=scope)
         return JSONResponse(_rpc_result(message_id, result))

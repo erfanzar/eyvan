@@ -350,6 +350,9 @@ class WorkloadLifecycleMixin:
                 raise ConflictError("only failed or cancelled workloads can be retried")
             budget_update = self._manual_retry_budget_update(workload)
             ensure_workload_transition(workload.state, WorkloadState.PENDING)
+            # Team governance (off unless team mode): a retry re-queues work, so
+            # the owner's callable rule and hard TPU cap apply as at admission.
+            await self._governance_retry(tx, workload)  # type: ignore[attr-defined]
             now = utcnow()
             next_generation = workload.generation + 1
             updated = workload.model_copy(

@@ -25,6 +25,7 @@ import typing as tp
 from dataclasses import replace
 from pathlib import Path
 
+from eyvan._internal.platform import load_platform_config, refuse_removed_team_variable, resolve_team_mode
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.server.persistence.base import Repository
 from eyvan.server.persistence.local import LocalControlPlaneInUseError, LocalJsonRepository
@@ -61,8 +62,9 @@ async def bootstrap_admin(
 
     if not settings.team_mode:
         raise BootstrapError(
-            "team mode is off in this environment; run with EYVAN_TEAM_MODE=1 and the same EYVAN_* settings "
-            "as the server, or the link would point at a plane that does not serve invites"
+            "team mode is off for this plane; pass --team (as the server is started with `eyvan-server --team`) "
+            "or set `team: true` in the platform file, and use the same EYVAN_* settings as the server, or the "
+            "link would point at a plane that does not serve invites"
         )
     repository, engine = _repository(settings)
     try:
@@ -112,11 +114,24 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         help="State document of a local-backend plane (the server's own --local-state-path; "
         "default ~/.eyvan/control-plane.json).",
     )
+    parser.add_argument(
+        "--team",
+        action="store_true",
+        help="The plane runs `eyvan-server --team` (not needed when the platform file says `team: true`).",
+    )
     parser.add_argument("--json", action="store_true", help="Emit the result as JSON.")
     args = parser.parse_args(argv)
     username = args.username.strip().lower()
     email = args.email or f"{username}@localhost.invalid"
-    settings = EyvanSettings.from_env()
+    try:
+        refuse_removed_team_variable()
+        settings = EyvanSettings.from_env()
+        settings = resolve_team_mode(
+            settings, flag=args.team, platform=load_platform_config(settings.platform_config_path)
+        )
+    except ValueError as exc:
+        print(f"bootstrap-admin: {exc}", file=sys.stderr)
+        return 1
     if args.local_state_path is not None:
         settings = replace(settings, local_state_path=args.local_state_path.expanduser())
     try:

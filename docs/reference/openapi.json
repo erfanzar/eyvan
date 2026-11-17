@@ -3780,6 +3780,16 @@
             "minLength": 1,
             "title": "Subject",
             "type": "string"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeamTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -6788,7 +6798,7 @@
       },
       "RulesBody": {
         "additionalProperties": false,
-        "description": "A complete replacement of one account's governance rules; ``null`` clears a rule.",
+        "description": "One account's governance rules: ``null`` clears a rule, an omitted key keeps the stored value.\n\nOmission is preserved so a client written before a rule existed (which never\nsends its key) cannot clear it by accident; ``eyvan users rules`` and the\ndashboard send every key, so their omitted options still clear.",
         "properties": {
           "allowed_fleets": {
             "anyOf": [
@@ -6830,6 +6840,19 @@
               }
             ],
             "title": "Guaranteed Tpu Units"
+          },
+          "max_tpu_units": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tpu Units"
           }
         },
         "title": "RulesBody",
@@ -7695,6 +7718,53 @@
           "unpriced_leases"
         ],
         "title": "SubjectUsageRecord",
+        "type": "object"
+      },
+      "TeamTier": {
+        "description": "How much a team-mode account is trusted. Derived, never stored.\n\n``admin`` is whoever holds an active ``fleet_admin`` grant; otherwise\n``trusted`` when the account carries ``UserRecord.trusted``; otherwise\n``user``. Deriving it keeps the grant table the one source of authority.",
+        "enum": [
+          "admin",
+          "trusted",
+          "user"
+        ],
+        "title": "TeamTier",
+        "type": "string"
+      },
+      "TierBody": {
+        "additionalProperties": false,
+        "properties": {
+          "org_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/TeamTier"
+          }
+        },
+        "required": [
+          "tier"
+        ],
+        "title": "TierBody",
         "type": "object"
       },
       "TokenBody": {
@@ -16423,7 +16493,7 @@
     },
     "/api/v1/team/users/{subject}/rules": {
       "put": {
-        "description": "Replace one account's fleet allow-list, approval threshold and TPU guarantee (fleet admins).",
+        "description": "Replace one account's fleet allow-list, approval threshold, TPU guarantee and hard TPU cap (fleet admins).",
         "operationId": "set_team_user_rules_api_v1_team_users__subject__rules_put",
         "parameters": [
           {
@@ -16471,6 +16541,61 @@
           }
         },
         "summary": "Set Team User Rules",
+        "tags": [
+          "team"
+        ]
+      }
+    },
+    "/api/v1/team/users/{subject}/tier": {
+      "put": {
+        "description": "Make an account admin, trusted or user: its grants and trusted flag change together (fleet admins).",
+        "operationId": "set_team_user_tier_api_v1_team_users__subject__tier_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject",
+            "required": true,
+            "schema": {
+              "title": "Subject",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TierBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Team User Tier Api V1 Team Users  Subject  Tier Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Team User Tier",
         "tags": [
           "team"
         ]

@@ -247,7 +247,8 @@ def login(
             raise click.ClickException(f"could not reach {base}: {exc}") from exc
         if status_response.status_code != 200 or not status_response.json().get("team_mode"):
             raise click.ClickException(
-                f"{base} does not run team accounts (EYVAN_TEAM_MODE is off); use `eyvan connect` instead"
+                f"{base} does not run team accounts (start it with `eyvan-server --team` or set `team: true` "
+                "in its platform config); use `eyvan connect` instead"
             )
         address = email or click.prompt("User name or email")
         if password_stdin:
@@ -382,7 +383,9 @@ def users_list(session: CliSession, as_json: bool) -> None:
     payload = session.client.request("GET", "/api/v1/team/users")
     rows = _objects(payload.get("users", [])) if isinstance(payload, dict) else []
     text = "\n".join(
-        f"{row['subject']:<20} {row['email']:<32} {'disabled' if row['disabled'] else 'active'}" for row in rows
+        f"{row['subject']:<20} {row['email']:<32} {row.get('tier') or '-'!s:<8} "
+        f"{'disabled' if row['disabled'] else 'active'}"
+        for row in rows
     )
     _emit(as_json, payload, text or "no accounts yet; invite someone with `eyvan users invite`")
 
@@ -395,7 +398,12 @@ def users_list(session: CliSession, as_json: bool) -> None:
     type=click.Choice(
         ["fleet_admin", "org_admin", "project_admin", "project_operator", "project_submitter", "project_viewer"]
     ),
-    help="Role the account gets on acceptance.",
+    help="Advanced: the exact role the account gets on acceptance (instead of --tier).",
+)
+@click.option(
+    "--tier",
+    type=click.Choice(["admin", "trusted", "user"]),
+    help="admin (fleet admin), trusted (operator; may run @eyvan.execute) or user (submitter).",
 )
 @click.option("--org", "org_id")
 @click.option("--project", "project_id")
@@ -406,14 +414,23 @@ def users_invite(
     email: str,
     subject: str | None,
     role: str | None,
+    tier: str | None,
     org_id: str | None,
     project_id: str | None,
     as_json: bool,
 ) -> None:
     """Invite someone; prints a one-time link to send them privately."""
 
+    if role is not None and tier is not None:
+        raise click.UsageError("pass --tier or --role, not both")
     name = (subject or email.split("@", 1)[0]).strip().lower()
     body: dict[str, tp.Any] = {"email": email, "subject": name}
+    if tier is not None:
+        body["tier"] = tier
+        if tier != "admin":
+            scope = session.workload_scope(org_id=org_id, project_id=project_id)
+            body["org_id"] = scope.org_id
+            body["project_id"] = scope.project_id
     if role is not None:
         scope = session.workload_scope(org_id=org_id, project_id=project_id)
         body["role"] = role
@@ -427,6 +444,33 @@ def users_invite(
         payload,
         f"invited {email} as {name}\n  link (shown once, send it privately): {payload['url']}",
     )
+
+
+@users.command("tier")
+@click.argument("subject")
+@click.argument("tier", type=click.Choice(["admin", "trusted", "user"]))
+@click.option("--org", "org_id", help="Org of the project role (trusted/user; default: the active context).")
+@click.option("--project", "project_id", help="Project of the project role (default: the active context).")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def users_tier(
+    session: CliSession, subject: str, tier: str, org_id: str | None, project_id: str | None, as_json: bool
+) -> None:
+    """Make an account admin, trusted or user (fleet admins).
+
+    admin: fleet admin everywhere. trusted: project operator, may run
+    @eyvan.execute and is never held for approval. user: project submitter;
+    runs @eyvan.execute only once a max TPU (`eyvan users rules --max-tpu`) is set.
+    """
+
+    body: dict[str, tp.Any] = {"tier": tier}
+    if tier != "admin":
+        scope = session.workload_scope(org_id=org_id, project_id=project_id)
+        body["org_id"] = scope.org_id
+        body["project_id"] = scope.project_id
+    payload = _object(session.client.request("PUT", f"/api/v1/team/users/{subject}/tier", json=body))
+    where = "" if tier == "admin" else f" in {body['org_id']}/{body['project_id']}"
+    _emit(as_json, payload, f"{subject} is now {payload.get('tier', tier)}{where}")
 
 
 @users.command("disable")
@@ -480,6 +524,12 @@ def users_revoke_invite(session: CliSession, invite_id: str) -> None:
 @click.option("--fleet", "fleets", multiple=True, help="Allowed fleet; repeat for several. Omit for no fleet rule.")
 @click.option("--approval-threshold", type=click.IntRange(min=0), help="Hold jobs above this many TPU units.")
 @click.option("--guarantee", type=click.IntRange(min=0), help="Guaranteed TPU units; usage above it is borrowed.")
+@click.option(
+    "--max-tpu",
+    "max_tpu",
+    type=click.IntRange(min=0, max=1_000_000),
+    help="Hard cap on TPU units in use or queued at once, across all projects. Omit for no cap.",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def users_rules(
@@ -488,6 +538,7 @@ def users_rules(
     fleets: tuple[str, ...],
     approval_threshold: int | None,
     guarantee: int | None,
+    max_tpu: int | None,
     as_json: bool,
 ) -> None:
     """Replace one account's governance rules (fleet admins); options left out are cleared."""
@@ -500,16 +551,19 @@ def users_rules(
                 "allowed_fleets": list(fleets) if fleets else None,
                 "approval_tpu_threshold": approval_threshold,
                 "guaranteed_tpu_units": guarantee,
+                "max_tpu_units": max_tpu,
             },
         )
     )
     rules = _object(payload.get("rules", {}))
     threshold = rules.get("approval_tpu_threshold")
     guaranteed = rules.get("guaranteed_tpu_units")
+    cap = rules.get("max_tpu_units")
     text = (
         f"{subject}: fleets {', '.join(rules.get('allowed_fleets') or []) or 'any'}; "
         f"approval above {threshold if threshold is not None else 'never'}; "
-        f"guarantee {guaranteed if guaranteed is not None else 'none'}"
+        f"guarantee {guaranteed if guaranteed is not None else 'none'}; "
+        f"max TPU {cap if cap is not None else 'no limit'}"
     )
     _emit(as_json, payload, text)
 

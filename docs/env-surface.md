@@ -41,7 +41,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_FLEET_STATE_URI` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_BUDGET` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_WINDOW_S` | `eyvan` |
-| `EYVAN_INSECURE_PLAINTEXT_BIND` | `eyvan` |
 | `EYVAN_KUBERNETES_NAMESPACE` | `eyvan` |
 | `EYVAN_MANAGED_RESULT_TOKEN` | `eyvan` |
 | `EYVAN_MAX_EXPANSION_CHILDREN` | `eyvan` |
@@ -75,6 +74,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_WORKLOAD_TOKEN` | `eyvan` |
 | `EYVAN_CONTROL_PLANE_CA_B64` | `eyvan/_internal/plane_tls` |
 | `EYVAN_CONTROL_PLANE_CA_FILE` | `eyvan/_internal/plane_tls` |
+| `EYVAN_TEAM_MODE` | `eyvan/_internal/platform` |
 | `EYVAN_CLUSTER_CAPACITY_MAX_AGE_S` | `eyvan/capacity/autoscale/pool_capacity` |
 | `EYVAN_CLUSTER_CAPACITY_PLANNING` | `eyvan/capacity/autoscale/pool_capacity` |
 | `EYVAN_KUBERNETES_CLUSTER_CAPACITY_DETAIL` | `eyvan/capacity/drivers/kubernetes` |
@@ -129,6 +129,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_GANG_INIT_FATAL` | `eyvan/config` |
 | `EYVAN_GRANT_EXPIRY_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_IDEMPOTENCY_RETENTION_S` | `eyvan/config` |
+| `EYVAN_INSECURE_PLAINTEXT_BIND` | `eyvan/config` |
 | `EYVAN_KUBERNETES_WORKER_IMAGE` | `eyvan/config` |
 | `EYVAN_LEASE_TTL_S` | `eyvan/config` |
 | `EYVAN_LOG_ARCHIVE_CHUNK_LINES` | `eyvan/config` |
@@ -165,7 +166,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_SERVICE_RECONCILE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SERVICE_REPLICA_LIFECYCLE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SOAK_EVIDENCE_MAX_AGE_S` | `eyvan/config` |
-| `EYVAN_TEAM_MODE` | `eyvan/config` |
 | `EYVAN_TRACKER_URL` | `eyvan/config` |
 | `EYVAN_TRACKING_STORE_URI` | `eyvan/config` |
 | `EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `eyvan/config` |

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
 from eyvan._internal.compat import StrEnum
+from eyvan._internal.platform import load_platform_config, refuse_removed_team_variable, resolve_team_mode
 from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.server.api.server_bind import ServerBindPolicy
 
@@ -227,6 +228,27 @@ def describe_unsatisfied_requirements(requirements: tuple[StartupRequirement, ..
     )
 
 
+def server_environment_settings(*, team: bool = False, insecure_plaintext: bool = False) -> EyvanSettings:
+    """Resolve what an ``eyvan-server`` process started here would run with, before bind defaults.
+
+    ``EYVAN_*`` settings, then the platform file named by
+    ``EYVAN_PLATFORM_CONFIG_PATH`` (its ``team`` key), then the command-line
+    flags. The server and ``eyvan doctor`` both call this, so the preflight
+    answers for the same team mode the server will enforce, including a team
+    mode that only the platform file turned on. Nothing is written to
+    ``os.environ``: ``--insecure-plaintext`` is a settings replacement.
+
+    Raises:
+        ValueError: An ``EYVAN_*`` value or the platform file does not parse.
+    """
+
+    refuse_removed_team_variable()
+    settings = EyvanSettings.from_env()
+    if insecure_plaintext:
+        settings = replace(settings, allow_insecure_plaintext_bind=True)
+    return resolve_team_mode(settings, flag=team, platform=load_platform_config(settings.platform_config_path))
+
+
 @dataclass(frozen=True, slots=True)
 class ServerStartupSettings:
     """Security-relevant server settings resolved for one bind address."""
@@ -236,10 +258,20 @@ class ServerStartupSettings:
     development_auth_mode: DevelopmentAuthMode
 
     @classmethod
-    def from_environment(cls, bind: ServerBindPolicy) -> ServerStartupSettings:
-        """Apply zero-configuration local defaults only to an unconfigured literal loopback bind."""
+    def from_environment(
+        cls,
+        bind: ServerBindPolicy,
+        *,
+        team: bool = False,
+        insecure_plaintext: bool = False,
+    ) -> ServerStartupSettings:
+        """Apply zero-configuration local defaults only to an unconfigured literal loopback bind.
 
-        settings = EyvanSettings.from_env()
+        ``team`` and ``insecure_plaintext`` are the ``eyvan-server`` flags of the
+        same names; see :func:`server_environment_settings`.
+        """
+
+        settings = server_environment_settings(team=team, insecure_plaintext=insecure_plaintext)
         if bind.is_loopback and _REPOSITORY_BACKEND_ENVIRONMENT_VARIABLE not in os.environ:
             settings = replace(settings, repository_backend=RepositoryBackend.LOCAL)
         if bind.is_loopback and _DEV_AUTH_ENVIRONMENT_VARIABLE not in os.environ:
@@ -299,5 +331,6 @@ __all__ = (
     "StartupRequirement",
     "describe_unsatisfied_requirements",
     "format_requirement_bullets",
+    "server_environment_settings",
     "unsatisfied_startup_requirements",
 )

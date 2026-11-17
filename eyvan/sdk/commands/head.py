@@ -361,6 +361,10 @@ class HeadSpec:
     #: the enabled unit back with its state. Off by default, because a stopped
     #: head stops every fleet it controls from being reconciled.
     spot: bool = False
+    #: Write ``team: true`` into the head's platform file, so the plane serves
+    #: team accounts. Off by default: the platform file is then byte-identical
+    #: to what earlier releases wrote.
+    team: bool = False
 
     @property
     def installed_description(self) -> str:
@@ -373,6 +377,16 @@ class HeadSpec:
         """Whether this run ships its own distribution instead of resolving a name."""
 
         return self.package == STAGED_WHEEL_PACKAGE
+
+    def host_install_spec(self) -> HostInstallSpec:
+        """Return the host-local half of this head's installer."""
+
+        return HostInstallSpec(
+            port=self.port,
+            install_target=f"{HEAD_WHEEL_DIR}/*.whl" if self.stages_wheel else shlex.quote(self.package),
+            force_reinstall=self.stages_wheel,
+            local_database=self.database_url is None,
+        )
 
     def __post_init__(self) -> None:
         """Reject a spec that could not be provisioned before any command runs."""
@@ -542,6 +556,8 @@ class HeadSpec:
             # inside an environment file on a machine that does not exist yet.
             "trusted_callable_projects": list(self.trusted_callable_projects),
             "zone": self.zone,
+            # Present only when set, so the default document is unchanged.
+            **({"team": True} if self.team else {}),
         }
 
 
@@ -1014,23 +1030,56 @@ def _local_wheel_bytes() -> _LocalWheel:
 def _head_tls_lines() -> tuple[str, ...]:
     """Return the bootstrap lines that give the head a CA and a server certificate.
 
-    The CA is created once and kept, so clients that already trust it keep
-    working across re-runs. The server certificate is reissued whenever it does
-    not name the head's current address, does not chain to that CA, or expires
-    within 30 days -- an adopted head whose address changed must not keep
-    serving a certificate for the old one.
+    The head's address is read back out of its environment file, so an adopted
+    head whose address changed is reissued a certificate for the new one.
+    """
+
+    return host_tls_lines(
+        address_lines=(
+            "# TLS for the control-plane listener, under a CA this head owns.",
+            f"head_address=$(sed -n 's#^EYVAN_PUBLIC_URL=https://\\([^:/]*\\):.*#\\1#p' {HEAD_ENVIRONMENT_PATH})",
+            'if [ -z "$head_address" ]; then',
+            f"  echo 'EYVAN_PUBLIC_URL in {HEAD_ENVIRONMENT_PATH} must be https://ADDRESS:PORT' >&2",
+            "  exit 1",
+            "fi",
+        ),
+        group="eyvan-head",
+    )
+
+
+def host_tls_lines(*, address_lines: tuple[str, ...], group: str, dns_name: bool = False) -> tuple[str, ...]:
+    """Return installer lines that give a host plane a CA and a server certificate.
+
+    ``address_lines`` must set the shell variable ``head_address`` (and
+    ``head_dns_name`` when ``dns_name`` is true). The CA is created once and
+    kept, so clients that already trust it keep working across re-runs. The
+    server certificate is reissued whenever it does not name the current
+    address (or DNS name), does not chain to that CA, or expires within 30 days.
+
+    Args:
+        address_lines: Lines that set ``head_address`` (and ``head_dns_name``).
+        group: Group of the service account that must read the server key.
+        dns_name: Whether the certificate also names ``$head_dns_name``.
+
+    Returns:
+        The installer lines, starting and ending with a blank line.
     """
 
     ca = str(HEAD_CONTROL_PLANE_CA_PATH)
+    name_check = (
+        (
+            f'  || ! openssl x509 -in {HEAD_TLS_CERT_PATH} -noout -checkhost "$head_dns_name" 2>/dev/null '
+            "| grep -q 'does match' \\",
+        )
+        if dns_name
+        else ()
+    )
+    san = "IP:%s,DNS:%s" if dns_name else "IP:%s"
+    san_arguments = '"$head_address" "$head_dns_name"' if dns_name else '"$head_address"'
     return (
         "",
-        "# TLS for the control-plane listener, under a CA this head owns.",
-        f"head_address=$(sed -n 's#^EYVAN_PUBLIC_URL=https://\\([^:/]*\\):.*#\\1#p' {HEAD_ENVIRONMENT_PATH})",
-        'if [ -z "$head_address" ]; then',
-        f"  echo 'EYVAN_PUBLIC_URL in {HEAD_ENVIRONMENT_PATH} must be https://ADDRESS:PORT' >&2",
-        "  exit 1",
-        "fi",
-        f"install -d -o root -g eyvan-head -m 0750 {HEAD_TLS_DIR}",
+        *address_lines,
+        f"install -d -o root -g {group} -m 0750 {HEAD_TLS_DIR}",
         f"if [ ! -s {HEAD_TLS_CA_KEY_PATH} ] || [ ! -s {ca} ]; then",
         "  openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=Eyvan control-plane head CA' "
         f"-keyout {HEAD_TLS_CA_KEY_PATH} -out {ca} "
@@ -1041,51 +1090,103 @@ def _head_tls_lines() -> tuple[str, ...]:
         f"chmod 0644 {ca}",
         f'if ! openssl x509 -in {HEAD_TLS_CERT_PATH} -noout -checkip "$head_address" 2>/dev/null '
         "| grep -q 'does match' \\",
+        *name_check,
         f"  || ! openssl verify -CAfile {ca} {HEAD_TLS_CERT_PATH} >/dev/null 2>&1 \\",
         f"  || ! openssl x509 -in {HEAD_TLS_CERT_PATH} -noout -checkend 2592000 >/dev/null 2>&1; then",
         f'  openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$head_address" -keyout {HEAD_TLS_KEY_PATH} '
         f"-out {HEAD_TLS_DIR}/server.csr",
         f"  openssl x509 -req -in {HEAD_TLS_DIR}/server.csr -CA {ca} -CAkey {HEAD_TLS_CA_KEY_PATH} "
         f"-CAcreateserial -CAserial {HEAD_TLS_DIR}/ca.srl -days 825 -out {HEAD_TLS_CERT_PATH} "
-        "-extfile <(printf 'subjectAltName=IP:%s\\nbasicConstraints=CA:FALSE\\n"
-        'keyUsage=digitalSignature,keyEncipherment\\nextendedKeyUsage=serverAuth\\n\' "$head_address")',
+        f"-extfile <(printf 'subjectAltName={san}\\nbasicConstraints=CA:FALSE\\n"
+        f"keyUsage=digitalSignature,keyEncipherment\\nextendedKeyUsage=serverAuth\\n' {san_arguments})",
         f"  rm -f {HEAD_TLS_DIR}/server.csr",
         "fi",
-        f"chown root:eyvan-head {HEAD_TLS_KEY_PATH} {HEAD_TLS_CERT_PATH}",
+        f"chown root:{group} {HEAD_TLS_KEY_PATH} {HEAD_TLS_CERT_PATH}",
         f"chmod 0640 {HEAD_TLS_KEY_PATH}",
         f"chmod 0644 {HEAD_TLS_CERT_PATH}",
         "",
     )
 
 
-def render_head_bootstrap_script(spec: HeadSpec) -> str:
-    """Render the idempotent installer the head runs under ``sudo``.
+@dataclass(frozen=True, slots=True)
+class HostInstallSpec:
+    """The host-local half of an installer: no project, zone, fleet or provider.
 
-    The script carries no credentials. Everything secret is read from
-    ``/etc/eyvan/head.env``, which is delivered separately over stdin, so the
-    installer can be printed in a dry run and read in review.
+    ``eyvan head up`` renders one from its :class:`HeadSpec`; ``eyvan team up``
+    builds one directly on the machine it is installing. Every field is a value
+    the rendered script embeds, so each is validated by whoever builds it.
     """
 
-    package = spec.package
-    if not package.strip():
-        raise ValueError("head package specification must be non-empty")
-    staged = package == STAGED_WHEEL_PACKAGE
-    venv_python = f"{HEAD_VENV_PATH}/bin/python"
-    after = "network-online.target" if spec.database_url is not None else "network-online.target postgresql.service"
-    unit = "\n".join(
+    port: int
+    #: What pip installs, already shell-ready: a quoted specifier or wheel path,
+    #: or the deliberately unquoted staged-wheel glob.
+    install_target: str
+    #: Reinstall the same version again, for a wheel whose version did not change.
+    force_reinstall: bool
+    local_database: bool = True
+    service_user: str = "eyvan-head"
+    environment_path: str = HEAD_ENVIRONMENT_PATH
+    unit_description: str = "Eyvan control plane head"
+    #: The word installer messages use for what is being installed.
+    label: str = "head"
+
+    @property
+    def venv_python(self) -> str:
+        """Return the interpreter of the plane's virtual environment."""
+
+        return f"{HEAD_VENV_PATH}/bin/python"
+
+
+def host_prelude_lines(host: HostInstallSpec) -> tuple[str, ...]:
+    """Return the script header, the apt helper, the environment check and the service account."""
+
+    user = host.service_user
+    return (
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "umask 022",
+        "export DEBIAN_FRONTEND=noninteractive",
+        "eyvan_apt_get() {",
+        "  if ! command -v apt-get >/dev/null 2>&1; then",
+        f"    echo 'the Eyvan {host.label} installer requires apt-get' >&2",
+        "    return 127",
+        "  fi",
+        '  command apt-get -o DPkg::Lock::Timeout=300 "$@"',
+        "}",
+        "",
+        f"if [ ! -r {host.environment_path} ]; then",
+        f"  echo 'the Eyvan {host.label} environment {host.environment_path} is missing' >&2",
+        "  exit 1",
+        "fi",
+        "",
+        f"if ! getent group {user} >/dev/null 2>&1; then",
+        f"  groupadd --system {user}",
+        "fi",
+        f"if ! id -u {user} >/dev/null 2>&1; then",
+        f"  useradd --system --gid {user} --home-dir /var/lib/eyvan --create-home --shell /usr/sbin/nologin {user}",
+        "fi",
+        f"install -d -o {user} -g {user} -m 0750 /var/lib/eyvan",
+    )
+
+
+def host_server_unit(host: HostInstallSpec) -> str:
+    """Return the systemd unit that runs ``eyvan-server`` on every interface."""
+
+    after = "network-online.target postgresql.service" if host.local_database else "network-online.target"
+    return "\n".join(
         (
             "[Unit]",
-            "Description=Eyvan control plane head",
+            f"Description={host.unit_description}",
             f"After={after}",
             "Wants=network-online.target",
             "",
             "[Service]",
             "Type=simple",
-            "User=eyvan-head",
-            "Group=eyvan-head",
-            f"EnvironmentFile={HEAD_ENVIRONMENT_PATH}",
+            f"User={host.service_user}",
+            f"Group={host.service_user}",
+            f"EnvironmentFile={host.environment_path}",
             "Environment=PYTHONUNBUFFERED=1",
-            f"ExecStart={HEAD_VENV_PATH}/bin/eyvan-server --host 0.0.0.0 --port {spec.port}",
+            f"ExecStart={HEAD_VENV_PATH}/bin/eyvan-server --host 0.0.0.0 --port {host.port}",
             "Restart=always",
             "RestartSec=2",
             "",
@@ -1093,43 +1194,14 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
             "WantedBy=multi-user.target",
         )
     )
-    lines = [
-        "#!/bin/bash",
-        "set -euo pipefail",
-        "umask 022",
-        "export DEBIAN_FRONTEND=noninteractive",
-        "eyvan_apt_get() {",
-        "  if ! command -v apt-get >/dev/null 2>&1; then",
-        "    echo 'the Eyvan head installer requires apt-get' >&2",
-        "    return 127",
-        "  fi",
-        '  command apt-get -o DPkg::Lock::Timeout=300 "$@"',
-        "}",
-        "",
-        f"if [ ! -r {HEAD_ENVIRONMENT_PATH} ]; then",
-        f"  echo 'the Eyvan head environment {HEAD_ENVIRONMENT_PATH} is missing' >&2",
-        "  exit 1",
-        "fi",
-        "",
-        "if ! getent group eyvan-head >/dev/null 2>&1; then",
-        "  groupadd --system eyvan-head",
-        "fi",
-        "if ! id -u eyvan-head >/dev/null 2>&1; then",
-        "  useradd --system --gid eyvan-head --home-dir /var/lib/eyvan --create-home "
-        "--shell /usr/sbin/nologin eyvan-head",
-        "fi",
-        "install -d -o eyvan-head -g eyvan-head -m 0750 /var/lib/eyvan",
-        f"chown root:eyvan-head {HEAD_ENVIRONMENT_PATH}",
-        f"chmod 0640 {HEAD_ENVIRONMENT_PATH}",
-        *_head_tls_lines(),
-        "# Group membership rather than a copy of the credential. Anyone who can",
-        "# reach this host over IAP already has sudo and can already read this",
-        "# file -- which is exactly what `head up` used to tell them to do. This",
-        "# removes the sudo round trip and grants no authority they lacked. It",
-        "# takes effect at their next login, which is why the SDK names the group",
-        "# when the read is refused.",
-        'if [ -n "${SUDO_USER:-}" ]; then usermod -aG eyvan-head "${SUDO_USER}"; fi',
-        "",
+
+
+def host_venv_lines(host: HostInstallSpec) -> tuple[str, ...]:
+    """Return the lines that build the plane's venv, install Eyvan and put the CLI on PATH."""
+
+    venv_python = host.venv_python
+    target = host.install_target
+    return (
         "# The virtual environment, built with the interpreter the image ships.",
         "# `uv` is deliberately not required: a missing uv is one of the failures",
         "# this command exists to remove, and python3-venv is in the base image or",
@@ -1145,30 +1217,23 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "fi",
         *(
             (
-                # The glob is deliberate and must not be quoted: the wheel keeps
-                # its own PEP 427 filename, which this script does not know at
-                # render time. Installing the file rather than the name `eyvan`
-                # means no index is consulted for Eyvan itself, while its
-                # dependencies still resolve normally -- --no-index blocked those
-                # too and the install died on alembic.
-                f"{venv_python} -m pip install --disable-pip-version-check --upgrade {HEAD_WHEEL_DIR}/*.whl",
-                # Then the same wheel again, forced. A staged wheel carries the
-                # version of the tree that built it, so a head re-run after a code
-                # change is almost always an install of the *same* version -- and
-                # `--upgrade` is a no-op there. The head kept serving the previous
-                # wheel while reporting a successful install, which is the worst
-                # available combination: every later observation describes code
-                # that is not running. `--no-deps` because the line above has
-                # already resolved the dependency tree, and repeating it would
-                # rebuild every dependency on every head up.
-                f"{venv_python} -m pip install --disable-pip-version-check --force-reinstall --no-deps "
-                f"{HEAD_WHEEL_DIR}/*.whl",
+                # A staged wheel's glob is deliberately unquoted: the wheel keeps
+                # its own PEP 427 filename, which is not known at render time.
+                # Installing the file rather than the name `eyvan` means no index
+                # is consulted for Eyvan itself, while its dependencies still
+                # resolve normally.
+                f"{venv_python} -m pip install --disable-pip-version-check --upgrade {target}",
+                # Then the same wheel again, forced. A rebuilt wheel usually
+                # carries the *same* version, and `--upgrade` is a no-op there --
+                # the plane would keep serving the previous code while reporting a
+                # successful install. `--no-deps` because the line above already
+                # resolved the dependency tree.
+                f"{venv_python} -m pip install --disable-pip-version-check --force-reinstall --no-deps {target}",
             )
-            if staged
+            if host.force_reinstall
             # An index install is a version specifier, so --upgrade is doing real
-            # resolution work and a forced pass would only reinstall what it just
-            # chose.
-            else (f"{venv_python} -m pip install --disable-pip-version-check --upgrade {shlex.quote(package)}",)
+            # resolution work and a forced pass would only reinstall what it chose.
+            else (f"{venv_python} -m pip install --disable-pip-version-check --upgrade {target}",)
         ),
         f"chmod -R a+rX {HEAD_VENV_PATH}",
         "",
@@ -1184,6 +1249,126 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
         "  echo 'eyvan: /usr/local/bin/eyvan is not a symlink; leaving it as it is' >&2",
         "fi",
         "",
+    )
+
+
+def host_postgres_lines(host: HostInstallSpec) -> tuple[str, ...]:
+    """Return the lines that install a plane-local PostgreSQL and its ``eyvan`` role and database.
+
+    The role's password is read out of the environment file by the venv's
+    interpreter and handed to psql on stdin, so it never appears in an argv.
+    """
+
+    return (
+        "# A head-local PostgreSQL: the control plane refuses a network bind on",
+        "# any other backend, and asking an operator to bring a database before",
+        "# they have a head is how a one-command install becomes fifteen.",
+        "if ! command -v psql >/dev/null 2>&1; then",
+        "  eyvan_apt_get update",
+        "  eyvan_apt_get install -y --no-install-recommends postgresql",
+        "fi",
+        "systemctl enable --now postgresql",
+        "# Read straight out of the environment file rather than sourcing it:",
+        "# sourcing runs an operator-supplied URL through the shell, and a",
+        "# database password is exactly the string that should never be parsed.",
+        "eyvan_database_password=$(",
+        f"  {host.venv_python} - {host.environment_path} <<'EYVAN_HEAD_PASSWORD'",
+        "import sys",
+        "import urllib.parse",
+        "",
+        'url = ""',
+        'with open(sys.argv[1], encoding="utf-8") as handle:',
+        "    for line in handle:",
+        '        key, separator, value = line.partition("=")',
+        '        if separator and key.strip() == "EYVAN_DATABASE_URL":',
+        "            url = value.strip()",
+        'print(urllib.parse.unquote(urllib.parse.urlsplit(url).password or ""))',
+        "EYVAN_HEAD_PASSWORD",
+        ")",
+        'if [ -z "${eyvan_database_password}" ]; then',
+        f"  echo 'the {host.label} database URL carries no password' >&2",
+        "  exit 1",
+        "fi",
+        "# Delivered on stdin: a password in psql's argv is readable in ps.",
+        "runuser -u postgres -- psql -v ON_ERROR_STOP=1 -f - <<EYVAN_HEAD_ROLE",
+        "DO \\$\\$",
+        "BEGIN",
+        "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'eyvan') THEN",
+        "    CREATE ROLE eyvan LOGIN PASSWORD '${eyvan_database_password}';",
+        "  ELSE",
+        "    ALTER ROLE eyvan LOGIN PASSWORD '${eyvan_database_password}';",
+        "  END IF;",
+        "END",
+        "\\$\\$;",
+        "EYVAN_HEAD_ROLE",
+        "if ! runuser -u postgres -- psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'eyvan'\" | grep -q 1; then",
+        "  runuser -u postgres -- createdb --owner eyvan eyvan",
+        "fi",
+        "",
+    )
+
+
+#: Keys of :func:`host_plane_environment` whose values are credentials.
+HOST_PLANE_SECRET_KEYS: frozenset[str] = frozenset(
+    {"EYVAN_ARTIFACT_TOKEN_KEY", "EYVAN_DATABASE_URL", "EYVAN_METRICS_TOKEN"}
+)
+
+
+def host_plane_environment(
+    *,
+    public_url: str,
+    database_url: str,
+    metrics_token: str,
+    artifact_token_key: str,
+    artifact_store_uri: str,
+) -> dict[str, str]:
+    """Return the infrastructure environment of a single-host plane, and no mode setting.
+
+    Team mode is deliberately absent: it comes from the platform file or the
+    server's ``--team`` flag, never from an environment variable.
+    """
+
+    return {
+        "EYVAN_ARTIFACT_STORE_URI": artifact_store_uri,
+        "EYVAN_ARTIFACT_TOKEN_KEY": artifact_token_key,
+        # Handed to dispatched jobs, whose callbacks to this plane verify it.
+        CONTROL_PLANE_CA_FILE_ENV: str(HEAD_CONTROL_PLANE_CA_PATH),
+        "EYVAN_DATABASE_URL": database_url,
+        "EYVAN_METRICS_TOKEN": metrics_token,
+        "EYVAN_PUBLIC_URL": public_url,
+        "EYVAN_REPOSITORY_BACKEND": "postgres",
+        "EYVAN_TLS_CERT_FILE": HEAD_TLS_CERT_PATH,
+        "EYVAN_TLS_KEY_FILE": HEAD_TLS_KEY_PATH,
+    }
+
+
+def render_head_bootstrap_script(spec: HeadSpec) -> str:
+    """Render the idempotent installer the head runs under ``sudo``.
+
+    The script carries no credentials. Everything secret is read from
+    ``/etc/eyvan/head.env``, which is delivered separately over stdin, so the
+    installer can be printed in a dry run and read in review.
+    """
+
+    if not spec.package.strip():
+        raise ValueError("head package specification must be non-empty")
+    host = spec.host_install_spec()
+    venv_python = host.venv_python
+    unit = host_server_unit(host)
+    lines = [
+        *host_prelude_lines(host),
+        f"chown root:eyvan-head {HEAD_ENVIRONMENT_PATH}",
+        f"chmod 0640 {HEAD_ENVIRONMENT_PATH}",
+        *_head_tls_lines(),
+        "# Group membership rather than a copy of the credential. Anyone who can",
+        "# reach this host over IAP already has sudo and can already read this",
+        "# file -- which is exactly what `head up` used to tell them to do. This",
+        "# removes the sudo round trip and grants no authority they lacked. It",
+        "# takes effect at their next login, which is why the SDK names the group",
+        "# when the read is refused.",
+        'if [ -n "${SUDO_USER:-}" ]; then usermod -aG eyvan-head "${SUDO_USER}"; fi',
+        "",
+        *host_venv_lines(host),
     ]
     if spec.submitter_python:
         lines.extend(
@@ -1238,57 +1423,8 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
                 "",
             )
         )
-    if spec.database_url is None:
-        lines.extend(
-            (
-                "# A head-local PostgreSQL: the control plane refuses a network bind on",
-                "# any other backend, and asking an operator to bring a database before",
-                "# they have a head is how a one-command install becomes fifteen.",
-                "if ! command -v psql >/dev/null 2>&1; then",
-                "  eyvan_apt_get update",
-                "  eyvan_apt_get install -y --no-install-recommends postgresql",
-                "fi",
-                "systemctl enable --now postgresql",
-                "# Read straight out of the environment file rather than sourcing it:",
-                "# sourcing runs an operator-supplied URL through the shell, and a",
-                "# database password is exactly the string that should never be parsed.",
-                "eyvan_database_password=$(",
-                f"  {venv_python} - {HEAD_ENVIRONMENT_PATH} <<'EYVAN_HEAD_PASSWORD'",
-                "import sys",
-                "import urllib.parse",
-                "",
-                'url = ""',
-                'with open(sys.argv[1], encoding="utf-8") as handle:',
-                "    for line in handle:",
-                '        key, separator, value = line.partition("=")',
-                '        if separator and key.strip() == "EYVAN_DATABASE_URL":',
-                "            url = value.strip()",
-                'print(urllib.parse.unquote(urllib.parse.urlsplit(url).password or ""))',
-                "EYVAN_HEAD_PASSWORD",
-                ")",
-                'if [ -z "${eyvan_database_password}" ]; then',
-                "  echo 'the head database URL carries no password' >&2",
-                "  exit 1",
-                "fi",
-                "# Delivered on stdin: a password in psql's argv is readable in ps.",
-                "runuser -u postgres -- psql -v ON_ERROR_STOP=1 -f - <<EYVAN_HEAD_ROLE",
-                "DO \\$\\$",
-                "BEGIN",
-                "  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'eyvan') THEN",
-                "    CREATE ROLE eyvan LOGIN PASSWORD '${eyvan_database_password}';",
-                "  ELSE",
-                "    ALTER ROLE eyvan LOGIN PASSWORD '${eyvan_database_password}';",
-                "  END IF;",
-                "END",
-                "\\$\\$;",
-                "EYVAN_HEAD_ROLE",
-                "if ! runuser -u postgres -- psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'eyvan'\" "
-                "| grep -q 1; then",
-                "  runuser -u postgres -- createdb --owner eyvan eyvan",
-                "fi",
-                "",
-            )
-        )
+    if host.local_database:
+        lines.extend(host_postgres_lines(host))
     agent_unit = "\n".join(
         (
             "[Unit]",
@@ -1320,6 +1456,7 @@ def render_head_bootstrap_script(spec: HeadSpec) -> str:
             f"chmod 0644 /etc/systemd/system/{HEAD_AGENT_SERVICE_NAME}",
             f"cat >{PLATFORM_CONFIG_PATH} <<'EYVAN_PLATFORM'",
             "version: 1",
+            *(("team: true",) if spec.team else ()),
             "agents:",
             "  default:",
             f"    endpoint: http://127.0.0.1:{HEAD_AGENT_PORT}",
@@ -2794,6 +2931,11 @@ def head_group() -> None:
         "any time; its disk and database survive, and starting the VM again resumes the plane."
     ),
 )
+@click.option(
+    "--team",
+    is_flag=True,
+    help="Write `team: true` into the head's platform file so the plane serves team accounts.",
+)
 @click.option("--rotate-secrets", is_flag=True, help="Regenerate this head's credentials instead of keeping them.")
 @click.option("--dry-run", is_flag=True, help="Print every action and resource name, changing nothing.")
 @click.option("--yes", is_flag=True, help="Confirm creating GCP resources without prompting.")
@@ -2821,6 +2963,7 @@ def head_up(
     boot_disk_size_gb: int | None,
     iap_ssh: bool,
     spot: bool,
+    team: bool,
     rotate_secrets: bool,
     dry_run: bool,
     yes: bool,
@@ -2863,6 +3006,7 @@ def head_up(
             boot_disk_size_gb=boot_disk_size_gb,
             iap_ssh=iap_ssh,
             spot=spot or None,
+            team=team or None,
         ),
     )
     provisioner = HeadProvisioner(spec)

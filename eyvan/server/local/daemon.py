@@ -272,6 +272,10 @@ class LocalDaemonCommand:
     #: process makes every later command refuse with "not owned by the selected
     #: native GCP runtime profile" until it is edited by hand.
     record_path: Path | None = None
+    #: Start the daemon with ``--team`` (team accounts). Ownership matching reads
+    #: only ``--host``/``--port``/``--local-daemon``/``--runtime-profile``, so a
+    #: daemon is recognized as owned whether or not it carries this flag.
+    team: bool = False
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -295,6 +299,7 @@ class LocalDaemonCommand:
             "--artifact-store-uri",
             self.profile.artifact_store_uri,
             *(() if self.record_path is None else ("--local-daemon-record-path", str(self.record_path))),
+            *(("--team",) if self.team else ()),
             "--log-level",
             "info",
         )

@@ -6,7 +6,8 @@
 """Team-mode HTTP routes: sign-in, invites, personal API tokens, users.
 
 Every route is registered on every plane so the route inventory and the API
-reference stay stable, but each answers 404 unless ``EYVAN_TEAM_MODE`` is on,
+reference stay stable, but each answers 404 unless the plane runs team mode
+(``eyvan-server --team`` or ``team: true`` in the platform config file),
 except ``/api/v1/team/status`` which tells the dashboard which mode it is in.
 
 Secrets never travel in a URL path or query: uvicorn's access log records
@@ -22,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan.config import EyvanSettings
 from eyvan.identity.team_secrets import TEAM_SESSION_COOKIE, SignInThrottle
-from eyvan.records import ApiTokenRecord, InviteRecord, Permission, Principal, Role, RoleGrant, UserRecord
+from eyvan.records import ApiTokenRecord, InviteRecord, Permission, Principal, Role, RoleGrant, TeamTier, UserRecord
 from eyvan.server.api.auth import authenticated_principal
 
 if tp.TYPE_CHECKING:
@@ -61,6 +62,14 @@ class InviteBody(_Body):
     email: str = Field(min_length=3, max_length=320)
     subject: str = Field(min_length=1, max_length=64)
     role: Role | None = None
+    #: The simple alternative to ``role``: admin, trusted or user (not both).
+    tier: TeamTier | None = None
+    org_id: str | None = Field(default=None, max_length=128)
+    project_id: str | None = Field(default=None, max_length=128)
+
+
+class TierBody(_Body):
+    tier: TeamTier
     org_id: str | None = Field(default=None, max_length=128)
     project_id: str | None = Field(default=None, max_length=128)
 
@@ -80,11 +89,17 @@ class TokenBody(_Body):
 
 
 class RulesBody(_Body):
-    """A complete replacement of one account's governance rules; ``null`` clears a rule."""
+    """One account's governance rules: ``null`` clears a rule, an omitted key keeps the stored value.
+
+    Omission is preserved so a client written before a rule existed (which never
+    sends its key) cannot clear it by accident; ``eyvan users rules`` and the
+    dashboard send every key, so their omitted options still clear.
+    """
 
     allowed_fleets: list[str] | None = Field(default=None, max_length=64)
     approval_tpu_threshold: int | None = Field(default=None, ge=0, le=1_000_000)
     guaranteed_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+    max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
 
 
 class ReclaimBody(_Body):
@@ -96,9 +111,14 @@ class WorkloadReclaimBody(_Body):
     reason: str = Field(min_length=1, max_length=500)
 
 
-def user_document(user: UserRecord) -> dict[str, tp.Any]:
-    """Public view of an account; never the password hash."""
+def user_document(user: UserRecord, tier: TeamTier | None = None) -> dict[str, tp.Any]:
+    """Public view of an account; never the password hash.
 
+    ``tier`` is derived from grants, so a caller that has it passes it in; without
+    it the flag alone decides between ``trusted`` and ``user``.
+    """
+
+    derived = tier if tier is not None else (TeamTier.TRUSTED if user.trusted else TeamTier.USER)
     return {
         "subject": user.subject,
         "email": user.email,
@@ -106,10 +126,13 @@ def user_document(user: UserRecord) -> dict[str, tp.Any]:
         "disabled": user.disabled,
         "created_at": user.created_at.isoformat(),
         "created_by": user.created_by,
+        "tier": derived.value,
+        "trusted": user.trusted,
         "rules": {
             "allowed_fleets": None if user.allowed_fleets is None else list(user.allowed_fleets),
             "approval_tpu_threshold": user.approval_tpu_threshold,
             "guaranteed_tpu_units": user.guaranteed_tpu_units,
+            "max_tpu_units": user.max_tpu_units,
         },
     }
 
@@ -167,6 +190,10 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
     def bad_input(error: ValueError) -> HTTPException:
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
 
+    async def document(user: UserRecord) -> dict[str, tp.Any]:
+        tiers = await service.team_tiers((user.subject,))
+        return user_document(user, tiers.get(user.subject))
+
     @app.get("/api/v1/team/status", tags=["team"])
     async def team_status() -> dict[str, tp.Any]:
         """Report whether this plane runs team accounts (unauthenticated)."""
@@ -194,13 +221,13 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         if body.token_name is not None:
             # A CLI credential is returned once, in the body; no cookie is set.
             return {
-                "user": user_document(user),
+                "user": await document(user),
                 "expires_at": expires_at,
                 "token": raw,
                 "record": token_document(record),
             }
         set_session(response, raw)
-        return {"user": user_document(user), "expires_at": expires_at}
+        return {"user": await document(user), "expires_at": expires_at}
 
     @app.post("/api/v1/team/logout", tags=["team"])
     async def team_logout(request: Request, response: Response, _on: _On) -> dict[str, tp.Any]:
@@ -217,12 +244,19 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         """Return who the caller is and the grants this plane resolved for them."""
 
         user = await service.get_team_user(principal.subject)
+        fleet_admin = any(grant.role is Role.FLEET_ADMIN for grant in principal.grants)
+        user_view = None if user is None else await document(user)
+        if user_view is not None:
+            tier = user_view["tier"]
+        else:
+            tier = TeamTier.ADMIN.value if fleet_admin else None
         return {
             "subject": principal.subject,
             "display_name": principal.display_name,
-            "user": None if user is None else user_document(user),
+            "user": user_view,
+            "tier": tier,
             "grants": [grant.model_dump(mode="json") for grant in principal.grants],
-            "fleet_admin": any(grant.role is Role.FLEET_ADMIN for grant in principal.grants),
+            "fleet_admin": fleet_admin,
         }
 
     @app.post("/api/v1/team/tokens", status_code=201, tags=["team"])
@@ -244,13 +278,26 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
     async def create_team_invite(body: InviteBody, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
         """Invite someone; the link is returned once and should be sent to them privately."""
 
+        if body.role is not None and body.tier is not None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="pass tier or role, not both")
         grants: tuple[RoleGrant, ...] = ()
-        if body.role is not None:
-            try:
+        trusted = False
+        try:
+            if body.role is not None:
                 grants = (RoleGrant(role=body.role, org_id=body.org_id, project_id=body.project_id),)
-            except ValueError as error:
-                raise bad_input(error) from None
-        invite, raw = await service.invite_user(principal, email=body.email, subject=body.subject, grants=grants)
+            elif body.tier is TeamTier.ADMIN:
+                grants = (RoleGrant(role=Role.FLEET_ADMIN),)
+            elif body.tier is not None:
+                if not body.org_id or not body.project_id:
+                    raise ValueError(f"the {body.tier.value} tier needs an org_id and a project_id")
+                role = Role.PROJECT_OPERATOR if body.tier is TeamTier.TRUSTED else Role.PROJECT_SUBMITTER
+                grants = (RoleGrant(role=role, org_id=body.org_id, project_id=body.project_id),)
+                trusted = body.tier is TeamTier.TRUSTED
+        except ValueError as error:
+            raise bad_input(error) from None
+        invite, raw = await service.invite_user(
+            principal, email=body.email, subject=body.subject, grants=grants, trusted=trusted
+        )
         return {
             "invite": invite_document(invite),
             "url": f"{settings.public_url.rstrip('/')}/#/accept-invite/{raw}",
@@ -285,33 +332,36 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         except ValueError as error:
             raise bad_input(error) from None
         set_session(response, raw)
-        return {"user": user_document(user), "expires_at": record.expires_at.isoformat() if record.expires_at else None}
+        return {"user": await document(user), "expires_at": record.expires_at.isoformat() if record.expires_at else None}
 
     @app.get("/api/v1/team/users", tags=["team"])
     async def list_team_users(principal: _Principal, _on: _On) -> dict[str, tp.Any]:
-        return {"users": [user_document(item) for item in await service.list_team_users(principal)]}
+        users = await service.list_team_users(principal)
+        tiers = await service.team_tiers()
+        return {"users": [user_document(item, tiers.get(item.subject)) for item in users]}
 
     @app.post("/api/v1/team/users/{subject}/disable", tags=["team"])
     async def disable_team_user(subject: str, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
-        return user_document(await service.set_user_disabled(principal, subject, disabled=True))
+        return await document(await service.set_user_disabled(principal, subject, disabled=True))
 
     @app.post("/api/v1/team/users/{subject}/enable", tags=["team"])
     async def enable_team_user(subject: str, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
-        return user_document(await service.set_user_disabled(principal, subject, disabled=False))
+        return await document(await service.set_user_disabled(principal, subject, disabled=False))
+
+    @app.put("/api/v1/team/users/{subject}/tier", tags=["team"])
+    async def set_team_user_tier(subject: str, body: TierBody, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
+        """Make an account admin, trusted or user: its grants and trusted flag change together (fleet admins)."""
+
+        return await document(
+            await service.set_user_tier(principal, subject, body.tier, org_id=body.org_id, project_id=body.project_id)
+        )
 
     @app.put("/api/v1/team/users/{subject}/rules", tags=["team"])
     async def set_team_user_rules(subject: str, body: RulesBody, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
-        """Replace one account's fleet allow-list, approval threshold and TPU guarantee (fleet admins)."""
+        """Replace one account's fleet allow-list, approval threshold, TPU guarantee and hard TPU cap (fleet admins)."""
 
-        return user_document(
-            await service.set_user_rules(
-                principal,
-                subject,
-                allowed_fleets=body.allowed_fleets,
-                approval_tpu_threshold=body.approval_tpu_threshold,
-                guaranteed_tpu_units=body.guaranteed_tpu_units,
-            )
-        )
+        sent = {name: getattr(body, name) for name in body.model_fields_set}
+        return await document(await service.set_user_rules(principal, subject, **sent))
 
     @app.get("/api/v1/team/reclaim/plan", tags=["team"])
     async def plan_team_reclaim(

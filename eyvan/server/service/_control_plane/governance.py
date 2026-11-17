@@ -19,23 +19,32 @@ from __future__ import annotations
 
 import secrets
 import typing as tp
+import weakref
 
 from eyvan.domain.governance import (
+    CALLABLE_NEEDS_CAP,
     HELD_WORKLOAD_KEY,
     REFUSE,
+    RULE_UNCHANGED,
     AdmissionVerdict,
     ReclaimPlan,
+    RuleUnchanged,
     RunningJob,
     UserRules,
     admission_verdict,
     plan_reclaim,
     requested_tpu_units,
     targeted_pool_ids,
+    team_tier,
+    tpu_cap_refusal,
+    tpu_units_in_use,
 )
-from eyvan.records import TeamRequestRecord, UserRecord
+from eyvan.records import TeamRequestRecord, TeamTier, UserRecord
 from eyvan.server.service._control_plane.shared import (
+    TERMINAL_WORKLOAD_STATES,
     AuditEvent,
     AuthorizationError,
+    CallableExecution,
     ConflictError,
     InputError,
     NotFoundError,
@@ -54,6 +63,15 @@ from eyvan.server.service._control_plane.shared import (
 #: The resolution string that releases a held workload.
 HOLD_APPROVED = "approved"
 
+#: Workload states that still hold or wait for capacity, for the hard TPU cap.
+_UNFINISHED_STATES = frozenset(WorkloadState) - TERMINAL_WORKLOAD_STATES
+
+#: Running TPU usage per owner inside one transaction, keyed by the session.
+#: Counted once, then raised by every workload admitted in that transaction, so
+#: a batch, DAG or group admitting N children reads the owner's rows once. The
+#: entry dies with the session; a retried transaction gets a fresh session.
+_USAGE_IN_TX: weakref.WeakKeyDictionary[tp.Any, dict[str, int]] = weakref.WeakKeyDictionary()
+
 #: States in which a workload holds capacity, for borrow accounting.
 _ACTIVE_STATES = frozenset(
     {
@@ -70,6 +88,7 @@ def user_rules(user: UserRecord) -> UserRules:
         allowed_fleets=user.allowed_fleets,
         approval_tpu_threshold=user.approval_tpu_threshold,
         guaranteed_tpu_units=user.guaranteed_tpu_units,
+        max_tpu_units=user.max_tpu_units,
     )
 
 
@@ -78,6 +97,125 @@ class GovernanceMixin:
 
     governance_enabled: bool
 
+    # -------------------------------------------------------- tier and cap
+
+    @staticmethod
+    async def _team_tier_in(tx: RepositorySession, user: UserRecord) -> TeamTier:
+        """Derive one account's tier from its durable grants and ``trusted`` flag."""
+
+        return team_tier(user.trusted, await tx.list_role_grants(subject=user.subject), utcnow())
+
+    @staticmethod
+    async def _lock_tpu_cap(tx: RepositorySession, subject: str) -> None:
+        """Serialize every cap decision for one person, across all of their orgs and projects.
+
+        The idempotency lookup takes a transaction-scoped PostgreSQL advisory lock
+        on the key (the same mechanism ``_lock_admission_scope`` uses), so two
+        cap decisions for one person never overlap. It is a backstop, not the
+        guarantee: the transaction's snapshot predates the lock, so a waiter that
+        resumes reads stale usage, and it is PostgreSQL's SERIALIZABLE conflict
+        detection that aborts it (retryable, surfaced as 503 + Retry-After) rather
+        than admitting it. The memory and local stores run whole transactions
+        serially, so there the count is always current.
+        """
+
+        await tx.get_idempotency("fleet", "governance.tpu_cap", subject)
+
+    @staticmethod
+    async def _tpu_units_in_use(tx: RepositorySession, subject: str, *, exclude_id: str | None = None) -> int:
+        owned = await tx.list_workloads_created_by(subject, states=_UNFINISHED_STATES)
+        return tpu_units_in_use(owned, subject, exclude_id=exclude_id)
+
+    async def _require_tpu_cap(
+        self,
+        tx: RepositorySession,
+        user: UserRecord,
+        tpu_units: int,
+        *,
+        exclude_id: str | None = None,
+        prefix: str = "",
+    ) -> None:
+        """Refuse (``ConflictError``) when ``tpu_units`` more would break the account's hard cap.
+
+        Without ``exclude_id`` this is an admission: the caller stores the job
+        next, so the transaction's running total is raised by ``tpu_units``.
+        With it (approval release, retry) usage is always counted afresh.
+        """
+
+        if user.max_tpu_units is None or tpu_units <= 0:
+            return
+        running = _USAGE_IN_TX.setdefault(tx, {}) if exclude_id is None else None
+        in_use = running.get(user.subject) if running is not None else None
+        if in_use is None:
+            await self._lock_tpu_cap(tx, user.subject)
+            in_use = await self._tpu_units_in_use(tx, user.subject, exclude_id=exclude_id)
+        refusal = tpu_cap_refusal(user.max_tpu_units, in_use, tpu_units)
+        if refusal is not None:
+            raise ConflictError(prefix + refusal)
+        if running is not None:
+            running[user.subject] = in_use + tpu_units
+
+    async def _governance_retry(self, tx: RepositorySession, workload: WorkloadRecord) -> None:
+        """Re-apply the owner's callable rule and hard TPU cap before a retry re-queues a workload.
+
+        A retry returns a FAILED/CANCELLED job to PENDING, so it is an admission
+        and must not be a way around either rule -- whoever asks for it. The
+        owner (``created_by``) is judged, not the operator retrying.
+        """
+
+        if not getattr(self, "governance_enabled", False) or workload.coordination_kind is not None:
+            return
+        if isinstance(workload.spec.execution, CallableExecution):
+            await self._require_team_callable(
+                tx, subject=workload.created_by, org_id=workload.org_id, project_id=workload.project_id
+            )
+        owner = await tx.get_user(workload.created_by)
+        if owner is not None:
+            await self._require_tpu_cap(
+                tx,
+                owner,
+                requested_tpu_units(workload.spec),
+                exclude_id=workload.id,
+                prefix=f"cannot retry {workload.id}: ",
+            )
+
+    async def _require_team_callable(self, tx: RepositorySession, *, subject: str, org_id: str, project_id: str) -> None:
+        """Apply the team-mode callable rule for the identity a callable workload belongs to.
+
+        A project the trust policy names is allowed as before, and nothing
+        changes on a plane without team governance. Otherwise an ``admin`` or
+        ``trusted`` account may run callables; a ``user`` only once a fleet admin
+        has set their TPU cap, which then bounds them. Anyone without an enabled
+        team account (bootstrap, OIDC-only and similar principals) keeps the
+        project rule.
+
+        The cap counts TPU units only, so a user-tier callable on a CPU or GPU
+        pool (0 TPU units) is admitted once a cap exists but is not bounded by it.
+        """
+
+        trust = self.callable_trust  # type: ignore[attr-defined]
+        if not getattr(self, "governance_enabled", False) or trust.allows(org_id, project_id):
+            return
+        user = await tx.get_user(subject)
+        if user is None or user.disabled:
+            trust.require(org_id, project_id)
+            return
+        if await self._team_tier_in(tx, user) is TeamTier.USER and user.max_tpu_units is None:
+            raise AuthorizationError(f"{subject!r} may not run callable workloads yet; {CALLABLE_NEEDS_CAP}")
+
+    async def team_tpu_cap(self, principal: Principal) -> dict[str, tp.Any] | None:
+        """Return the caller's tier, hard TPU cap and current usage, or ``None`` off team mode."""
+
+        if not getattr(self, "governance_enabled", False):
+            return None
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            user = await tx.get_user(principal.subject)
+            if user is None:
+                return None
+            tier = await self._team_tier_in(tx, user)
+            in_use = await self._tpu_units_in_use(tx, user.subject)
+        return {"tier": tier.value, "max_tpu_units": user.max_tpu_units, "tpu_units_in_use_or_queued": in_use}
+
     # ------------------------------------------------------------- rules
 
     async def set_user_rules(
@@ -85,27 +223,44 @@ class GovernanceMixin:
         principal: Principal,
         subject: str,
         *,
-        allowed_fleets: tp.Sequence[str] | None,
-        approval_tpu_threshold: int | None,
-        guaranteed_tpu_units: int | None,
+        allowed_fleets: tp.Sequence[str] | None | RuleUnchanged = RULE_UNCHANGED,
+        approval_tpu_threshold: int | None | RuleUnchanged = RULE_UNCHANGED,
+        guaranteed_tpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
+        max_tpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
     ) -> UserRecord:
-        """Replace one account's rules (fleet admins only); ``None`` clears a rule."""
+        """Update one account's rules (fleet admins only).
+
+        ``None`` clears a rule; a rule left at ``RULE_UNCHANGED`` (omitted by the
+        caller) keeps its stored value, so a client that predates a rule cannot
+        clear it by not knowing it exists.
+        """
 
         if not self.authorizer.allows(principal, Permission.MANAGE_FLEET):  # type: ignore[attr-defined]
             raise AuthorizationError(f"{principal.subject!r} may not set governance rules")
-        fleets = None if allowed_fleets is None else tuple(sorted({name.strip() for name in allowed_fleets}))
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             user = await tx.get_user(subject)
             if user is None:
                 raise NotFoundError(f"user {subject!r} not found")
+            if isinstance(allowed_fleets, RuleUnchanged):
+                fleets = user.allowed_fleets
+            else:
+                fleets = None if allowed_fleets is None else tuple(sorted({name.strip() for name in allowed_fleets}))
+            rules: dict[str, tp.Any] = {
+                "allowed_fleets": fleets,
+                "approval_tpu_threshold": user.approval_tpu_threshold
+                if isinstance(approval_tpu_threshold, RuleUnchanged)
+                else approval_tpu_threshold,
+                "guaranteed_tpu_units": user.guaranteed_tpu_units
+                if isinstance(guaranteed_tpu_units, RuleUnchanged)
+                else guaranteed_tpu_units,
+                "max_tpu_units": user.max_tpu_units if isinstance(max_tpu_units, RuleUnchanged) else max_tpu_units,
+            }
             try:
                 updated = UserRecord.model_validate(
                     {
                         **user.model_dump(mode="json"),
                         "password_hash": user.password_hash,
-                        "allowed_fleets": fleets,
-                        "approval_tpu_threshold": approval_tpu_threshold,
-                        "guaranteed_tpu_units": guaranteed_tpu_units,
+                        **rules,
                         "updated_at": utcnow(),
                     }
                 )
@@ -121,8 +276,9 @@ class GovernanceMixin:
                     action="user.rules_updated",
                     payload={
                         "allowed_fleets": list(fleets) if fleets is not None else None,
-                        "approval_tpu_threshold": approval_tpu_threshold,
-                        "guaranteed_tpu_units": guaranteed_tpu_units,
+                        "approval_tpu_threshold": updated.approval_tpu_threshold,
+                        "guaranteed_tpu_units": updated.guaranteed_tpu_units,
+                        "max_tpu_units": updated.max_tpu_units,
                     },
                 )
             )
@@ -138,11 +294,14 @@ class GovernanceMixin:
         subject: str,
         operation: str,
         top_level: bool,
+        holds_capacity: bool = True,
     ) -> AdmissionVerdict | None:
         """Return the verdict for one new submission, or ``None`` when no rule applies.
 
         Raises ``AuthorizationError`` for a fleet the person may not use and
-        ``ConflictError`` for an over-threshold submission that cannot be held.
+        ``ConflictError`` for an over-threshold submission that cannot be held
+        or one that would break their hard TPU cap. The ``admin`` and
+        ``trusted`` tiers are never held, but the cap binds every tier.
         """
 
         if not getattr(self, "governance_enabled", False):
@@ -159,18 +318,26 @@ class GovernanceMixin:
             pool = await tx.get_capacity_pool(pool_id)
             if pool is not None:
                 fleets.append(pool.fleet_name)
+        tpu_units = requested_tpu_units(spec)
+        exempt = rules.approval_tpu_threshold is not None and await self._team_tier_in(tx, user) is not TeamTier.USER
         verdict = admission_verdict(
             rules,
-            tpu_units=requested_tpu_units(spec),
+            tpu_units=tpu_units,
             fleets=fleets,
             pinned=bool(pool_ids),
             operation=operation,
             top_level=top_level,
+            exempt_from_approval=exempt,
         )
         if verdict.action == REFUSE:
             if verdict.refusal == "fleet":
                 raise AuthorizationError(verdict.reason)
             raise ConflictError(verdict.reason)
+        # Held jobs count too: approving one later must not be how a cap is passed.
+        # A coordinator (batch/DAG/group/service parent) holds nothing itself;
+        # each of its children is checked as it is stored.
+        if holds_capacity:
+            await self._require_tpu_cap(tx, user, tpu_units)
         return verdict
 
     async def _hold_for_approval(
@@ -242,6 +409,16 @@ class GovernanceMixin:
             # Already cancelled by its owner, or not a governance hold at all.
             return
         if resolution == HOLD_APPROVED:
+            owner = await tx.get_user(workload.created_by) if getattr(self, "governance_enabled", False) else None
+            if owner is not None:
+                # Re-checked at release: the cap may have been lowered while the job waited.
+                await self._require_tpu_cap(
+                    tx,
+                    owner,
+                    requested_tpu_units(workload.spec),
+                    exclude_id=workload.id,
+                    prefix=f"cannot release {workload.id} for {owner.subject}: ",
+                )
             released = workload.model_copy(
                 update={
                     "schedulable": True,

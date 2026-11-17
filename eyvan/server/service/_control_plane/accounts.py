@@ -18,8 +18,9 @@ import asyncio
 import secrets
 from datetime import timedelta
 
+from eyvan.domain.governance import enabled_fleet_admins, team_tier
 from eyvan.identity.team_secrets import hash_password, is_team_token, new_secret, token_hash, verify_password
-from eyvan.records import ApiTokenRecord, InviteRecord, UserRecord
+from eyvan.records import ApiTokenRecord, InviteRecord, TeamTier, UserRecord
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
     AuthorizationError,
@@ -28,6 +29,7 @@ from eyvan.server.service._control_plane.shared import (
     NotFoundError,
     Permission,
     Principal,
+    RepositorySession,
     Role,
     RoleGrant,
     RoleGrantRecord,
@@ -76,14 +78,18 @@ class AccountsMixin:
         email: str,
         subject: str,
         grants: tuple[RoleGrant, ...] = (),
+        trusted: bool = False,
         ttl: timedelta = INVITE_TTL,
     ) -> tuple[InviteRecord, str]:
         """Create a single-use invite; return it and its raw token (shown once).
 
         The inviter must be able to issue every grant the invite carries: an
         invite is a deferred grant, so it may not be a way around grant rules.
+        ``trusted`` (the trusted tier) is account administration, so it needs it.
         """
 
+        if trusted:
+            self._require_account_administration(principal)
         if grants:
             for grant in grants:
                 self._require_grant_administration(principal, grant)  # type: ignore[attr-defined]
@@ -102,6 +108,7 @@ class AccountsMixin:
                 created_by=principal.subject,
                 created_at=now,
                 expires_at=now + ttl,
+                trusted=trusted,
             )
         except ValueError as exc:
             raise InputError(str(exc)) from exc
@@ -120,7 +127,12 @@ class AccountsMixin:
                     "invite",
                     invite.id,
                     "invite.created",
-                    {"email": email, "subject": subject, "roles": [grant.role.value for grant in grants]},
+                    {
+                        "email": email,
+                        "subject": subject,
+                        "roles": [grant.role.value for grant in grants],
+                        **({"trusted": True} if trusted else {}),
+                    },
                 )
             )
         return invite, raw
@@ -228,6 +240,7 @@ class AccountsMixin:
                 created_by=invite.created_by,
                 created_at=now,
                 updated_at=now,
+                trusted=invite.trusted,
             )
             await tx.put_user(user)
             await tx.put_invite(invite.model_copy(update={"accepted_at": now}))
@@ -393,6 +406,136 @@ class AccountsMixin:
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             return await tx.list_users()
 
+    async def team_tiers(self, subjects: tuple[str, ...] | None = None) -> dict[str, TeamTier]:
+        """Return the derived tier of each account (all accounts when ``subjects`` is ``None``)."""
+
+        now = utcnow()
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            users = await tx.list_users()
+            grants = await tx.list_role_grants()
+        wanted = None if subjects is None else set(subjects)
+        return {
+            user.subject: team_tier(user.trusted, (item for item in grants if item.subject == user.subject), now)
+            for user in users
+            if wanted is None or user.subject in wanted
+        }
+
+    @staticmethod
+    async def _require_an_enabled_fleet_admin_after(tx: RepositorySession, before: set[str], subject: str) -> None:
+        """Refuse (``ConflictError``) a change that took the plane's last enabled fleet admin away.
+
+        Called after the change inside its transaction, so raising rolls it back.
+        Only applies when ``subject`` was an enabled admin before the change:
+        a plane that never had a team admin (bootstrap, OIDC) is not blocked.
+        """
+
+        if subject in before and not enabled_fleet_admins(await tx.list_users(), await tx.list_role_grants(), utcnow()):
+            raise ConflictError(
+                f"{subject!r} is the last enabled fleet admin; make someone else an admin before changing this"
+            )
+
+    @staticmethod
+    async def _enabled_fleet_admins(tx: RepositorySession) -> set[str]:
+        return enabled_fleet_admins(await tx.list_users(), await tx.list_role_grants(), utcnow())
+
+    async def set_user_tier(
+        self,
+        principal: Principal,
+        subject: str,
+        tier: TeamTier | str,
+        *,
+        org_id: str | None = None,
+        project_id: str | None = None,
+    ) -> UserRecord:
+        """Set one account's tier: its ``fleet_admin`` grant, project role and ``trusted`` flag, atomically.
+
+        * ``admin``: ensure a global ``fleet_admin`` grant; ``trusted`` off.
+        * ``trusted``: drop ``fleet_admin``; on (org, project) drop ``project_submitter``
+          and ensure ``project_operator``; ``trusted`` on.
+        * ``user``: drop ``fleet_admin``; on (org, project) drop ``project_operator``
+          and ensure ``project_submitter``; ``trusted`` off.
+
+        Every other grant is left alone. Refuses to leave the plane without an
+        enabled fleet admin account.
+        """
+
+        self._require_account_administration(principal)
+        try:
+            target = TeamTier(tier)
+        except ValueError as exc:
+            raise InputError(f"tier must be one of {', '.join(item.value for item in TeamTier)}") from exc
+        scoped: RoleGrant | None = None
+        dropped_project_role: Role | None = None
+        if target is not TeamTier.ADMIN:
+            if not org_id or not project_id:
+                raise InputError(f"the {target.value} tier needs an org_id and a project_id for its project role")
+            keep_role, drop_role = (
+                (Role.PROJECT_OPERATOR, Role.PROJECT_SUBMITTER)
+                if target is TeamTier.TRUSTED
+                else (Role.PROJECT_SUBMITTER, Role.PROJECT_OPERATOR)
+            )
+            try:
+                scoped = RoleGrant(role=keep_role, org_id=org_id, project_id=project_id)
+            except ValueError as exc:
+                raise InputError(str(exc)) from exc
+            dropped_project_role = drop_role
+        now = utcnow()
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            user = await tx.get_user(subject)
+            if user is None:
+                raise NotFoundError(f"user {subject!r} not found")
+            grants = await tx.list_role_grants(subject=subject)
+            old = team_tier(user.trusted, grants, now)
+            admins_before = await self._enabled_fleet_admins(tx)
+            added: list[str] = []
+            removed: list[str] = []
+
+            async def ensure(grant: RoleGrant) -> None:
+                record = RoleGrantRecord(
+                    subject=subject, grant=grant, reason="tier", granted_by=principal.subject, granted_at=now
+                )
+                current = next((item for item in grants if item.key == record.key), None)
+                # A time-limited grant is replaced too: a tier is not a temporary elevation.
+                if current is None or current.expires_at is not None or not current.active_at(now):
+                    await tx.put_role_grant(record)
+                    added.append(grant.role.value)
+
+            async def drop(key: tuple[str, str, str, str]) -> None:
+                if await tx.delete_role_grant(key):
+                    removed.append(key[1])
+
+            if target is TeamTier.ADMIN:
+                await ensure(RoleGrant(role=Role.FLEET_ADMIN))
+            else:
+                assert scoped is not None and dropped_project_role is not None
+                await drop((subject, Role.FLEET_ADMIN.value, "", ""))
+                await drop((subject, dropped_project_role.value, org_id or "", project_id or ""))
+                await ensure(scoped)
+            await self._require_an_enabled_fleet_admin_after(tx, admins_before, subject)
+            updated = user.model_copy(update={"trusted": target is TeamTier.TRUSTED, "updated_at": now})
+            await tx.put_user(updated)
+            await tx.append_event(
+                AuditEvent(
+                    id=_new_id("evt"),
+                    actor=principal.subject,
+                    org_id=org_id if target is not TeamTier.ADMIN else None,
+                    project_id=project_id if target is not TeamTier.ADMIN else None,
+                    entity_type="user",
+                    entity_id=subject,
+                    action="user.tier_updated",
+                    payload={
+                        "subject": subject,
+                        "old_tier": old.value,
+                        "new_tier": target.value,
+                        "org_id": org_id if target is not TeamTier.ADMIN else None,
+                        "project_id": project_id if target is not TeamTier.ADMIN else None,
+                        "grants_added": [*added],
+                        "grants_removed": [*removed],
+                    },
+                )
+            )
+            return updated
+
     async def set_user_disabled(self, principal: Principal, subject: str, *, disabled: bool) -> UserRecord:
         """Disable or re-enable an account; disabling revokes every token it holds."""
 
@@ -404,8 +547,10 @@ class AccountsMixin:
             user = await tx.get_user(subject)
             if user is None:
                 raise NotFoundError(f"user {subject!r} not found")
+            admins_before = await self._enabled_fleet_admins(tx) if disabled else set()
             updated = user.model_copy(update={"disabled": disabled, "updated_at": now})
             await tx.put_user(updated)
+            await self._require_an_enabled_fleet_admin_after(tx, admins_before, subject)
             if disabled:
                 for record in await tx.list_api_tokens(subject=subject):
                     if record.revoked_at is None:

@@ -260,7 +260,7 @@ function emitAuthChanged(): void {
 /** Ends a team password session: drops the HttpOnly `eyvan_team_session` cookie. */
 export const TEAM_LOGOUT_PATH = "/api/v1/team/logout";
 
-// Team accounts (EYVAN_TEAM_MODE). The gate records what the plane said, so
+// Team accounts (`eyvan-server --team` or `team: true`). The gate records what the plane said, so
 // the app can label the session and route sign-out without asking again.
 let teamModeEnabled = false;
 let teamSessionActive = false;

@@ -84,10 +84,97 @@ describe("Settings → Users & tokens", () => {
     expect(client.createTeamInvite).toHaveBeenCalledWith({
       email: "Bob@example.com",
       subject: "bob",
-      role: "project_submitter",
+      tier: "user",
       org_id: "acme",
       project_id: "r",
     });
+  });
+
+  it("invites with a tier, or with a custom role under Advanced, never both", async () => {
+    const client = mockClient();
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    const invite = await screen.findByRole("region", { name: "Invite a user" });
+    fireEvent.change(within(invite).getByLabelText("Email"), { target: { value: "ann@example.com" } });
+    fireEvent.change(within(invite).getByLabelText("Tier"), { target: { value: "admin" } });
+    fireEvent.click(within(invite).getByRole("button", { name: /Create invite/ }));
+    await waitFor(() =>
+      expect(client.createTeamInvite).toHaveBeenCalledWith({
+        email: "ann@example.com",
+        subject: "ann",
+        tier: "admin",
+        org_id: null,
+        project_id: null,
+      }),
+    );
+
+    fireEvent.change(within(invite).getByLabelText("Email"), { target: { value: "dan@example.com" } });
+    fireEvent.change(within(invite).getByLabelText("Role"), { target: { value: "project_viewer" } });
+    fireEvent.click(within(invite).getByRole("button", { name: /Create invite/ }));
+    await waitFor(() =>
+      expect(client.createTeamInvite).toHaveBeenLastCalledWith({
+        email: "dan@example.com",
+        subject: "dan",
+        role: "project_viewer",
+        org_id: "acme",
+        project_id: "r",
+      }),
+    );
+  });
+
+  it("changes a user's tier inline with the default project scope", async () => {
+    const client = mockClient();
+    vi.mocked(client.listTeamUsers).mockResolvedValue([{ ...USER, tier: "user" }]);
+    client.setTeamUserTier = vi.fn(async () => ({ ...USER, tier: "trusted" as const }));
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    const select = await screen.findByLabelText("Tier for alice");
+    fireEvent.change(select, { target: { value: "trusted" } });
+    await waitFor(() => expect(client.setTeamUserTier).toHaveBeenCalledWith("alice", "trusted", "acme", "r"));
+  });
+
+  it("asks before making someone admin: confirm applies, cancel changes nothing", async () => {
+    const client = mockClient();
+    vi.mocked(client.listTeamUsers).mockResolvedValue([{ ...USER, tier: "user" }]);
+    client.setTeamUserTier = vi.fn(async () => ({ ...USER, tier: "admin" as const }));
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    const select = (await screen.findByLabelText("Tier for alice")) as HTMLSelectElement;
+
+    fireEvent.change(select, { target: { value: "admin" } });
+    const dialog = await screen.findByRole("alertdialog", { name: "Confirm admin for alice" });
+    expect(dialog.textContent).toContain("Make alice a fleet admin?");
+    expect(client.setTeamUserTier).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(client.setTeamUserTier).not.toHaveBeenCalled();
+    expect((screen.getByLabelText("Tier for alice") as HTMLSelectElement).value).toBe("user");
+
+    fireEvent.change(screen.getByLabelText("Tier for alice"), { target: { value: "admin" } });
+    fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(client.setTeamUserTier).toHaveBeenCalledWith("alice", "admin", "acme", "r"));
+  });
+
+  it("saves and summarizes a max TPU cap", async () => {
+    const client = mockClient();
+    const withCap: TeamUser = {
+      ...USER,
+      rules: { allowed_fleets: null, approval_tpu_threshold: null, guaranteed_tpu_units: null, max_tpu_units: 16 },
+    };
+    vi.mocked(client.listTeamUsers).mockResolvedValue([withCap]);
+    client.setTeamUserRules = vi.fn(async () => withCap);
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    const users = await screen.findByRole("region", { name: "Users" });
+    await waitFor(() => expect(within(users).getByTestId("rules-alice").textContent).toBe("max 16 TPU"));
+    fireEvent.click(within(users).getByRole("button", { name: "Rules" }));
+    const form = await within(users).findByRole("form", { name: "Rules for alice" });
+    fireEvent.change(within(form).getByLabelText(/Max TPU units/), { target: { value: "32" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save rules" }));
+    await waitFor(() =>
+      expect(client.setTeamUserRules).toHaveBeenCalledWith("alice", {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: null,
+        max_tpu_units: 32,
+      }),
+    );
   });
 
   it("disables a user and revokes an open invite", async () => {
@@ -135,7 +222,12 @@ describe("Settings → Users & tokens", () => {
     const client = mockClient();
     const withRules: TeamUser = {
       ...USER,
-      rules: { allowed_fleets: ["research"], approval_tpu_threshold: 8, guaranteed_tpu_units: null },
+      rules: {
+        allowed_fleets: ["research"],
+        approval_tpu_threshold: 8,
+        guaranteed_tpu_units: null,
+        max_tpu_units: null,
+      },
     };
     vi.mocked(client.listTeamUsers).mockResolvedValue([withRules]);
     client.setTeamUserRules = vi.fn(async (_subject, rules) => ({ ...USER, rules }));
@@ -156,6 +248,7 @@ describe("Settings → Users & tokens", () => {
         allowed_fleets: ["research", "prod"],
         approval_tpu_threshold: null,
         guaranteed_tpu_units: 32,
+        max_tpu_units: null,
       }),
     );
   });

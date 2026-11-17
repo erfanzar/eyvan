@@ -404,6 +404,17 @@ class CallableSubmissionMixin:
             raise InputError(f"TPU chip request for pool {pool.id!r}: {problem}")
 
     def _require_trusted_callable_project(self, org_id: str, project_id: str) -> None:
+        """Apply the project rule now, or defer it to the submitting transaction in team mode.
+
+        With team governance the decision depends on the owner's account (tier
+        and TPU cap), which only a transaction can read. Every path that calls
+        this stores the workload through ``_store_workload``, which runs
+        ``_require_team_callable`` for the owning identity -- and that re-applies
+        this exact project rule to anyone without an enabled team account.
+        """
+
+        if getattr(self, "governance_enabled", False):
+            return
         self.callable_trust.require(org_id, project_id)
 
     def _authorize_callable_spec(self, spec: WorkloadDefinition, *, org_id: str, project_id: str) -> None:
@@ -430,10 +441,27 @@ class CallableSubmissionMixin:
             raise InputError(REMOTE_CALLABLE_SIGNING_KEY_ERROR)
 
     def authorize_callable_artifact(self, principal: Principal, *, org_id: str, project_id: str) -> None:
-        """Authorize managed callable storage for one trusted project."""
+        """Authorize managed callable storage for one trusted project.
+
+        Synchronous, so in team mode it can only check SUBMIT; uploading bytes
+        executes nothing, and every submission that would run them is gated by
+        the account rule in its transaction. ``authorize_callable_upload`` is the
+        complete check for callers that can await.
+        """
 
         self.authorizer.require(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
         self._require_trusted_callable_project(org_id, project_id)
+
+    async def authorize_callable_upload(self, principal: Principal, *, org_id: str, project_id: str) -> None:
+        """Authorize managed callable/workspace storage, applying the team-mode account rule."""
+
+        self.authorize_callable_artifact(principal, org_id=org_id, project_id=project_id)
+        if not getattr(self, "governance_enabled", False):
+            return
+        async with self.repository.transaction() as tx:
+            await self._require_team_callable(  # type: ignore[attr-defined]
+                tx, subject=principal.subject, org_id=org_id, project_id=project_id
+            )
 
     @staticmethod
     def result_spec_for_generation(

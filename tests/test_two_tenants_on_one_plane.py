@@ -207,7 +207,7 @@ EXEMPT_ROUTES: dict[str, str] = {
     "POST /api/v1/workloads/{workload_id}/children": "workload capability token, not a principal",
     "PUT /api/v1/workloads/{workload_id}/endpoint": "workload capability token, not a principal",
     "GET /api/v1/secrets/content": "secret capability token, not a principal",
-    # Team accounts (404 unless EYVAN_TEAM_MODE). Accounts are plane-wide, not
+    # Team accounts (404 unless team mode is on). Accounts are plane-wide, not
     # per-tenant; authority still comes from the role grants an invite carries.
     "GET /api/v1/team/status": "unauthenticated; reports only whether team mode is on",
     "POST /api/v1/team/login": "password sign-in; the caller's own credentials, no tenant data",
@@ -280,6 +280,7 @@ FLEET_ONLY_ROUTES.update(
         "POST /api/v1/team/users/{subject}/disable": "disable an account and revoke its tokens",
         "POST /api/v1/team/users/{subject}/enable": "re-enable an account",
         "PUT /api/v1/team/users/{subject}/rules": "set any account's fleet rules, approval threshold and guarantee",
+        "PUT /api/v1/team/users/{subject}/tier": "make any account admin, trusted or user (grants + trusted flag)",
         "POST /api/v1/team/workloads/{workload_id}/reclaim": "checkpoint, stop and requeue any tenant's workload",
         "POST /api/v1/assistant/providers": "add a plane-wide assistant provider",
         "POST /api/v1/assistant/models/discover": "read a provider's model list with a typed or stored key",

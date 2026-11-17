@@ -49,6 +49,7 @@ from eyvan.sdk.commands.soak_monitor import register_soak_monitor_commands
 from eyvan.sdk.commands.start import register_start_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
 from eyvan.sdk.commands.team import register_team_commands
+from eyvan.sdk.commands.team_up import register_team_up_commands
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
 from eyvan.sdk.commands.track import register_track_commands
 from eyvan.sdk.commands.workloads import register_workload_commands
@@ -169,6 +170,7 @@ for register_commands in (
     register_federation_commands,
     register_tenancy_commands,
     register_team_commands,
+    register_team_up_commands,
     register_assistant_commands,
     register_research_commands,
     register_mcp_commands,
