@@ -849,17 +849,25 @@ class UserRecord(EyvanModel):
     #: it can submit to and is never held for approval. Fleet admins are the
     #: ``admin`` tier through their grant, not through this flag.
     trusted: bool = False
-    #: Hard ceiling on the TPU units this person may have in use or queued at
-    #: once, across every org and project. ``None`` is no ceiling; a plain
-    #: ``user`` may run callables only once a fleet admin has set one.
+    #: Hard ceilings across every org/project, in ResourceVector units. A plain
+    #: team user needs a positive cap for each dimension their callable reserves.
     max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+    max_gpu_units: int | None = Field(default=None, ge=0, le=1_000_000, strict=True)
+    max_cpu_units: float | None = Field(default=None, ge=0, le=1_000_000, strict=True)
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         # An account with no rules serializes exactly as it did before rules
         # existed, so stored documents and older readers are unaffected.
         document = handler(self)
-        for name in ("allowed_fleets", "approval_tpu_threshold", "guaranteed_tpu_units", "max_tpu_units"):
+        for name in (
+            "allowed_fleets",
+            "approval_tpu_threshold",
+            "guaranteed_tpu_units",
+            "max_tpu_units",
+            "max_cpu_units",
+            "max_gpu_units",
+        ):
             if getattr(self, name) is None:
                 document.pop(name, None)
         if not self.trusted:

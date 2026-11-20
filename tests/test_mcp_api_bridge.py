@@ -516,7 +516,9 @@ def test_forwarded_headers_unit() -> None:
 
 
 def test_a_cookie_session_is_not_turned_into_a_forwarded_identity() -> None:
-    http = _client(dev_auth_enabled=False, bootstrap_token="b" * 40)
+    origin = "https://plane.example.test"
+    settings = EyvanSettings(team_mode=True, dev_auth_enabled=False, public_url=origin, bootstrap_token="b" * 40)
+    http = TestClient(create_app(settings=settings), base_url=origin)
     bootstrap = {"Authorization": "Bearer " + "b" * 40}
     created = http.post(
         "/api/v1/team/invites",
@@ -532,7 +534,7 @@ def test_a_cookie_session_is_not_turned_into_a_forwarded_identity() -> None:
     assert created.status_code == 201, created.text
     accepted = http.post("/api/v1/team/invites/accept", json={"token": created.json()["token"], "password": PASSWORD})
     assert accepted.status_code == 200 and http.cookies  # signed in by cookie only
-    failed, refused = _call(http, "eyvan_api_get", {"path": "/api/v1/team/me"}, headers={"Origin": ORIGIN})
+    failed, refused = _call(http, "eyvan_api_get", {"path": "/api/v1/team/me"}, headers={"Origin": origin})
     assert failed and refused["status"] == 401 and "Bearer" in refused["error"]
 
 

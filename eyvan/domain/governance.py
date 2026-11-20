@@ -19,6 +19,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from fractions import Fraction
 
 from eyvan.records import (
     POOL_ALTERNATES_LABEL,
@@ -51,18 +52,41 @@ HOLDABLE_OPERATIONS = frozenset({"workload.submit", "workload.submit_pool", "wor
 _BAND_RANK: Mapping[str, int] = {band.value: index for index, band in enumerate(PriorityBand)}
 
 
+@dataclass(frozen=True, slots=True)
+class QuotaUnits:
+    """Reserved compute dimensions. CPU sums use exact wire-decimal quantities."""
+
+    cpu: Fraction = Fraction(0)
+    gpu: int = 0
+    tpu: int = 0
+
+    def __add__(self, other: QuotaUnits) -> QuotaUnits:
+        return QuotaUnits(self.cpu + other.cpu, self.gpu + other.gpu, self.tpu + other.tpu)
+
+
+def requested_units(spec: WorkloadDefinition) -> QuotaUnits:
+    """Scale the actual reservation, not a kind inferred from an accelerator name."""
+
+    count = spec.gang.replicas * spec.cell_group_count
+    if spec.worker_resource_scope == "per_worker":
+        count *= spec.worker_count
+    resources = spec.gang.per_replica
+    return QuotaUnits(Fraction(str(resources.cpu)) * count, resources.gpu * count, resources.tpu * count)
+
+
 def requested_tpu_units(spec: WorkloadDefinition) -> int:
-    """Return the TPU units one workload holds while running.
+    return requested_units(spec).tpu
 
-    The same unit pools declare in ``allocatable.tpu`` and quotas count: per
-    replica, times replicas, times workers when the gang describes one worker,
-    times the number of cells in a multi-cell group.
-    """
 
-    per_cell = spec.gang.per_replica.tpu * spec.gang.replicas
-    if str(getattr(spec.worker_resource_scope, "value", spec.worker_resource_scope)) == "per_worker":
-        per_cell *= spec.worker_count
-    return int(per_cell * spec.cell_group_count)
+def has_approval_gate(workload: WorkloadRecord) -> bool:
+    """Only a top-level non-coordinator uses the schedulable gate for approval."""
+
+    return (
+        not workload.schedulable
+        and workload.parent_workload_id is None
+        and not workload.depends_on
+        and workload.coordination_kind is None
+    )
 
 
 def targeted_pool_ids(spec: WorkloadDefinition) -> tuple[str, ...]:
@@ -99,7 +123,7 @@ def enabled_fleet_admins(users: Iterable[UserRecord], grants: Iterable[RoleGrant
 _FINISHED_STATES = frozenset({WorkloadState.SUCCEEDED, WorkloadState.FAILED, WorkloadState.CANCELLED})
 
 #: Refusal shown to a plain ``user`` who submits a callable before a cap exists.
-CALLABLE_NEEDS_CAP = "ask a fleet admin to set your TPU quota before running @eyvan.execute jobs"
+CALLABLE_NEEDS_CAP = "ask a fleet admin to set a positive quota for each resource your callable reserves"
 
 
 def team_tier(trusted: bool, grants: Iterable[RoleGrantRecord], moment: datetime) -> TeamTier:
@@ -110,8 +134,8 @@ def team_tier(trusted: bool, grants: Iterable[RoleGrantRecord], moment: datetime
     return TeamTier.TRUSTED if trusted else TeamTier.USER
 
 
-def tpu_units_in_use(workloads: Iterable[WorkloadRecord], subject: str, *, exclude_id: str | None = None) -> int:
-    """Return the TPU units ``subject`` has in use or queued, across every org and project.
+def units_in_use(workloads: Iterable[WorkloadRecord], subject: str, *, exclude_id: str | None = None) -> QuotaUnits:
+    """Return the units ``subject`` has in use or queued, across every org and project.
 
     Every unfinished workload counts -- pending (held or not), admitted, leased,
     dispatching, running, checkpointing and cancelling -- except coordinators
@@ -119,14 +143,19 @@ def tpu_units_in_use(workloads: Iterable[WorkloadRecord], subject: str, *, exclu
     their children are counted instead, so a batch is not counted twice.
     """
 
-    return sum(
-        requested_tpu_units(workload.spec)
+    live = (
+        requested_units(workload.spec)
         for workload in workloads
         if workload.created_by == subject
         and workload.state not in _FINISHED_STATES
         and workload.coordination_kind is None
         and workload.id != exclude_id
     )
+    return sum(live, start=QuotaUnits())
+
+
+def tpu_units_in_use(workloads: Iterable[WorkloadRecord], subject: str, *, exclude_id: str | None = None) -> int:
+    return units_in_use(workloads, subject, exclude_id=exclude_id).tpu
 
 
 def tpu_cap_refusal(max_tpu_units: int | None, in_use: int, requested: int) -> str | None:
@@ -136,9 +165,7 @@ def tpu_cap_refusal(max_tpu_units: int | None, in_use: int, requested: int) -> s
     for someone already over a cap an admin has since lowered.
     """
 
-    if max_tpu_units is None or requested <= 0 or in_use + requested <= max_tpu_units:
-        return None
-    return f"TPU quota: you have {in_use} of {max_tpu_units} TPU units in use or queued; this job asks for {requested}"
+    return UserRules(max_tpu_units=max_tpu_units).cap_refusal(QuotaUnits(tpu=in_use), QuotaUnits(tpu=requested))
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,10 +176,66 @@ class UserRules:
     approval_tpu_threshold: int | None = None
     guaranteed_tpu_units: int | None = None
     max_tpu_units: int | None = None
+    max_gpu_units: int | None = None
+    max_cpu_units: float | None = None
+
+    @property
+    def caps(self) -> Mapping[str, int | Fraction | None]:
+        return {
+            "cpu": Fraction(str(self.max_cpu_units)) if self.max_cpu_units is not None else None,
+            "gpu": self.max_gpu_units,
+            "tpu": self.max_tpu_units,
+        }
 
     @property
     def empty(self) -> bool:
-        return self.allowed_fleets is None and self.approval_tpu_threshold is None and self.max_tpu_units is None
+        return (
+            self.allowed_fleets is None
+            and self.approval_tpu_threshold is None
+            and all(cap is None for cap in self.caps.values())
+        )
+
+    def approval_reason(self, tpu_units: int) -> str | None:
+        threshold = self.approval_tpu_threshold
+        if threshold is None or tpu_units <= threshold:
+            return None
+        return f"asks for {tpu_units} TPU units, above your approval threshold of {threshold}"
+
+    def fleet_refusal(self, fleets: Iterable[str], *, pinned: bool) -> str | None:
+        if self.allowed_fleets is None:
+            return None
+        allowed = set(self.allowed_fleets)
+        permitted = ", ".join(sorted(allowed)) or "(none)"
+        if not pinned:
+            return f"your account may only submit to fleet(s) {permitted}; name one"
+        targets = set(fleets)
+        outside = sorted(targets - allowed)
+        if outside or not targets:
+            return f"your account may not submit to fleet {', '.join(outside or ['(unknown)'])}; allowed: {permitted}"
+        return None
+
+    def callable_refusal(self, requested: QuotaUnits | None) -> str | None:
+        """An upload (no spec yet) needs some allowance; execution needs all it reserves."""
+
+        caps = self.caps
+        if requested is None:
+            return None if any(cap is not None and cap > 0 for cap in caps.values()) else CALLABLE_NEEDS_CAP
+        needed = [name for name in caps if getattr(requested, name) > 0]
+        if not needed:
+            return "callable has no resolved CPU, GPU or TPU reservation"
+        for name in needed:
+            cap = caps[name]
+            if cap is None or cap <= 0:
+                return f"{name.upper()} quota required: {CALLABLE_NEEDS_CAP}"
+        return None
+
+    def cap_refusal(self, in_use: QuotaUnits, requested: QuotaUnits) -> str | None:
+        for name, cap in self.caps.items():
+            used, extra = getattr(in_use, name), getattr(requested, name)
+            if cap is not None and extra > 0 and used + extra > cap:
+                unit = name.upper()
+                return f"{unit} quota: you have {used} of {cap} {unit} units in use or queued; this job asks for {extra}"
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +260,8 @@ def admission_verdict(
 ) -> AdmissionVerdict:
     """Decide admit / hold / refuse for one submission.
 
-    The hard TPU cap is not decided here: it needs the submitter's live usage,
-    which the service counts inside the submitting transaction (``tpu_cap_refusal``).
+    Hard caps need live owner-wide usage and are decided by ``UserRules.cap_refusal``
+    inside the submitting transaction.
 
     Args:
         rules: the submitter's rules.
@@ -191,29 +274,12 @@ def admission_verdict(
             for approval, whatever their threshold says.
     """
 
-    fleet_names = sorted(set(fleets))
-    if rules.allowed_fleets is not None:
-        allowed = set(rules.allowed_fleets)
-        if not pinned:
-            return AdmissionVerdict(
-                REFUSE,
-                f"your account may only submit to fleet(s) {', '.join(sorted(allowed)) or '(none)'}; name one",
-                tpu_units,
-                "fleet",
-            )
-        outside = [name for name in fleet_names if name not in allowed]
-        if outside or not fleet_names:
-            return AdmissionVerdict(
-                REFUSE,
-                f"your account may not submit to fleet {', '.join(outside or ['(unknown)'])}; "
-                f"allowed: {', '.join(sorted(allowed)) or '(none)'}",
-                tpu_units,
-                "fleet",
-            )
-    threshold = rules.approval_tpu_threshold
-    if exempt_from_approval or threshold is None or tpu_units <= threshold:
+    fleet_refusal = rules.fleet_refusal(fleets, pinned=pinned)
+    if fleet_refusal is not None:
+        return AdmissionVerdict(REFUSE, fleet_refusal, tpu_units, "fleet")
+    reason = rules.approval_reason(tpu_units)
+    if exempt_from_approval or reason is None:
         return AdmissionVerdict(ADMIT, "", tpu_units)
-    reason = f"asks for {tpu_units} TPU units, above your approval threshold of {threshold}"
     if top_level and operation in HOLDABLE_OPERATIONS:
         return AdmissionVerdict(HOLD, f"{reason}; waiting for a fleet admin's approval", tpu_units)
     return AdmissionVerdict(
@@ -357,17 +423,21 @@ __all__ = (
     "REFUSE",
     "RULE_UNCHANGED",
     "AdmissionVerdict",
+    "QuotaUnits",
     "ReclaimPlan",
     "RuleUnchanged",
     "RunningJob",
     "UserRules",
     "admission_verdict",
     "enabled_fleet_admins",
+    "has_approval_gate",
     "plan_reclaim",
     "requested_tpu_units",
+    "requested_units",
     "targeted_pool_ids",
     "team_tier",
     "tpu_cap_refusal",
     "tpu_units_in_use",
+    "units_in_use",
     "usage_by_subject",
 )

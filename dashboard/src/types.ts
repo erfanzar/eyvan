@@ -81,6 +81,8 @@ export interface TeamUserRules {
   guaranteed_tpu_units: number | null;
   /** Hard cap on TPU units in use or queued; null means no limit. */
   max_tpu_units: number | null;
+  max_cpu_units: number | null;
+  max_gpu_units: number | null;
 }
 
 export interface TeamRoleGrant {

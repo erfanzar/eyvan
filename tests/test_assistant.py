@@ -307,6 +307,41 @@ def test_requests_persist_in_every_backend(backend: str, tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_get_quota_reports_the_callers_team_resource_caps() -> None:
+    provider = FakeProvider(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_call("get_quota", {})]},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    http = _client(provider)
+    invite = http.post(
+        "/api/v1/team/invites",
+        json={"email": "alice@example.com", "subject": "alice", "tier": "user", **SCOPE},
+        headers=ADMIN,
+    )
+    assert invite.status_code == 201, invite.text
+    accepted = http.post(
+        "/api/v1/team/invites/accept", json={"token": invite.json()["token"], "password": "correct horse battery"}
+    )
+    assert accepted.status_code == 200, accepted.text
+    http.cookies.clear()
+    rules = {"max_cpu_units": 3, "max_gpu_units": 0}
+    updated = http.put("/api/v1/team/users/alice/rules", json=rules, headers=ADMIN)
+    assert updated.status_code == 200, updated.text
+    response = _chat(http, "What limits apply to me?", headers={**ALICE, "X-Eyvan-Roles": "project_viewer"})
+    assert response.status_code == 200, response.text
+    [quota] = [json.loads(msg["content"]) for msg in provider.sent(1)["messages"] if msg["role"] == "tool"]
+    legacy = {"tier": "user", "max_tpu_units": None, "tpu_units_in_use_or_queued": 0}
+    assert quota["team_tpu_cap"] == legacy
+    assert quota["team_resource_caps"] == {
+        **legacy,
+        **rules,
+        "cpu_units_in_use_or_queued": 0,
+        "gpu_units_in_use_or_queued": 0,
+    }
+
+
 def test_every_read_tool_runs_against_the_real_service() -> None:
     provider = FakeProvider()
     http = _client(provider)

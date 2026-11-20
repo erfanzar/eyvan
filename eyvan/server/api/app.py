@@ -1911,7 +1911,7 @@ def create_app(
         project_id: str,
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
     ) -> Response:
-        service.authorizer.require(principal, Permission.READ, org_id=org_id, project_id=project_id)
+        await service.authorize_result_download(principal, org_id=org_id, project_id=project_id, result_id=result_id)
         try:
             uri = result_uri(result_id)
         except ValueError as exc:
@@ -2729,10 +2729,34 @@ def create_app(
     @app.get("/api/v1/workloads/{workload_id}", response_model=WorkloadRecord, tags=["workloads"])
     async def get_workload(
         workload_id: str, response: Response, principal: tp.Annotated[Principal, Depends(authenticated_principal)]
-    ) -> WorkloadRecord:
-        workload = await service.get_workload(principal, workload_id)
+    ) -> WorkloadRecord | Response:
+        workload = await service.get_workload(principal, workload_id, for_status=True)
         if settings.correlation_enabled:
             response.headers["X-Eyvan-Correlation-ID"] = canonical_correlation_id(workload.id)
+        if not service.authorizer.allows(
+            principal, Permission.READ, org_id=workload.org_id, project_id=workload.project_id
+        ):
+            # Preserve the SDK record contract (including the current execution/result URI),
+            # without exposing lease, endpoint or dispatch details to a submit-only owner.
+            fields = {
+                "id",
+                "org_id",
+                "project_id",
+                "created_by",
+                "spec",
+                "state",
+                "attempt",
+                "generation",
+                "created_at",
+                "updated_at",
+                "failure_reason",
+                "scheduling_reason",
+            }
+            return Response(
+                workload.model_dump_json(include=fields),
+                media_type="application/json",
+                headers={**response.headers, "Cache-Control": "private, no-store"},
+            )
         return workload
 
     @app.get("/api/v1/workloads/{workload_id}/children", response_model=list[WorkloadRecord], tags=["workloads"])

@@ -530,6 +530,8 @@ def users_revoke_invite(session: CliSession, invite_id: str) -> None:
     type=click.IntRange(min=0, max=1_000_000),
     help="Hard cap on TPU units in use or queued at once, across all projects. Omit for no cap.",
 )
+@click.option("--max-cpu", type=click.FloatRange(0, 1_000_000), help="Hard cap on CPU units (fractions allowed).")
+@click.option("--max-gpu", type=click.IntRange(0, 1_000_000), help="Hard cap on GPU units in use or queued.")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def users_rules(
@@ -539,6 +541,8 @@ def users_rules(
     approval_threshold: int | None,
     guarantee: int | None,
     max_tpu: int | None,
+    max_cpu: float | None,
+    max_gpu: int | None,
     as_json: bool,
 ) -> None:
     """Replace one account's governance rules (fleet admins); options left out are cleared."""
@@ -552,18 +556,25 @@ def users_rules(
                 "approval_tpu_threshold": approval_threshold,
                 "guaranteed_tpu_units": guarantee,
                 "max_tpu_units": max_tpu,
+                "max_cpu_units": max_cpu,
+                "max_gpu_units": max_gpu,
             },
         )
     )
     rules = _object(payload.get("rules", {}))
     threshold = rules.get("approval_tpu_threshold")
     guaranteed = rules.get("guaranteed_tpu_units")
-    cap = rules.get("max_tpu_units")
+    caps = []
+    for resource in ("tpu", "cpu", "gpu"):
+        cap = rules.get(f"max_{resource}_units")
+        caps.append(f"max {resource.upper()} {cap if cap is not None else 'no limit'}")
+    allowed = rules.get("allowed_fleets")
+    fleet_label = "any" if allowed is None else (", ".join(allowed) or "none")
     text = (
-        f"{subject}: fleets {', '.join(rules.get('allowed_fleets') or []) or 'any'}; "
+        f"{subject}: fleets {fleet_label}; "
         f"approval above {threshold if threshold is not None else 'never'}; "
         f"guarantee {guaranteed if guaranteed is not None else 'none'}; "
-        f"max TPU {cap if cap is not None else 'no limit'}"
+        f"{'; '.join(caps)}"
     )
     _emit(as_json, payload, text)
 

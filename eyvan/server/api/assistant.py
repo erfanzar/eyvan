@@ -423,10 +423,13 @@ class AssistantTools:
         # ``unlimited`` is a property, which model_dump drops; without it the
         # model would have to infer "no limit" from an empty-looking chain.
         document = {**quota.model_dump(mode="json"), "unlimited": quota.unlimited}
-        # Team mode: the person's hard TPU cap across every project, if any.
-        team_cap = await self.service.team_tpu_cap(self.principal)
-        if team_cap is not None:
-            document["team_tpu_cap"] = team_cap
+        # Cross-project caps apply in addition to the project quota chain.
+        caps = await self.service.team_tpu_cap(self.principal)
+        if caps is not None:
+            document["team_resource_caps"] = caps
+            document["team_tpu_cap"] = {
+                key: caps[key] for key in ("tier", "max_tpu_units", "tpu_units_in_use_or_queued")
+            }
         return document
 
     async def _tool_list_workloads(self, state: str | None = None) -> tp.Any:

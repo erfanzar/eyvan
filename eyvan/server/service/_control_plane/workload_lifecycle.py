@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from eyvan.domain.governance import has_approval_gate
 from eyvan.server.service._control_plane.shared import (
     ACTIVE_LEASE_STATES,
     STUCK_CANCEL_AFTER_S,
@@ -348,11 +349,13 @@ class WorkloadLifecycleMixin:
                 return workload, True
             if workload.state not in {WorkloadState.FAILED, WorkloadState.CANCELLED}:
                 raise ConflictError("only failed or cancelled workloads can be retried")
+            if has_approval_gate(workload):
+                raise ConflictError("workload was never released from approval; resubmit it as a new workload")
             budget_update = self._manual_retry_budget_update(workload)
             ensure_workload_transition(workload.state, WorkloadState.PENDING)
             # Team governance (off unless team mode): a retry re-queues work, so
-            # the owner's callable rule and hard TPU cap apply as at admission.
-            await self._governance_retry(tx, workload)  # type: ignore[attr-defined]
+            # the owner's callable rule and hard caps apply as at admission.
+            await self._governance_readmission(tx, workload, f"cannot retry {workload.id}: ")  # type: ignore[attr-defined]
             now = utcnow()
             next_generation = workload.generation + 1
             updated = workload.model_copy(

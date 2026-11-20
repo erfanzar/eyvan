@@ -843,8 +843,8 @@ export class EyvanApiClient {
     );
   }
 
-  /** Replace one account's governance rules (fleet admins); a null field clears that rule. */
-  async setTeamUserRules(subject: string, rules: TeamUserRules): Promise<TeamUser> {
+  /** Update only the supplied rules (fleet admins); null clears that rule. */
+  async setTeamUserRules(subject: string, rules: Partial<TeamUserRules>): Promise<TeamUser> {
     return this.attachmentRequest<TeamUser>(`/api/v1/team/users/${encodeURIComponent(subject)}/rules`, {
       method: "PUT",
       body: JSON.stringify(rules),

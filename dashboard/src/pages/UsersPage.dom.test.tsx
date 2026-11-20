@@ -152,29 +152,69 @@ describe("Settings → Users & tokens", () => {
     await waitFor(() => expect(client.setTeamUserTier).toHaveBeenCalledWith("alice", "admin", "acme", "r"));
   });
 
-  it("saves and summarizes a max TPU cap", async () => {
+  it("summarizes resource caps including zero and saves fractional CPU alongside GPU and TPU caps", async () => {
     const client = mockClient();
     const withCap: TeamUser = {
       ...USER,
-      rules: { allowed_fleets: null, approval_tpu_threshold: null, guaranteed_tpu_units: null, max_tpu_units: 16 },
+      rules: {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: null,
+        max_tpu_units: 16,
+        max_cpu_units: 4,
+        max_gpu_units: 0,
+      },
     };
     vi.mocked(client.listTeamUsers).mockResolvedValue([withCap]);
     client.setTeamUserRules = vi.fn(async () => withCap);
     render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
     const users = await screen.findByRole("region", { name: "Users" });
-    await waitFor(() => expect(within(users).getByTestId("rules-alice").textContent).toBe("max 16 TPU"));
+    await waitFor(() =>
+      expect(within(users).getByTestId("rules-alice").textContent).toBe("max 16 TPU; max 4 CPU; max 0 GPU"),
+    );
     fireEvent.click(within(users).getByRole("button", { name: "Rules" }));
     const form = await within(users).findByRole("form", { name: "Rules for alice" });
     fireEvent.change(within(form).getByLabelText(/Max TPU units/), { target: { value: "32" } });
+    fireEvent.change(within(form).getByLabelText(/Max CPU units/), { target: { value: "0.5" } });
+    fireEvent.change(within(form).getByLabelText(/Max GPU units/), { target: { value: "3" } });
     fireEvent.click(within(form).getByRole("button", { name: "Save rules" }));
     await waitFor(() =>
       expect(client.setTeamUserRules).toHaveBeenCalledWith("alice", {
-        allowed_fleets: null,
-        approval_tpu_threshold: null,
-        guaranteed_tpu_units: null,
         max_tpu_units: 32,
+        max_cpu_units: 0.5,
+        max_gpu_units: 3,
       }),
     );
+  });
+
+  it.each([
+    { denied: true, toggle: false, expected: { max_cpu_units: 0 } },
+    { denied: true, toggle: true, expected: { allowed_fleets: null, max_cpu_units: 0 } },
+    { denied: false, toggle: true, expected: { allowed_fleets: [], max_cpu_units: 0 } },
+  ])("patches only edits when deny-all starts $denied and toggles $toggle", async ({ denied, toggle, expected }) => {
+    const client = mockClient();
+    const account = {
+      ...USER,
+      rules: {
+        allowed_fleets: denied ? [] : null,
+        max_cpu_units: 4,
+        max_gpu_units: 2,
+        max_tpu_units: 8,
+        guaranteed_tpu_units: null,
+        approval_tpu_threshold: null,
+      },
+    };
+    vi.mocked(client.listTeamUsers).mockResolvedValue([account]);
+    client.setTeamUserRules = vi.fn(async () => account);
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rules" }));
+    const form = within(await screen.findByRole("form", { name: "Rules for alice" }));
+    const checkbox = form.getByRole("checkbox", { name: "Deny all fleets" }) as HTMLInputElement;
+    expect(checkbox.checked).toBe(denied);
+    if (toggle) fireEvent.click(checkbox);
+    fireEvent.change(form.getByLabelText(/Max CPU units/), { target: { value: "0" } });
+    fireEvent.click(form.getByRole("button", { name: "Save rules" }));
+    await waitFor(() => expect(client.setTeamUserRules).toHaveBeenCalledWith("alice", expected));
   });
 
   it("disables a user and revokes an open invite", async () => {
@@ -227,10 +267,12 @@ describe("Settings → Users & tokens", () => {
         approval_tpu_threshold: 8,
         guaranteed_tpu_units: null,
         max_tpu_units: null,
+        max_cpu_units: null,
+        max_gpu_units: null,
       },
     };
     vi.mocked(client.listTeamUsers).mockResolvedValue([withRules]);
-    client.setTeamUserRules = vi.fn(async (_subject, rules) => ({ ...USER, rules }));
+    client.setTeamUserRules = vi.fn(async () => withRules);
     render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
 
     const users = await screen.findByRole("region", { name: "Users" });
@@ -248,7 +290,6 @@ describe("Settings → Users & tokens", () => {
         allowed_fleets: ["research", "prod"],
         approval_tpu_threshold: null,
         guaranteed_tpu_units: 32,
-        max_tpu_units: null,
       }),
     );
   });

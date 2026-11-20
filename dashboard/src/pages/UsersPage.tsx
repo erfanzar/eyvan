@@ -29,7 +29,7 @@ export interface TeamClient {
   listTeamUsers: (signal?: AbortSignal) => Promise<TeamUser[]>;
   setTeamUserDisabled: (subject: string, disabled: boolean) => Promise<TeamUser>;
   /** Optional so older callers and tests that never edit rules still type-check. */
-  setTeamUserRules?: (subject: string, rules: TeamUserRules) => Promise<TeamUser>;
+  setTeamUserRules?: (subject: string, rules: Partial<TeamUserRules>) => Promise<TeamUser>;
   setTeamUserTier?: (
     subject: string,
     tier: TeamTier,
@@ -68,6 +68,8 @@ export function rulesSummary(rules: TeamUserRules | undefined): string {
   if (!rules) return "no rules";
   const parts = [
     rules.max_tpu_units != null ? `max ${rules.max_tpu_units} TPU` : null,
+    rules.max_cpu_units != null ? `max ${rules.max_cpu_units} CPU` : null,
+    rules.max_gpu_units != null ? `max ${rules.max_gpu_units} GPU` : null,
     rules.allowed_fleets ? `fleets: ${rules.allowed_fleets.join(", ") || "none"}` : null,
     rules.approval_tpu_threshold !== null ? `approval above ${rules.approval_tpu_threshold} TPU` : null,
     rules.guaranteed_tpu_units !== null ? `guaranteed ${rules.guaranteed_tpu_units} TPU` : null,
@@ -75,11 +77,12 @@ export function rulesSummary(rules: TeamUserRules | undefined): string {
   return parts.join("; ") || "no rules";
 }
 
-const optionalCount = (value: string): number | null => {
+const optionalCount = (value: string, fractional = false): number | null => {
   const trimmed = value.trim();
   if (!trimmed) return null;
   const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`"${value}" is not a whole number of TPU units`);
+  if (!Number.isFinite(parsed) || (!fractional && !Number.isInteger(parsed)) || parsed < 0 || parsed > 1_000_000)
+    throw new Error(`"${value}" must be a ${fractional ? "number" : "whole number"} of units between 0 and 1,000,000`);
   return parsed;
 };
 
@@ -89,34 +92,61 @@ function RulesEditor({
   onCancel,
 }: {
   user: TeamUser;
-  onSave: (rules: TeamUserRules) => Promise<void>;
+  onSave: (rules: Partial<TeamUserRules>) => Promise<void>;
   onCancel: () => void;
 }) {
-  const current = user.rules;
+  // Compare against the rules the admin opened, not a later refresh of the row.
+  const [current] = useState(user.rules);
+  const [denyAll, setDenyAll] = useState(current?.allowed_fleets?.length === 0);
   const [fleets, setFleets] = useState(current?.allowed_fleets?.join(", ") ?? "");
   const [threshold, setThreshold] = useState(current?.approval_tpu_threshold?.toString() ?? "");
   const [guarantee, setGuarantee] = useState(current?.guaranteed_tpu_units?.toString() ?? "");
   const [maxTpu, setMaxTpu] = useState(current?.max_tpu_units?.toString() ?? "");
+  const [maxCpu, setMaxCpu] = useState(current?.max_cpu_units?.toString() ?? "");
+  const [maxGpu, setMaxGpu] = useState(current?.max_gpu_units?.toString() ?? "");
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
     setProblem(null);
-    let rules: TeamUserRules;
+    const rules: Partial<TeamUserRules> = {};
     try {
-      const names = fleets
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean);
-      rules = {
-        allowed_fleets: names.length ? names : null,
-        approval_tpu_threshold: optionalCount(threshold),
-        guaranteed_tpu_units: optionalCount(guarantee),
-        max_tpu_units: optionalCount(maxTpu),
-      };
+      const previous = current?.allowed_fleets ?? null;
+      if (denyAll !== (previous?.length === 0) || fleets !== (previous?.join(", ") ?? "")) {
+        const names = [
+          ...new Set(
+            fleets
+              .split(",")
+              .map((name) => name.trim())
+              .filter(Boolean),
+          ),
+        ];
+        const next = denyAll ? [] : names.length ? names : null;
+        const sameFleets =
+          next === previous ||
+          (next !== null &&
+            previous !== null &&
+            next.length === previous.length &&
+            next.every((name) => previous.includes(name)));
+        if (!sameFleets) rules.allowed_fleets = next;
+      }
+      for (const [key, input] of [
+        ["approval_tpu_threshold", threshold],
+        ["guaranteed_tpu_units", guarantee],
+        ["max_tpu_units", maxTpu],
+        ["max_cpu_units", maxCpu],
+        ["max_gpu_units", maxGpu],
+      ] as const) {
+        const value = optionalCount(input, key === "max_cpu_units");
+        if (value !== (current?.[key] ?? null)) rules[key] = value;
+      }
     } catch (failure) {
       setProblem(message(failure, "Check the numbers"));
+      return;
+    }
+    if (!Object.keys(rules).length) {
+      onCancel();
       return;
     }
     setBusy(true);
@@ -135,7 +165,11 @@ function RulesEditor({
     >
       <label className="field">
         <span>Allowed fleets (comma separated; empty = any)</span>
-        <input value={fleets} onChange={(event) => setFleets(event.target.value)} />
+        <input disabled={denyAll} value={fleets} onChange={(event) => setFleets(event.target.value)} />
+      </label>
+      <label className="field">
+        <span>Deny all fleets</span>
+        <input type="checkbox" checked={denyAll} onChange={(event) => setDenyAll(event.target.checked)} />
       </label>
       <label className="field">
         <span>Needs approval above (TPU units; empty = never)</span>
@@ -148,9 +182,15 @@ function RulesEditor({
       <label className="field">
         <span>Max TPU units (empty = no limit)</span>
         <input inputMode="numeric" value={maxTpu} onChange={(event) => setMaxTpu(event.target.value)} />
-        <small className="field-hint">
-          Hard cap on TPU units in use or queued. A plain user can run @eyvan.execute only after a max is set.
-        </small>
+        <small className="field-hint">Caps count units in use or queued across all projects.</small>
+      </label>
+      <label className="field">
+        <span>Max CPU units (empty = no limit)</span>
+        <input inputMode="decimal" value={maxCpu} onChange={(event) => setMaxCpu(event.target.value)} />
+      </label>
+      <label className="field">
+        <span>Max GPU units (empty = no limit)</span>
+        <input inputMode="numeric" value={maxGpu} onChange={(event) => setMaxGpu(event.target.value)} />
       </label>
       <div className="field">
         <span>&nbsp;</span>

@@ -402,7 +402,13 @@ async def test_rules_and_holds_persist_in_every_backend(backend: str, tmp_path) 
     await repository.open()
     service, _ = await _service(repository=repository)
     await service.set_user_rules(
-        ADMIN, "alice", allowed_fleets=["research"], approval_tpu_threshold=2, guaranteed_tpu_units=16
+        ADMIN,
+        "alice",
+        allowed_fleets=["research"],
+        approval_tpu_threshold=2,
+        guaranteed_tpu_units=16,
+        max_cpu_units=0.75,
+        max_gpu_units=0,
     )
     await repository.close()
 
@@ -419,6 +425,7 @@ async def test_rules_and_holds_persist_in_every_backend(backend: str, tmp_path) 
     if engine is not None:
         await engine.dispose()
     assert (user.allowed_fleets, user.approval_tpu_threshold, user.guaranteed_tpu_units) == (("research",), 2, 16)
+    assert (user.max_cpu_units, user.max_gpu_units, user.max_tpu_units) == (0.75, 0, None)
 
 
 def test_an_account_without_rules_serializes_exactly_as_before() -> None:
@@ -479,12 +486,18 @@ def test_rules_route_is_admin_only_and_reports_rules() -> None:
     assert refused.status_code == 403, refused.text
     response = http.put("/api/v1/team/users/alice/rules", json=body, headers=ADMIN_HEADERS)
     assert response.status_code == 200, response.text
-    assert response.json()["rules"] == {**body, "max_tpu_units": None}
+    expected = {**body, "max_tpu_units": None, "max_cpu_units": None, "max_gpu_units": None}
+    assert response.json()["rules"] == expected
     assert "password_hash" not in response.text
     listed = http.get("/api/v1/team/users", headers=ADMIN_HEADERS).json()["users"]
-    assert [user["rules"] for user in listed if user["subject"] == "alice"] == [{**body, "max_tpu_units": None}]
+    assert [user["rules"] for user in listed if user["subject"] == "alice"] == [expected]
     bad = http.put("/api/v1/team/users/alice/rules", json={"approval_tpu_threshold": -1}, headers=ADMIN_HEADERS)
     assert bad.status_code == 422
+    for key in ("max_cpu_units", "max_gpu_units"):
+        for invalid in (-1, 1_000_001):
+            assert (
+                http.put("/api/v1/team/users/alice/rules", json={key: invalid}, headers=ADMIN_HEADERS).status_code == 422
+            )
 
 
 def test_reclaim_plan_hides_other_peoples_work_from_non_admins() -> None:

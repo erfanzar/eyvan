@@ -23,10 +23,9 @@ import typing as tp
 #: Every team bearer token starts with this, so the authenticator can route it
 #: without trying an OIDC verification first, and leaked tokens are greppable.
 TEAM_TOKEN_PREFIX = "eyv_"
-#: The dashboard's team session cookie: HttpOnly, SameSite=Strict. Not
-#: ``__Host-`` prefixed, because that prefix requires ``Secure`` and a loopback
-#: team plane serves plain HTTP.
-TEAM_SESSION_COOKIE = "eyvan_team_session"
+#: Only explicit loopback HTTP development uses the unprefixed cookie.
+TEAM_SESSION_COOKIE = "__Host-eyvan_team_session"
+LOOPBACK_TEAM_SESSION_COOKIE = "eyvan_team_session"
 MIN_PASSWORD_LENGTH = 10
 MAX_PASSWORD_LENGTH = 1024
 
@@ -145,6 +144,7 @@ class SignInThrottle:
 
 
 __all__ = (
+    "LOOPBACK_TEAM_SESSION_COOKIE",
     "MIN_PASSWORD_LENGTH",
     "TEAM_SESSION_COOKIE",
     "TEAM_TOKEN_PREFIX",

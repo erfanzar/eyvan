@@ -353,11 +353,16 @@ async def test_rules_audit_includes_the_cap() -> None:
 @pytest.mark.asyncio
 async def test_team_callable_rule_by_tier() -> None:
     service, _ = await _service()
-    with pytest.raises(AuthorizationError, match="ask a fleet admin to set your TPU quota"):
+    with pytest.raises(AuthorizationError, match="CPU quota required"):
         await service.submit_workload(
             ALICE, org_id="acme", project_id="research", spec=_callable(), idempotency_key="u0"
         )
     await _cap(service, "alice", 4)
+    with pytest.raises(AuthorizationError, match="CPU quota required"):
+        await service.submit_workload(
+            ALICE, org_id="acme", project_id="research", spec=_callable(4), idempotency_key="u1"
+        )
+    await service.set_user_rules(ADMIN, "alice", max_cpu_units=2)
     ok, _ = await service.submit_workload(
         ALICE, org_id="acme", project_id="research", spec=_callable(4), idempotency_key="u1"
     )
@@ -367,6 +372,7 @@ async def test_team_callable_rule_by_tier() -> None:
             ALICE, org_id="acme", project_id="research", spec=_callable(1), idempotency_key="u2"
         )
     await _cap(service, "alice", None)
+    await service.set_user_rules(ADMIN, "alice", max_cpu_units=None)
     await service.set_user_tier(ADMIN, "alice", "trusted", org_id="acme", project_id="research")
     trusted, _ = await service.submit_workload(
         ALICE, org_id="acme", project_id="research", spec=_callable(), idempotency_key="t"
@@ -374,7 +380,7 @@ async def test_team_callable_rule_by_tier() -> None:
     assert trusted.state is WorkloadState.PENDING
     # Batch is gated the same way (every route stores through one path).
     await service.set_user_tier(ADMIN, "alice", "user", org_id="acme", project_id="research")
-    with pytest.raises(AuthorizationError, match="TPU quota"):
+    with pytest.raises(AuthorizationError, match="CPU quota required"):
         await service.submit_batch(
             ALICE, org_id="acme", project_id="research", template=_callable(), count=2, idempotency_key="b"
         )
@@ -390,14 +396,14 @@ async def test_principals_without_a_team_account_keep_the_project_rule() -> None
         BOB, org_id="acme", project_id="research", spec=_callable(), idempotency_key="b"
     )
     assert ok.state is WorkloadState.PENDING
-    # A trusted project lets an uncapped plain user through, exactly as before.
-    alice_ok, _ = await trusted_service.submit_workload(
-        ALICE, org_id="acme", project_id="research", spec=_callable(), idempotency_key="a"
-    )
-    assert alice_ok.state is WorkloadState.PENDING
+    # Project trust is a fallback for non-team principals, not a team cap exemption.
+    with pytest.raises(AuthorizationError, match="CPU quota required"):
+        await trusted_service.submit_workload(
+            ALICE, org_id="acme", project_id="research", spec=_callable(), idempotency_key="a"
+        )
     with pytest.raises(AuthorizationError, match="not trusted"):
         await service.authorize_callable_upload(BOB, org_id="acme", project_id="research")
-    with pytest.raises(AuthorizationError, match="TPU quota"):
+    with pytest.raises(AuthorizationError, match="positive quota"):
         await service.authorize_callable_upload(ALICE, org_id="acme", project_id="research")
 
 
@@ -546,6 +552,14 @@ def _cli(monkeypatch, argv: list[str]) -> tuple[tp.Any, _Recorder]:
     return result, fake
 
 
+@pytest.mark.parametrize(("allowed", "label"), [(None, "any"), ([], "none"), (["research"], "research")])
+def test_cli_rules_fleet_label(monkeypatch, allowed, label) -> None:
+    monkeypatch.setattr(_Recorder, "request", lambda *args, **kwargs: {"rules": {"allowed_fleets": allowed}})
+    result, _ = _cli(monkeypatch, ["users", "rules", "alice"])
+    assert result.exit_code == 0, result.output
+    assert f"fleets {label};" in result.output
+
+
 def test_cli_users_tier(monkeypatch) -> None:
     result, fake = _cli(monkeypatch, ["users", "tier", "alice", "trusted"])
     assert result.exit_code == 0, result.output
@@ -569,6 +583,8 @@ def test_cli_users_invite_tier_and_rules_max_tpu(monkeypatch) -> None:
     }
     both, _ = _cli(monkeypatch, ["users", "invite", "b@example.com", "--tier", "user", "--role", "project_viewer"])
     assert both.exit_code != 0 and "not both" in both.output
-    rules, fake = _cli(monkeypatch, ["users", "rules", "alice", "--max-tpu", "8"])
+    rules, fake = _cli(monkeypatch, ["users", "rules", "alice", "--max-tpu", "8", "--max-gpu", "0", "--max-cpu", "0.5"])
     assert rules.exit_code == 0, rules.output
     assert fake.calls[0][2]["max_tpu_units"] == 8 and "max TPU 8" in rules.output
+    assert fake.calls[0][2]["max_gpu_units"] == 0 and "max GPU 0" in rules.output
+    assert fake.calls[0][2]["max_cpu_units"] == 0.5 and "max CPU 0.5" in rules.output

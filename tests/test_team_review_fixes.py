@@ -89,6 +89,7 @@ async def test_retry_within_the_cap_still_works() -> None:
 async def test_an_operator_cannot_retry_a_callable_whose_owner_lost_callable_rights() -> None:
     service, repository = await _service()
     await _cap(service, "alice", 4)
+    await service.set_user_rules(ADMIN, "alice", max_cpu_units=1)
     job, _ = await service.submit_workload(
         ALICE,
         org_id="acme",
@@ -98,7 +99,7 @@ async def test_an_operator_cannot_retry_a_callable_whose_owner_lost_callable_rig
     )
     await service.cancel_workload(ALICE, job.id, idempotency_key="cancel")
     await _cap(service, "alice", None)  # a plain user without a cap may not run callables
-    with pytest.raises(AuthorizationError, match="ask a fleet admin to set your TPU quota"):
+    with pytest.raises(AuthorizationError, match="TPU quota required"):
         await service.retry_workload(BOB, job.id, idempotency_key="bob-retry")
     assert await _state(repository, job.id) is WorkloadState.CANCELLED
 
@@ -274,12 +275,14 @@ async def test_admin_tier_replaces_a_time_limited_fleet_admin_grant() -> None:
 
 def test_an_omitted_rule_keeps_its_stored_value_and_null_clears_it() -> None:
     http = _http()
-    full = {"allowed_fleets": None, "approval_tpu_threshold": 4, "guaranteed_tpu_units": 2, "max_tpu_units": 8}
+    caps = {"max_tpu_units": 8, "max_gpu_units": 0, "max_cpu_units": 0.5}
+    full = {"allowed_fleets": None, "approval_tpu_threshold": 4, "guaranteed_tpu_units": 2, **caps}
     assert http.put("/api/v1/team/users/alice/rules", json=full, headers=HTTP_ADMIN).status_code == 200
     # An older client knows three rules and sends only those.
     old_client = {"allowed_fleets": None, "approval_tpu_threshold": 6, "guaranteed_tpu_units": 2}
     response = http.put("/api/v1/team/users/alice/rules", json=old_client, headers=HTTP_ADMIN)
     assert response.status_code == 200, response.text
-    assert response.json()["rules"] == {**old_client, "max_tpu_units": 8}
-    cleared = http.put("/api/v1/team/users/alice/rules", json={"max_tpu_units": None}, headers=HTTP_ADMIN)
-    assert cleared.json()["rules"] == {**old_client, "max_tpu_units": None}
+    assert response.json()["rules"] == {**old_client, **caps}
+    clear = {"max_cpu_units": None, "max_tpu_units": None}
+    cleared = http.put("/api/v1/team/users/alice/rules", json=clear, headers=HTTP_ADMIN)
+    assert cleared.json()["rules"] == {**old_client, **caps, **clear}

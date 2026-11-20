@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import typing as tp
 
@@ -19,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan._internal.json_types import JsonValue
 from eyvan.config import EyvanSettings
-from eyvan.identity.team_secrets import TEAM_SESSION_COOKIE, is_team_token
+from eyvan.identity.team_secrets import LOOPBACK_TEAM_SESSION_COOKIE, TEAM_SESSION_COOKIE, is_team_token
 from eyvan.records import Principal, Role, RoleGrant
 from eyvan.server.api.dashboard_sessions import (
     DASHBOARD_SESSION_EXPIRED,
@@ -158,6 +159,45 @@ _LOOPBACK_HOSTS: tp.Final = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"}
 DEFAULT_DEVELOPMENT_SCOPE: tp.Final = "default"
 
 
+def team_session_cookie_name(settings: EyvanSettings, request: Request) -> str:
+    """Select exactly one cookie; only loopback HTTP development gets a non-Secure cookie."""
+
+    if settings.dev_auth_enabled and not settings.tls_enabled and request.url.scheme == "http":
+        public = httpx.URL(settings.public_url)
+        if public.scheme == "http" and public.host in _LOOPBACK_HOSTS and request.url.hostname in _LOOPBACK_HOSTS:
+            return LOOPBACK_TEAM_SESSION_COOKIE
+    return TEAM_SESSION_COOKIE
+
+
+def require_dashboard_origin(settings: EyvanSettings, request: Request) -> None:
+    """Check cookie writes against the configured dashboard origin, not the request Host."""
+
+    # Validate the configured authority before parsing. Only configuration may
+    # contain a base path; never strip a path, userinfo or list from an Origin.
+    match = re.fullmatch(
+        r"(https?)://(\[[0-9a-f:.]+\]|[\w.-]+)(?::([0-9]{1,5}))?(?:/[^\s?#\\\x00-\x1f\x7f]*)?",
+        settings.public_url,
+        re.ASCII | re.IGNORECASE,
+    )
+    refused = HTTPException(status_code=403, detail="dashboard writes require a same-origin request")
+    if not match:
+        raise refused
+    try:
+        public = httpx.URL(settings.public_url)
+    except httpx.InvalidURL:
+        raise refused from None
+    if public.port is not None and public.port > 65535:
+        raise refused
+    # A browser omits the scheme's default port. Compare its serialized
+    # Origin exactly; do not normalize potentially malformed request input.
+    host = public.raw_host.decode("ascii")
+    origin = f"{public.scheme}://{f'[{host}]' if ':' in host else host}"
+    if public.port is not None and public.port != {"http": 80, "https": 443}[public.scheme]:
+        origin += f":{public.port}"
+    if request.headers.getlist("origin") != [origin]:
+        raise refused
+
+
 def _local_owner() -> str:
     """Return the account running this plane, as the dashboard's default subject.
 
@@ -278,14 +318,12 @@ class RequestAuthenticator:
                 return await self.verifier.verify(token)
             except Exception as exc:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token") from exc
-        team_cookie = request.cookies.get(TEAM_SESSION_COOKIE) if self.settings.team_mode else None
+        team_cookie = (
+            request.cookies.get(team_session_cookie_name(self.settings, request)) if self.settings.team_mode else None
+        )
         if team_cookie:
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                # Same rule as the OIDC cookie below: cookie writes only from
-                # the configured dashboard origin, never a caller-chosen Host.
-                expected_origin = str(httpx.URL(self.settings.public_url).copy_with(path="/", query=None, fragment=None))
-                if request.headers.get("origin", "") != expected_origin.rstrip("/"):
-                    raise HTTPException(status_code=403, detail="dashboard writes require a same-origin request")
+                require_dashboard_origin(self.settings, request)
             team_principal = await request.app.state.service.resolve_team_token(team_cookie)
             if team_principal is None:
                 raise HTTPException(

@@ -22,22 +22,23 @@ import typing as tp
 import weakref
 
 from eyvan.domain.governance import (
-    CALLABLE_NEEDS_CAP,
     HELD_WORKLOAD_KEY,
     REFUSE,
     RULE_UNCHANGED,
     AdmissionVerdict,
+    QuotaUnits,
     ReclaimPlan,
     RuleUnchanged,
     RunningJob,
     UserRules,
     admission_verdict,
+    has_approval_gate,
     plan_reclaim,
     requested_tpu_units,
+    requested_units,
     targeted_pool_ids,
     team_tier,
-    tpu_cap_refusal,
-    tpu_units_in_use,
+    units_in_use,
 )
 from eyvan.records import TeamRequestRecord, TeamTier, UserRecord
 from eyvan.server.service._control_plane.shared import (
@@ -70,7 +71,7 @@ _UNFINISHED_STATES = frozenset(WorkloadState) - TERMINAL_WORKLOAD_STATES
 #: Counted once, then raised by every workload admitted in that transaction, so
 #: a batch, DAG or group admitting N children reads the owner's rows once. The
 #: entry dies with the session; a retried transaction gets a fresh session.
-_USAGE_IN_TX: weakref.WeakKeyDictionary[tp.Any, dict[str, int]] = weakref.WeakKeyDictionary()
+_USAGE_IN_TX: weakref.WeakKeyDictionary[tp.Any, dict[str, QuotaUnits]] = weakref.WeakKeyDictionary()
 
 #: States in which a workload holds capacity, for borrow accounting.
 _ACTIVE_STATES = frozenset(
@@ -89,6 +90,8 @@ def user_rules(user: UserRecord) -> UserRules:
         approval_tpu_threshold=user.approval_tpu_threshold,
         guaranteed_tpu_units=user.guaranteed_tpu_units,
         max_tpu_units=user.max_tpu_units,
+        max_cpu_units=user.max_cpu_units,
+        max_gpu_units=user.max_gpu_units,
     )
 
 
@@ -106,7 +109,7 @@ class GovernanceMixin:
         return team_tier(user.trusted, await tx.list_role_grants(subject=user.subject), utcnow())
 
     @staticmethod
-    async def _lock_tpu_cap(tx: RepositorySession, subject: str) -> None:
+    async def _lock_resource_caps(tx: RepositorySession, subject: str) -> None:
         """Serialize every cap decision for one person, across all of their orgs and projects.
 
         The idempotency lookup takes a transaction-scoped PostgreSQL advisory lock
@@ -122,86 +125,106 @@ class GovernanceMixin:
         await tx.get_idempotency("fleet", "governance.tpu_cap", subject)
 
     @staticmethod
-    async def _tpu_units_in_use(tx: RepositorySession, subject: str, *, exclude_id: str | None = None) -> int:
+    async def _units_in_use(tx: RepositorySession, subject: str, *, exclude_id: str | None = None) -> QuotaUnits:
         owned = await tx.list_workloads_created_by(subject, states=_UNFINISHED_STATES)
-        return tpu_units_in_use(owned, subject, exclude_id=exclude_id)
+        return units_in_use(owned, subject, exclude_id=exclude_id)
 
-    async def _require_tpu_cap(
+    async def _require_caps(
         self,
         tx: RepositorySession,
         user: UserRecord,
-        tpu_units: int,
+        requested: QuotaUnits,
         *,
         exclude_id: str | None = None,
         prefix: str = "",
     ) -> None:
-        """Refuse (``ConflictError``) when ``tpu_units`` more would break the account's hard cap.
+        """Check every configured dimension under one owner-wide lock and snapshot.
 
-        Without ``exclude_id`` this is an admission: the caller stores the job
-        next, so the transaction's running total is raised by ``tpu_units``.
-        With it (approval release, retry) usage is always counted afresh.
+        Cache admissions within a batch; approval and retry exclude the re-entering
+        workload and read fresh usage. Never charge a coordinator for its children.
         """
 
-        if user.max_tpu_units is None or tpu_units <= 0:
+        rules = user_rules(user)
+        if not any(cap is not None and getattr(requested, name) > 0 for name, cap in rules.caps.items()):
             return
         running = _USAGE_IN_TX.setdefault(tx, {}) if exclude_id is None else None
         in_use = running.get(user.subject) if running is not None else None
         if in_use is None:
-            await self._lock_tpu_cap(tx, user.subject)
-            in_use = await self._tpu_units_in_use(tx, user.subject, exclude_id=exclude_id)
-        refusal = tpu_cap_refusal(user.max_tpu_units, in_use, tpu_units)
+            await self._lock_resource_caps(tx, user.subject)
+            in_use = await self._units_in_use(tx, user.subject, exclude_id=exclude_id)
+        refusal = rules.cap_refusal(in_use, requested)
         if refusal is not None:
             raise ConflictError(prefix + refusal)
         if running is not None:
-            running[user.subject] = in_use + tpu_units
+            running[user.subject] = in_use + requested
 
-    async def _governance_retry(self, tx: RepositorySession, workload: WorkloadRecord) -> None:
-        """Re-apply the owner's callable rule and hard TPU cap before a retry re-queues a workload.
+    @staticmethod
+    async def _restricted_target_fleets(tx: RepositorySession, rules: UserRules, spec: WorkloadDefinition) -> list[str]:
+        """Resolve every possible target when an allowlist applies, including alternates."""
 
-        A retry returns a FAILED/CANCELLED job to PENDING, so it is an admission
-        and must not be a way around either rule -- whoever asks for it. The
-        owner (``created_by``) is judged, not the operator retrying.
-        """
+        fleets: list[str] = []
+        if rules.allowed_fleets is not None:
+            for pool_id in targeted_pool_ids(spec):
+                pool = await tx.get_capacity_pool(pool_id)
+                if pool is None:
+                    raise AuthorizationError(f"cannot verify the fleet of unresolved pool {pool_id!r}")
+                fleets.append(pool.fleet_name)
+        return fleets
 
-        if not getattr(self, "governance_enabled", False) or workload.coordination_kind is not None:
+    async def _governance_readmission(
+        self, tx: RepositorySession, workload: WorkloadRecord, prefix: str, *, approving: bool = False
+    ) -> None:
+        """Re-check the owner, not the operator retrying or releasing the job."""
+
+        if not self.governance_enabled:
             return
-        if isinstance(workload.spec.execution, CallableExecution):
-            await self._require_team_callable(
-                tx, subject=workload.created_by, org_id=workload.org_id, project_id=workload.project_id
-            )
         owner = await tx.get_user(workload.created_by)
         if owner is not None:
-            await self._require_tpu_cap(
+            if owner.disabled:
+                raise AuthorizationError(f"{prefix}owner {owner.subject!r} is disabled")
+            rules = user_rules(owner)
+            fleets = await self._restricted_target_fleets(tx, rules, workload.spec)
+            refusal = rules.fleet_refusal(fleets, pinned=bool(fleets))
+            if refusal is not None:
+                raise AuthorizationError(prefix + refusal)
+            if not approving and workload.parent_workload_id is None and workload.coordination_kind is None:
+                reason = rules.approval_reason(requested_tpu_units(workload.spec))
+                if reason is not None and await self._team_tier_in(tx, owner) is TeamTier.USER:
+                    raise ConflictError(f"{prefix}new attempt {reason}; resubmit for fresh approval")
+        if workload.coordination_kind is not None:
+            return  # The coordinator holds no resources and never executes its template.
+        if isinstance(workload.spec.execution, CallableExecution):
+            await self._require_team_callable(
                 tx,
-                owner,
-                requested_tpu_units(workload.spec),
-                exclude_id=workload.id,
-                prefix=f"cannot retry {workload.id}: ",
+                subject=workload.created_by,
+                org_id=workload.org_id,
+                project_id=workload.project_id,
+                spec=workload.spec,
             )
+        if owner is not None:
+            await self._require_caps(tx, owner, requested_units(workload.spec), exclude_id=workload.id, prefix=prefix)
 
-    async def _require_team_callable(self, tx: RepositorySession, *, subject: str, org_id: str, project_id: str) -> None:
-        """Apply the team-mode callable rule for the identity a callable workload belongs to.
+    async def _require_team_callable(
+        self, tx: RepositorySession, *, subject: str, org_id: str, project_id: str, spec: WorkloadDefinition | None
+    ) -> None:
+        """Authorize uploads provisionally; only a concrete reservation authorizes execution."""
 
-        A project the trust policy names is allowed as before, and nothing
-        changes on a plane without team governance. Otherwise an ``admin`` or
-        ``trusted`` account may run callables; a ``user`` only once a fleet admin
-        has set their TPU cap, which then bounds them. Anyone without an enabled
-        team account (bootstrap, OIDC-only and similar principals) keeps the
-        project rule.
-
-        The cap counts TPU units only, so a user-tier callable on a CPU or GPU
-        pool (0 TPU units) is admitted once a cap exists but is not bounded by it.
-        """
-
-        trust = self.callable_trust  # type: ignore[attr-defined]
-        if not getattr(self, "governance_enabled", False) or trust.allows(org_id, project_id):
+        if not self.governance_enabled:
             return
         user = await tx.get_user(subject)
-        if user is None or user.disabled:
-            trust.require(org_id, project_id)
+        if user is None:
+            self.callable_trust.require(org_id, project_id)  # type: ignore[attr-defined]
             return
-        if await self._team_tier_in(tx, user) is TeamTier.USER and user.max_tpu_units is None:
-            raise AuthorizationError(f"{subject!r} may not run callable workloads yet; {CALLABLE_NEEDS_CAP}")
+        if user.disabled:
+            raise AuthorizationError(f"{subject!r} is disabled and may not run callable workloads")
+        if await self._team_tier_in(tx, user) is TeamTier.USER:
+            refusal = user_rules(user).callable_refusal(requested_units(spec) if spec is not None else None)
+            if refusal is not None:
+                raise AuthorizationError(f"{subject!r} may not run callable workloads: {refusal}")
+            if spec is not None:
+                for pool_id in targeted_pool_ids(spec):
+                    if await tx.get_capacity_pool(pool_id) is None:
+                        raise AuthorizationError(f"unresolved callable pool {pool_id!r}")
 
     async def team_tpu_cap(self, principal: Principal) -> dict[str, tp.Any] | None:
         """Return the caller's tier, hard TPU cap and current usage, or ``None`` off team mode."""
@@ -213,8 +236,13 @@ class GovernanceMixin:
             if user is None:
                 return None
             tier = await self._team_tier_in(tx, user)
-            in_use = await self._tpu_units_in_use(tx, user.subject)
-        return {"tier": tier.value, "max_tpu_units": user.max_tpu_units, "tpu_units_in_use_or_queued": in_use}
+            in_use = await self._units_in_use(tx, user.subject)
+        report = {"tier": tier.value, "max_tpu_units": user.max_tpu_units, "tpu_units_in_use_or_queued": in_use.tpu}
+        if user.max_cpu_units is not None:
+            report.update(max_cpu_units=user.max_cpu_units, cpu_units_in_use_or_queued=float(in_use.cpu))
+        if user.max_gpu_units is not None:
+            report.update(max_gpu_units=user.max_gpu_units, gpu_units_in_use_or_queued=in_use.gpu)
+        return report
 
     # ------------------------------------------------------------- rules
 
@@ -227,6 +255,8 @@ class GovernanceMixin:
         approval_tpu_threshold: int | None | RuleUnchanged = RULE_UNCHANGED,
         guaranteed_tpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
         max_tpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
+        max_gpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
+        max_cpu_units: float | None | RuleUnchanged = RULE_UNCHANGED,
     ) -> UserRecord:
         """Update one account's rules (fleet admins only).
 
@@ -254,6 +284,8 @@ class GovernanceMixin:
                 if isinstance(guaranteed_tpu_units, RuleUnchanged)
                 else guaranteed_tpu_units,
                 "max_tpu_units": user.max_tpu_units if isinstance(max_tpu_units, RuleUnchanged) else max_tpu_units,
+                "max_cpu_units": user.max_cpu_units if isinstance(max_cpu_units, RuleUnchanged) else max_cpu_units,
+                "max_gpu_units": user.max_gpu_units if isinstance(max_gpu_units, RuleUnchanged) else max_gpu_units,
             }
             try:
                 updated = UserRecord.model_validate(
@@ -279,6 +311,16 @@ class GovernanceMixin:
                         "approval_tpu_threshold": updated.approval_tpu_threshold,
                         "guaranteed_tpu_units": updated.guaranteed_tpu_units,
                         "max_tpu_units": updated.max_tpu_units,
+                        **(
+                            {"max_cpu_units": updated.max_cpu_units}
+                            if updated.max_cpu_units is not None or not isinstance(max_cpu_units, RuleUnchanged)
+                            else {}
+                        ),
+                        **(
+                            {"max_gpu_units": updated.max_gpu_units}
+                            if updated.max_gpu_units is not None or not isinstance(max_gpu_units, RuleUnchanged)
+                            else {}
+                        ),
                     },
                 )
             )
@@ -312,19 +354,15 @@ class GovernanceMixin:
         rules = user_rules(user)
         if rules.empty:
             return None
-        pool_ids = targeted_pool_ids(spec)
-        fleets: list[str] = []
-        for pool_id in pool_ids:
-            pool = await tx.get_capacity_pool(pool_id)
-            if pool is not None:
-                fleets.append(pool.fleet_name)
-        tpu_units = requested_tpu_units(spec)
+        fleets = await self._restricted_target_fleets(tx, rules, spec)
+        reservation = requested_units(spec)
+        tpu_units = reservation.tpu
         exempt = rules.approval_tpu_threshold is not None and await self._team_tier_in(tx, user) is not TeamTier.USER
         verdict = admission_verdict(
             rules,
             tpu_units=tpu_units,
             fleets=fleets,
-            pinned=bool(pool_ids),
+            pinned=bool(fleets),
             operation=operation,
             top_level=top_level,
             exempt_from_approval=exempt,
@@ -337,7 +375,7 @@ class GovernanceMixin:
         # A coordinator (batch/DAG/group/service parent) holds nothing itself;
         # each of its children is checked as it is stored.
         if holds_capacity:
-            await self._require_tpu_cap(tx, user, tpu_units)
+            await self._require_caps(tx, user, reservation)
         return verdict
 
     async def _hold_for_approval(
@@ -398,27 +436,13 @@ class GovernanceMixin:
         if request.kind != "approval" or not isinstance(workload_id, str):
             return
         workload = await tx.get_workload(workload_id)
-        if (
-            workload is None
-            or workload.state is not WorkloadState.PENDING
-            or workload.schedulable
-            or workload.parent_workload_id is not None
-            or workload.depends_on
-            or workload.coordination_kind is not None
-        ):
+        if workload is None or workload.state is not WorkloadState.PENDING or not has_approval_gate(workload):
             # Already cancelled by its owner, or not a governance hold at all.
             return
         if resolution == HOLD_APPROVED:
-            owner = await tx.get_user(workload.created_by) if getattr(self, "governance_enabled", False) else None
-            if owner is not None:
-                # Re-checked at release: the cap may have been lowered while the job waited.
-                await self._require_tpu_cap(
-                    tx,
-                    owner,
-                    requested_tpu_units(workload.spec),
-                    exclude_id=workload.id,
-                    prefix=f"cannot release {workload.id} for {owner.subject}: ",
-                )
+            await self._governance_readmission(
+                tx, workload, f"cannot release {workload.id} for {workload.created_by}: ", approving=True
+            )
             released = workload.model_copy(
                 update={
                     "schedulable": True,

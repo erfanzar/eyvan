@@ -407,10 +407,10 @@ class CallableSubmissionMixin:
         """Apply the project rule now, or defer it to the submitting transaction in team mode.
 
         With team governance the decision depends on the owner's account (tier
-        and TPU cap), which only a transaction can read. Every path that calls
+        and resource caps), which only a transaction can read. Every path that calls
         this stores the workload through ``_store_workload``, which runs
         ``_require_team_callable`` for the owning identity -- and that re-applies
-        this exact project rule to anyone without an enabled team account.
+        this exact project rule to anyone without a team account.
         """
 
         if getattr(self, "governance_enabled", False):
@@ -460,7 +460,7 @@ class CallableSubmissionMixin:
             return
         async with self.repository.transaction() as tx:
             await self._require_team_callable(  # type: ignore[attr-defined]
-                tx, subject=principal.subject, org_id=org_id, project_id=project_id
+                tx, subject=principal.subject, org_id=org_id, project_id=project_id, spec=None
             )
 
     @staticmethod

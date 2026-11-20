@@ -244,7 +244,8 @@ class _CallableProgressRenderer:
         try:
             progress = self._client.get_workload_progress(workload.id)
         except EyvanHTTPError as error:
-            if error.status_code != 404:
+            # Own-workload status need not include access to project capacity details.
+            if error.status_code not in {403, 404}:
                 raise
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)

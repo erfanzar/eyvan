@@ -519,7 +519,7 @@ def test_callable_result_does_not_hide_progress_authorization_errors(tmp_path, c
     client.close()
 
 
-@pytest.mark.parametrize("progress_failure", ("not_found", "unavailable"))
+@pytest.mark.parametrize("progress_failure", ("forbidden", "not_found", "unavailable"))
 def test_callable_result_uses_the_durable_workload_fallback_when_progress_is_temporarily_unavailable(
     tmp_path,
     monkeypatch,
@@ -544,6 +544,8 @@ def test_callable_result_uses_the_durable_workload_fallback_when_progress_is_tem
         if request.url.path == "/api/v1/workloads/wl-v6e-16":
             return httpx.Response(200, json=_workload(execution, next(states)).model_dump(mode="json"))
         if request.url.path == "/api/v1/workloads/wl-v6e-16/progress":
+            if progress_failure == "forbidden":
+                return httpx.Response(403, json={"detail": "project read permission required"})
             if progress_failure == "not_found":
                 return httpx.Response(404, json={"detail": "workload progress has not been initialized"})
             raise httpx.ConnectError("control plane restarted")

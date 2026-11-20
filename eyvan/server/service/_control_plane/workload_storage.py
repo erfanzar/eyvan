@@ -8,6 +8,7 @@ from __future__ import annotations
 from eyvan.server.service._control_plane.shared import (
     TERMINAL_WORKLOAD_STATES,
     ArtifactReferenceRecord,
+    AuthorizationError,
     CallableExecution,
     ConflictError,
     CoordinationKind,
@@ -25,6 +26,7 @@ from eyvan.server.service._control_plane.shared import (
     artifact_reference_id,
     datetime,
     is_managed_uri,
+    managed_result_uri,
     validate_parent,
 )
 
@@ -112,7 +114,7 @@ class WorkloadStorageMixin:
             # decided here, inside the transaction every submission path shares;
             # off team mode it returns at once (the project rule already ran).
             await self._require_team_callable(  # type: ignore[attr-defined]
-                tx, subject=owner, org_id=org_id, project_id=project_id
+                tx, subject=owner, org_id=org_id, project_id=project_id, spec=spec
             )
         # Team governance (off unless team mode): may refuse, or hold the job
         # for a fleet admin's approval behind the existing ``schedulable`` gate.
@@ -265,8 +267,44 @@ class WorkloadStorageMixin:
         async with self.repository.transaction() as tx:
             return await tx.list_workloads(org_id=org_id, project_id=project_id, state=state)
 
-    async def get_workload(self, principal: Principal, workload_id: str) -> WorkloadRecord:
+    def _is_team_submitter_owner(self, principal: Principal, workload: WorkloadRecord) -> bool:
+        return (
+            self.governance_enabled
+            and workload.created_by == principal.subject
+            and self.authorizer.allows(
+                principal, Permission.SUBMIT, org_id=workload.org_id, project_id=workload.project_id
+            )
+        )
+
+    async def get_workload(self, principal: Principal, workload_id: str, *, for_status: bool = False) -> WorkloadRecord:
         async with self.repository.transaction() as tx:
             workload = await self._require_workload(tx, workload_id)
+            # Other callers use get_workload as the READ gate for logs, endpoints, MCP, etc.
+            if for_status and self._is_team_submitter_owner(principal, workload):
+                return workload
             self.authorizer.require(principal, Permission.READ, org_id=workload.org_id, project_id=workload.project_id)
             return workload
+
+    async def authorize_result_download(
+        self, principal: Principal, *, org_id: str, project_id: str, result_id: str
+    ) -> None:
+        if self.authorizer.allows(principal, Permission.READ, org_id=org_id, project_id=project_id):
+            return
+        if self.governance_enabled and self.authorizer.allows(
+            principal, Permission.SUBMIT, org_id=org_id, project_id=project_id
+        ):
+            # The server-issued name is a lookup hint, not proof of scope, ownership or currency.
+            workload_id, _, generation = result_id.rpartition("-g")
+            if workload_id and generation.isdecimal():
+                async with self.repository.transaction() as tx:
+                    workload = await tx.get_workload(workload_id)
+                    if (
+                        workload is not None
+                        and (workload.org_id, workload.project_id) == (org_id, project_id)
+                        and self._is_team_submitter_owner(principal, workload)
+                        and str(workload.generation) == generation
+                        and isinstance(workload.spec.execution, CallableExecution)
+                        and workload.spec.execution.result_uri == managed_result_uri(result_id)
+                    ):
+                        return
+        raise AuthorizationError("not authorized to download this managed result")

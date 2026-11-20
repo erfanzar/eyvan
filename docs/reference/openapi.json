@@ -6798,7 +6798,7 @@
       },
       "RulesBody": {
         "additionalProperties": false,
-        "description": "One account's governance rules: ``null`` clears a rule, an omitted key keeps the stored value.\n\nOmission is preserved so a client written before a rule existed (which never\nsends its key) cannot clear it by accident; ``eyvan users rules`` and the\ndashboard send every key, so their omitted options still clear.",
+        "description": "One account's governance rules: ``null`` clears a rule, an omitted key keeps the stored value.\n\nOmission is preserved so a client written before a rule existed (which never\nsends its key) cannot clear it by accident. The dashboard sends only edits;\n``eyvan users rules`` sends every key, so its omitted options still clear.",
         "properties": {
           "allowed_fleets": {
             "anyOf": [
@@ -6840,6 +6840,32 @@
               }
             ],
             "title": "Guaranteed Tpu Units"
+          },
+          "max_cpu_units": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Cpu Units"
+          },
+          "max_gpu_units": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Gpu Units"
           },
           "max_tpu_units": {
             "anyOf": [
@@ -15951,7 +15977,7 @@
     },
     "/api/v1/team/logout": {
       "post": {
-        "description": "End the cookie session (and a bearer session token, if that is what was sent).",
+        "description": "End the dashboard's cookie session.",
         "operationId": "team_logout_api_v1_team_logout_post",
         "responses": {
           "200": {
@@ -16493,7 +16519,7 @@
     },
     "/api/v1/team/users/{subject}/rules": {
       "put": {
-        "description": "Replace one account's fleet allow-list, approval threshold, TPU guarantee and hard TPU cap (fleet admins).",
+        "description": "Update the supplied rules, including hard CPU, GPU and TPU caps (fleet admins).",
         "operationId": "set_team_user_rules_api_v1_team_users__subject__rules_put",
         "parameters": [
           {

@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from eyvan.config import EyvanSettings
 from eyvan.identity.team_secrets import TEAM_SESSION_COOKIE, SignInThrottle
 from eyvan.records import ApiTokenRecord, InviteRecord, Permission, Principal, Role, RoleGrant, TeamTier, UserRecord
-from eyvan.server.api.auth import authenticated_principal
+from eyvan.server.api.auth import authenticated_principal, require_dashboard_origin, team_session_cookie_name
 
 if tp.TYPE_CHECKING:
     from eyvan.server.service import ControlPlaneService
@@ -92,14 +92,16 @@ class RulesBody(_Body):
     """One account's governance rules: ``null`` clears a rule, an omitted key keeps the stored value.
 
     Omission is preserved so a client written before a rule existed (which never
-    sends its key) cannot clear it by accident; ``eyvan users rules`` and the
-    dashboard send every key, so their omitted options still clear.
+    sends its key) cannot clear it by accident. The dashboard sends only edits;
+    ``eyvan users rules`` sends every key, so its omitted options still clear.
     """
 
     allowed_fleets: list[str] | None = Field(default=None, max_length=64)
     approval_tpu_threshold: int | None = Field(default=None, ge=0, le=1_000_000)
     guaranteed_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
     max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+    max_cpu_units: float | None = Field(default=None, ge=0, le=1_000_000, strict=True)
+    max_gpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
 
 
 class ReclaimBody(_Body):
@@ -133,6 +135,8 @@ def user_document(user: UserRecord, tier: TeamTier | None = None) -> dict[str, t
             "approval_tpu_threshold": user.approval_tpu_threshold,
             "guaranteed_tpu_units": user.guaranteed_tpu_units,
             "max_tpu_units": user.max_tpu_units,
+            "max_cpu_units": user.max_cpu_units,
+            "max_gpu_units": user.max_gpu_units,
         },
     }
 
@@ -171,18 +175,16 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
     throttle = SignInThrottle()
     app.state.team_sign_in_throttle = throttle
     app.state.team_mode = settings.team_mode
-    # Secure whenever the browser reaches this plane over TLS: either the
-    # advertised URL is https, or this process terminates TLS itself.
-    secure_cookie = settings.public_url.lower().startswith("https://") or settings.tls_enabled
     ttl = settings.dashboard_session_ttl_s
 
-    def set_session(response: Response, raw: str) -> None:
+    def set_session(request: Request, response: Response, raw: str) -> None:
+        name = team_session_cookie_name(settings, request)
         response.set_cookie(
-            key=TEAM_SESSION_COOKIE,
+            key=name,
             value=raw,
             max_age=ttl,
             httponly=True,
-            secure=secure_cookie,
+            secure=name == TEAM_SESSION_COOKIE,
             samesite="strict",
             path="/",
         )
@@ -201,7 +203,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         return {"team_mode": settings.team_mode}
 
     @app.post("/api/v1/team/login", tags=["team"])
-    async def team_login(body: LoginBody, response: Response, _on: _On) -> dict[str, tp.Any]:
+    async def team_login(body: LoginBody, request: Request, response: Response, _on: _On) -> dict[str, tp.Any]:
         """Sign in with user name (or email) and password; sets an HttpOnly session cookie."""
 
         key = body.email.strip().lower()
@@ -226,17 +228,19 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
                 "token": raw,
                 "record": token_document(record),
             }
-        set_session(response, raw)
+        set_session(request, response, raw)
         return {"user": await document(user), "expires_at": expires_at}
 
     @app.post("/api/v1/team/logout", tags=["team"])
     async def team_logout(request: Request, response: Response, _on: _On) -> dict[str, tp.Any]:
-        """End the cookie session (and a bearer session token, if that is what was sent)."""
+        """End the dashboard's cookie session."""
 
-        cookie = request.cookies.get(TEAM_SESSION_COOKIE)
+        require_dashboard_origin(settings, request)
+        name = team_session_cookie_name(settings, request)
+        cookie = request.cookies.get(name)
         if cookie:
             await service.end_session(cookie)
-        response.delete_cookie(key=TEAM_SESSION_COOKIE, path="/", httponly=True, secure=secure_cookie, samesite="strict")
+        response.delete_cookie(key=name, path="/", httponly=True, secure=name == TEAM_SESSION_COOKIE, samesite="strict")
         return {"signed_out": True}
 
     @app.get("/api/v1/team/me", tags=["team"])
@@ -322,7 +326,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
         return {"email": invite.email, "subject": invite.subject, "expires_at": invite.expires_at.isoformat()}
 
     @app.post("/api/v1/team/invites/accept", tags=["team"])
-    async def accept_team_invite(body: AcceptBody, response: Response, _on: _On) -> dict[str, tp.Any]:
+    async def accept_team_invite(body: AcceptBody, request: Request, response: Response, _on: _On) -> dict[str, tp.Any]:
         """Create the account from an invite, set its password, and sign in."""
 
         try:
@@ -331,7 +335,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
             )
         except ValueError as error:
             raise bad_input(error) from None
-        set_session(response, raw)
+        set_session(request, response, raw)
         return {"user": await document(user), "expires_at": record.expires_at.isoformat() if record.expires_at else None}
 
     @app.get("/api/v1/team/users", tags=["team"])
@@ -358,7 +362,7 @@ def register_team_routes(app: FastAPI, *, settings: EyvanSettings, service: Cont
 
     @app.put("/api/v1/team/users/{subject}/rules", tags=["team"])
     async def set_team_user_rules(subject: str, body: RulesBody, principal: _Principal, _on: _On) -> dict[str, tp.Any]:
-        """Replace one account's fleet allow-list, approval threshold, TPU guarantee and hard TPU cap (fleet admins)."""
+        """Update the supplied rules, including hard CPU, GPU and TPU caps (fleet admins)."""
 
         sent = {name: getattr(body, name) for name in body.model_fields_set}
         return await document(await service.set_user_rules(principal, subject, **sent))

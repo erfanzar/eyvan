@@ -63,6 +63,47 @@ def test_invite_accept_sets_a_session_cookie_that_authenticates() -> None:
     assert "password_hash" not in me.text
 
 
+def test_https_team_cookie_and_logout_contract() -> None:
+    origin = "https://plane.example.test"
+    settings = EyvanSettings(
+        dev_auth_enabled=True, team_mode=True, public_url=origin + ":443", artifact_token_key="k" * 32
+    )
+    http = TestClient(create_app(settings=settings), base_url=origin)
+    invite = _onboard(http)["token"]
+    accepted = http.post("/api/v1/team/invites/accept", json={"token": invite, "password": PASSWORD})
+    assert accepted.status_code == 200
+    name = "__Host-eyvan_team_session"
+    cookie = next(iter(http.cookies.jar))
+    assert cookie.name == name
+    assert cookie.secure and cookie.path == "/" and not cookie.domain_specified
+    assert cookie.has_nonstandard_attr("HttpOnly") and cookie.get_nonstandard_attr("SameSite") == "strict"
+
+    # Only the host-prefixed name supplies a team identity over HTTPS.
+    http.cookies.clear()
+    http.cookies.set("eyvan_team_session", cookie.value)
+    assert http.get("/api/v1/team/me").json().get("subject") != "alice"
+    http.cookies.jar.set_cookie(cookie)
+    for headers in (
+        {},
+        {"Origin": "https://other.example.test"},
+        {"Origin": origin + ":444"},
+        {"Origin": origin + "/path"},
+        {"Origin": origin + "?query"},
+        {"Origin": origin + "#fragment"},
+        {"Origin": "https://user@plane.example.test"},
+        [("Origin", origin), ("Origin", origin)],
+    ):
+        refused = http.post("/api/v1/team/logout", headers=headers)
+        assert refused.status_code == 403 and "set-cookie" not in refused.headers
+        assert http.get("/api/v1/team/me").json()["subject"] == "alice"
+
+    ended = http.post("/api/v1/team/logout", headers={"Origin": origin})
+    assert ended.status_code == 200
+    assert name not in http.cookies
+    http.cookies.jar.set_cookie(cookie)
+    assert http.get("/api/v1/team/me").status_code == 401
+
+
 def test_cookie_writes_must_come_from_the_dashboard_origin() -> None:
     http = _client()
     token = _onboard(http)["token"]

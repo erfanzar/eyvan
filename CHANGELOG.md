@@ -34,12 +34,13 @@ or `team: true`.
 
 - Team tiers: admin, trusted and user, set from the dashboard's Users page
   (making someone admin asks for confirmation) or `eyvan users tier`.
-- A hard per-user TPU cap (`max_tpu_units`). It counts every queued, held and
-  running workload of the user across projects, and is checked when a job is
-  submitted, released from approval or retried. Every tier may run
-  `@eyvan.execute` callables; a plain user only once an admin has set a cap, and
-  only within it. Callables on CPU or GPU pools use no TPU units, so the cap
-  does not bound them.
+- Per-user CPU, GPU and TPU limits (`max_cpu_units`, `max_gpu_units` and
+  `max_tpu_units`) apply to scheduler reservations across projects, not measured
+  utilization. Queued and held jobs count alongside running jobs. A plain team
+  user needs an allowance for **each** resource a callable reserves. For
+  example, a job reserving CPU and GPU needs both allowances; a TPU allowance
+  alone does not grant CPU-only execution. When upgrading, review existing
+  users' CPU allowances, including for accelerator jobs that also reserve CPU.
 - The MCP endpoint lets an external agent call the plane's API with a user's
   personal token, with that user's permissions. Routes that create accounts or
   credentials, grant durable authority, run raw queries or act on the plane host
@@ -54,6 +55,9 @@ or `team: true`.
 
 ### Changed
 
+- HTTPS team dashboards now use a host-prefixed session cookie. Browser users
+  must sign in once after upgrading. Use HTTPS for a networked team dashboard;
+  local loopback development retains a separate cookie. API tokens are unaffected.
 - `PUT /api/v1/team/users/{subject}/rules` keeps a rule the request leaves out
   instead of clearing it; send `null` to clear. An older client can no longer
   clear a TPU cap by accident.
