@@ -481,6 +481,33 @@ def test_up_writes_files_runs_the_steps_in_order_and_returns_the_invite(tmp_path
     assert "add-tags plane-1 --zone us-east5-a" in result.firewall[1]
 
 
+@pytest.mark.parametrize("leftover", [False, True])
+def test_shared_directories_are_traversable_whatever_the_callers_umask(tmp_path: Path, leftover: bool) -> None:
+    """The service user must reach platform.yaml and tls/: a root `umask 077` once left /etc/eyvan 0700.
+
+    The plane then crash-looped on PermissionError reading /etc/eyvan/platform.yaml. ``leftover`` is a
+    re-run over that broken directory, which the installer must repair rather than keep.
+    """
+
+    pem, _ = _certificate()
+    host = FakeHost(tmp_path, pem)
+    if leftover:
+        for directory in ("etc/eyvan", "opt/eyvan"):
+            (tmp_path / directory).mkdir(parents=True)
+            os.chmod(tmp_path / directory, 0o700)
+    previous = os.umask(0o077)
+    try:
+        _installer(host).up()
+    finally:
+        os.umask(previous)
+
+    for directory in ("etc/eyvan", "opt/eyvan"):
+        assert stat.S_IMODE(os.stat(tmp_path / directory).st_mode) == 0o755, directory
+    assert stat.S_IMODE(os.stat(tmp_path / "etc/eyvan/platform.yaml").st_mode) == 0o644
+    assert stat.S_IMODE(os.stat(tmp_path / TEAM_ENVIRONMENT_PATH.lstrip("/")).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(tmp_path / "opt/eyvan/team-bootstrap.sh").st_mode) == 0o700
+
+
 def test_no_secret_reaches_an_argv_or_the_printed_output(tmp_path: Path, monkeypatch) -> None:
     pem, fingerprint = _certificate()
     host = FakeHost(tmp_path, pem)

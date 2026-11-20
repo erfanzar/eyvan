@@ -669,6 +669,20 @@ class TeamUpResult:
         return tuple(lines)
 
 
+#: Directories the ``eyvan`` service user must traverse (``platform.yaml``, the
+#: CA, ``tls/``, the venv). Created and re-moded explicitly so the result never
+#: depends on the umask of whoever ran ``sudo eyvan team up``; the secrets inside
+#: keep their own 0600/0640 modes.
+_SHARED_DIRECTORIES: tuple[str, ...] = ("/etc/eyvan", "/opt/eyvan")
+
+
+def _ensure_shared_directory(target: Path) -> None:
+    """Create ``target`` (and parents) and force it to 0755, repairing a narrower mode left by an earlier run."""
+
+    target.mkdir(parents=True, exist_ok=True)
+    os.chmod(target, 0o755)
+
+
 def _write_atomic(target: Path, text: str, mode: int) -> None:
     """Replace ``target`` with ``text`` so it is never seen partially written or with a wider mode."""
 
@@ -777,6 +791,8 @@ class TeamUpInstaller:
         self._redact = plane_secrets.values()
         environment = plane_environment(self.spec, plane_secrets)
         try:
+            for directory in _SHARED_DIRECTORIES:
+                _ensure_shared_directory(self.path(directory))
             _write_atomic(self.path(TEAM_ENVIRONMENT_PATH), render_environment_file(environment), 0o600)
         except OSError as exc:
             raise TeamUpError(TeamUpStep.ENVIRONMENT, f"cannot write {TEAM_ENVIRONMENT_PATH}: {exc}") from exc
