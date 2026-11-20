@@ -9,7 +9,7 @@ description = "A policy-aware global fleet control plane with native GCP CPU, GP
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { text = "AGPL-3.0-or-later" }
-authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+authors = [{ name = "Erfan Zare Chavoshi", email = "59269023+erfanzar@users.noreply.github.com" }]
 dependencies = [
     "alembic>=1.14.0",
     "asyncpg>=0.30.0",
