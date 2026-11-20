@@ -93,11 +93,26 @@ def test_auth_required(method: str, path: str) -> None:
     assert http.request(method, path, headers=headers, **kwargs).status_code == 403
 
 
+def test_public_dashboard_config_describes_local_attachment_capability() -> None:
+    response = client().get("/api/v1/dashboard/config")
+    assert response.status_code == 200
+    assert response.json() == {
+        "issuer": None,
+        "client_id": None,
+        "audience": "eyvan",
+        "development_auth": "explicit",
+        "local_attachments_available": True,
+        "default_org": "default",
+        "default_project": "default",
+    }
+    assert response.json()["local_attachments_available"] is True
+
+
 @pytest.mark.parametrize("local", [False, True])
 def test_nonlocal_or_nondev_refused(local: bool) -> None:
-    response = client(local=local, development=False).post(
-        "/api/v1/attachments/plan", json=BODY, headers={"Authorization": "Bearer test"}
-    )
+    http = client(local=local, development=False)
+    assert http.get("/api/v1/dashboard/config").json()["local_attachments_available"] is False
+    response = http.post("/api/v1/attachments/plan", json=BODY, headers={"Authorization": "Bearer test"})
     assert response.status_code == 403
     assert "local loopback development plane" in response.json()["detail"]
 

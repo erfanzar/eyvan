@@ -20,7 +20,13 @@ import {
   mockPolicies,
   mockWorkloads,
 } from "./api/mockData";
-import { NO_AUTH_CAPABILITIES, type AuthIdentity, type AuthScope } from "./auth/oidc";
+import {
+  __resetRuntimeOidcConfigForTests,
+  loadRuntimeOidcConfig,
+  NO_AUTH_CAPABILITIES,
+  type AuthIdentity,
+  type AuthScope,
+} from "./auth/oidc";
 import type {
   CapacityPoolSummary,
   EffectiveProjectScope,
@@ -189,6 +195,10 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     // from which cells exist: a fleet with twenty pools and nothing running
     // is the ordinary case and used to be indistinguishable from no fleet.
     listCapacityPools: vi.fn(async (): Promise<CapacityPoolSummary[]> => []),
+    listDiscoveredTpus: vi.fn(async () => {
+      throw new Error("Discovery index unavailable");
+    }),
+    listAttachments: vi.fn(async () => []),
     getProjectUsage: vi.fn(async (): Promise<ProjectUsage> => ({ orgId: "acme", projectId: "research", subjects: [] })),
     listAuditEvents: vi.fn(async () => mockAuditEvents.slice(0, 1)),
     followEvents: vi.fn(
@@ -290,12 +300,53 @@ function deferred<T>() {
 
 afterEach(() => {
   cleanup();
+  __resetRuntimeOidcConfigForTests();
   window.history.replaceState(null, "", "/");
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
 describe("App composes server session authority", () => {
+  it("refreshes registered inventory without requesting host-only discovery on a remote plane", async () => {
+    await loadRuntimeOidcConfig(async () => Response.json({ local_attachments_available: false }));
+    window.location.hash = "#/fleet";
+    const { client, calls } = fakeClient(authority("fleet_admin"));
+    renderApp(client);
+    await screen.findByText("eyvan gcp connect --tpu NAME");
+    expect(screen.queryByRole("button", { name: "Add TPU" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Add TPU" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "TPUs in your Google Cloud" })).toBeNull();
+    const reads = calls.listCells.mock.calls.length;
+    const poolReads = calls.listCapacityPools.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
+    await screen.findByText("Fleet inventory reloaded from Eyvan.");
+    expect(calls.listCells.mock.calls.length).toBeGreaterThan(reads);
+    expect(calls.listCapacityPools.mock.calls.length).toBeGreaterThan(poolReads);
+    expect(calls.listDiscoveredTpus).not.toHaveBeenCalled();
+    expect(calls.listAttachments).not.toHaveBeenCalled();
+  });
+
+  it.each(["fleet_admin", "project_admin"])(
+    "respects %s authority when local attachments are available",
+    async (role) => {
+      await loadRuntimeOidcConfig(async () => Response.json({ local_attachments_available: true }));
+      window.location.hash = "#/fleet";
+      const { client, calls } = fakeClient(authority(role));
+      renderApp(client);
+      if (role === "fleet_admin") {
+        await screen.findByText("Discovery index unavailable");
+        fireEvent.click(screen.getByRole("button", { name: "Add TPU" }));
+        await screen.findByRole("dialog", { name: "Add TPU" });
+        expect(calls.listAttachments).toHaveBeenCalled();
+      } else {
+        await screen.findByRole("region", { name: "Operations metrics" });
+        expect(screen.queryByRole("button", { name: "Add TPU" })).toBeNull();
+        expect(calls.listDiscoveredTpus).not.toHaveBeenCalled();
+        expect(calls.listAttachments).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it.each(["project_viewer", "project_operator", "project_admin", "org_admin"])(
     "does not mount fleet-wide billing for a %s deep link",
     async (role) => {

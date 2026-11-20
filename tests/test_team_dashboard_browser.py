@@ -12,6 +12,7 @@ dashboard's Playwright, a built dashboard or a launchable browser is missing.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import socket
 import subprocess
@@ -22,8 +23,9 @@ from pathlib import Path
 import pytest
 import uvicorn
 
-from eyvan.config import EyvanSettings
+from eyvan.config import EyvanSettings, RepositoryBackend
 from eyvan.server.api.app import create_app
+from eyvan.server.api.bootstrap_admin import bootstrap_admin
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tests" / "browser" / "team_dashboard.mjs"
@@ -46,14 +48,21 @@ def test_team_screens_work_in_a_real_browser(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     port = _free_port()
     settings = EyvanSettings(
-        # Development headers only seed the first invite; the browser never sends them.
-        dev_auth_enabled=True,
+        # Use real team authentication, not development headers, so local-host
+        # attachment tools are unavailable just as on the deployed team plane.
+        dev_auth_enabled=False,
+        repository_backend=RepositoryBackend.LOCAL,
+        local_state_path=tmp_path / "state.json",
         team_mode=True,
         controller_enabled=False,
         artifact_token_key="k" * 32,
         artifact_store_uri=str(tmp_path / "artifacts"),
         public_url=f"http://127.0.0.1:{port}",
     )
+    invite = asyncio.run(bootstrap_admin(settings, username="admin", email="admin@example.com"))
+    invite_file = tmp_path / "first-invite"
+    invite_file.touch(mode=0o600)
+    invite_file.write_text(invite["url"], encoding="utf-8")
     server = uvicorn.Server(
         uvicorn.Config(create_app(settings=settings), host="127.0.0.1", port=port, log_level="error")
     )
@@ -65,7 +74,7 @@ def test_team_screens_work_in_a_real_browser(tmp_path, monkeypatch) -> None:
             time.sleep(0.05)
         assert server.started, "the disposable plane did not start"
         completed = subprocess.run(
-            [node, str(SCRIPT), f"http://127.0.0.1:{port}"],
+            [node, str(SCRIPT), f"http://127.0.0.1:{port}", str(invite_file)],
             cwd=ROOT,
             capture_output=True,
             text=True,

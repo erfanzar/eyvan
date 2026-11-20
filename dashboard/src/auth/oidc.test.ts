@@ -19,6 +19,7 @@ import {
   isOidcConfigured,
   configuredScope,
   loadRuntimeOidcConfig,
+  localAttachmentsAvailable,
   logout,
   planeDevelopmentAuthMode,
   planeRequiresLocalCredential,
@@ -251,18 +252,29 @@ describe("runtime OIDC configuration", () => {
     expect(isOidcConfigured()).toBe(true);
   });
 
-  it("does not ask when the bundle deliberately carries every runtime value", async () => {
-    // A round trip whose answer is discarded, on the critical path of every
-    // page load. Existing images must behave exactly as they did.
+  it("reads runtime capabilities even when identity configuration is baked in", async () => {
     vi.stubEnv("VITE_EYVAN_OIDC_ISSUER", "https://baked.example.com");
     vi.stubEnv("VITE_EYVAN_OIDC_CLIENT_ID", "baked-client");
     vi.stubEnv("VITE_EYVAN_OIDC_AUDIENCE", "baked-audience");
-    const fetchImpl = vi.fn();
+    const fetchImpl = vi.fn(async () => Response.json({ local_attachments_available: true }));
 
-    await loadRuntimeOidcConfig(fetchImpl as unknown as typeof fetch);
+    await loadRuntimeOidcConfig(fetchImpl);
 
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fetchImpl).toHaveBeenCalledWith("/api/v1/dashboard/config");
+    expect(localAttachmentsAvailable()).toBe(true);
     expect(isOidcConfigured()).toBe(true);
+  });
+
+  it.each([
+    {},
+    null,
+    { local_attachments_available: false },
+    { local_attachments_available: "true" },
+    { local_attachments_available: 1 },
+  ])("requires an explicit boolean capability: %j", async (config) => {
+    expect(localAttachmentsAvailable()).toBe(false);
+    await loadRuntimeOidcConfig(async () => Response.json(config));
+    expect(localAttachmentsAvailable()).toBe(false);
   });
 
   it("treats an unreachable control plane as unconfigured rather than as an auth error", async () => {

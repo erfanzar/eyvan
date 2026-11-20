@@ -87,6 +87,12 @@ def _summary(plan: dict[str, tp.Any]) -> dict[str, tp.Any]:
         return {"shape": None, "hosts": len(plan.get("endpoints", [])), "capacity_class": None, "endpoint_mode": None}
 
 
+def is_loopback_development(server_bind: ServerBindPolicy, settings: EyvanSettings) -> bool:
+    """Whether this plane supports local attachments, independent of caller permissions."""
+
+    return server_bind.is_loopback and settings.dev_auth_enabled
+
+
 def register_attachment_routes(
     app: FastAPI, *, settings: EyvanSettings, service: ControlPlaneService, server_bind: ServerBindPolicy
 ) -> None:
@@ -94,7 +100,7 @@ def register_attachment_routes(
 
     def authorize(principal: Principal) -> None:
         service.authorizer.require(principal, Permission.MANAGE_FLEET)
-        if not server_bind.is_loopback or not settings.dev_auth_enabled:
+        if not is_loopback_development(server_bind, settings):
             raise HTTPException(
                 status_code=403,
                 detail=(

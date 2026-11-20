@@ -748,7 +748,7 @@ export class EyvanApiClient {
 
   constructor(
     private readonly baseUrl = "/api/v1",
-    private readonly forceDemo = isDemoMode(),
+    readonly forceDemo = isDemoMode(),
     initialScope: AuthScope = configuredScope(),
   ) {
     this.activeScope = { ...initialScope };

@@ -113,7 +113,7 @@ from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.secrets import MAX_SECRET_BYTES, SecretUnavailable, read_secret
 from eyvan.server.api.assistant import register_assistant_routes
-from eyvan.server.api.attachments import register_attachment_routes
+from eyvan.server.api.attachments import is_loopback_development, register_attachment_routes
 from eyvan.server.api.auth import (
     DEFAULT_DEVELOPMENT_SCOPE,
     OIDCTokenVerifier,
@@ -628,7 +628,7 @@ def create_app(
         else None
     )
     platform = platform_config or load_platform_config(settings.platform_config_path)
-    loopback_development = settings.dev_auth_enabled and server_bind.is_loopback
+    loopback_development = is_loopback_development(server_bind, settings)
     if platform.default_agent_endpoint is None and loopback_development:
         # Keep every other operator setting when filling in the local agent.
         platform = replace(platform, default_agent_endpoint=DEFAULT_LOCAL_CELL_AGENT_URL)
@@ -2171,7 +2171,7 @@ def create_app(
         )
 
     @app.get("/api/v1/dashboard/config", tags=["system"])
-    async def dashboard_config() -> dict[str, str | None]:
+    async def dashboard_config() -> dict[str, str | bool | None]:
         """Serve the browser's identity configuration at runtime.
 
         The dashboard's OIDC issuer and client id were compiled into the bundle
@@ -2202,6 +2202,8 @@ def create_app(
             "client_id": settings.oidc_dashboard_client_id,
             "audience": settings.oidc_audience,
             "development_auth": startup.development_auth_mode.value,
+            # Availability describes the plane, not permission to use its attachment routes.
+            "local_attachments_available": loopback_development,
             # The scope this plane puts a dashboard session in. Reported because
             # the dashboard used to compile in "acme"/"research" as its fallback
             # while the CLI defaults to "default"/"default", so a job submitted

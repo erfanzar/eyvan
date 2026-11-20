@@ -174,21 +174,18 @@ let runtimeConfig:
       client_id?: string | null;
       audience?: string | null;
       development_auth?: string | null;
+      local_attachments_available?: boolean;
       default_org?: string | null;
       default_project?: string | null;
     }
   | undefined;
 
+export function localAttachmentsAvailable(): boolean {
+  return runtimeConfig?.local_attachments_available === true;
+}
+
 export async function loadRuntimeOidcConfig(fetchImpl: typeof fetch = fetch): Promise<void> {
   if (runtimeConfig !== undefined) return;
-  if (bakedIssuer() && bakedClientId() && bakedAudience()) {
-    // Every runtime value is deliberately overridden by this build, and a
-    // bundle that carries its own OIDC never reaches the local-plane screen
-    // that is the plane's posture's only reader. So the round trip stays
-    // skipped: it is on the critical path of every page load.
-    runtimeConfig = {};
-    return;
-  }
   try {
     const response = await fetchImpl("/api/v1/dashboard/config");
     runtimeConfig = response.ok ? await response.json() : {};
@@ -218,10 +215,6 @@ function bakedIssuer(): string | undefined {
 
 function bakedClientId(): string | undefined {
   return import.meta.env.VITE_EYVAN_OIDC_CLIENT_ID || undefined;
-}
-
-function bakedAudience(): string | undefined {
-  return import.meta.env.VITE_EYVAN_OIDC_AUDIENCE || undefined;
 }
 
 function issuer(): string | undefined {

@@ -7,9 +7,10 @@
 // tests/test_team_dashboard_browser.py): accept-invite -> Settings -> invite and
 // token -> sign out / wrong password / sign in -> a second non-admin user ->
 // disabling that user signs them out. Exit 77 when no browser can launch.
+import { readFile } from "node:fs/promises";
 import { chromium } from "../../dashboard/node_modules/playwright/index.mjs";
 
-const [base] = process.argv.slice(2);
+const [base, inviteFile] = process.argv.slice(2);
 const problems = [];
 const ok = (message) => console.log("PASS", message);
 const fail = (message) => {
@@ -36,13 +37,7 @@ try {
 
 try {
   // The first admin is invited out-of-band, the way an operator would bootstrap.
-  const seeded = await fetch(`${base}/api/v1/team/invites`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Eyvan-User": "root", "X-Eyvan-Roles": "fleet_admin" },
-    body: JSON.stringify({ email: "admin@example.com", subject: "admin", role: "fleet_admin" }),
-  });
-  if (seeded.status !== 201) throw new Error(`seed invite returned ${seeded.status}: ${await seeded.text()}`);
-  const adminInvite = (await seeded.json()).url;
+  const adminInvite = await readFile(inviteFile, "utf8");
 
   const contextA = await browser.newContext({ viewport: { width: 1500, height: 1000 }, serviceWorkers: "block" });
   const a = await contextA.newPage();
@@ -63,6 +58,19 @@ try {
   const settings = a.getByRole("button", { name: /^Settings/ });
   await settings.waitFor({ timeout: 15000 });
   ok("accepting the invite signs in and the rail offers Settings");
+
+  let attachmentRequests = 0;
+  a.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/v1/attachments")) attachmentRequests++;
+  });
+  await a.getByRole("button", { name: /^Fleet\b/ }).click();
+  await a.getByRole("heading", { name: "Applied fleets" }).waitFor();
+  await a.getByRole("button", { name: /refresh.*fleet|refresh.*inventory/i }).click();
+  await a.getByText(/reloaded from Eyvan/i).waitFor();
+  if (attachmentRequests || (await a.getByRole("button", { name: "Add TPU" }).count()))
+    fail(`team Fleet offered local attachments or made discovery calls (requests: ${attachmentRequests})`);
+  else ok("team admin can view and refresh fleet data without invoking local TPU attachments");
+
   await settings.click();
   await a.getByRole("heading", { name: "Settings" }).waitFor({ timeout: 10000 });
   if (!a.url().endsWith("#/settings")) fail(`Settings navigated to ${a.url()}`);

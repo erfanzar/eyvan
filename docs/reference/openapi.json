@@ -12804,6 +12804,9 @@
                         "type": "string"
                       },
                       {
+                        "type": "boolean"
+                      },
+                      {
                         "type": "null"
                       }
                     ]

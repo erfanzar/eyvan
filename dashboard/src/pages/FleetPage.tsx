@@ -351,6 +351,12 @@ export function FleetPage({
             </button>
           </div>
         </div>
+        {!attachmentClient && (
+          <p className="panel-note">
+            To attach an existing TPU, run <code>eyvan gcp connect --tpu NAME</code> on the control-plane host, then
+            refresh inventory here to see the registered cells and pools.
+          </p>
+        )}
         {refreshError && (
           <div className="inline-error" role="alert">
             <AlertTriangle size={16} />

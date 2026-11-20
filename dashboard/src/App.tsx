@@ -15,6 +15,7 @@ import {
   isTeamMode,
   isTeamSession,
   logout,
+  localAttachmentsAvailable,
   NO_AUTH_CAPABILITIES,
   type AuthCapabilities,
   type AuthIdentity,
@@ -1274,7 +1275,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadLaunchLatency={loadLaunchLatency}
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
             onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
-            attachmentClient={capabilities.manageFleet ? client : undefined}
+            attachmentClient={
+              capabilities.manageFleet && (client.forceDemo || localAttachmentsAvailable()) ? client : undefined
+            }
             initScriptClient={capabilities.manageFleet ? client : undefined}
             loadPools={loadPools}
             refreshRevision={auxiliaryRefreshRevision}
